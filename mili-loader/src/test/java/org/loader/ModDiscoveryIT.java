@@ -6,59 +6,122 @@ import org.loader.loader.classloader.ModClassLoader;
 import org.loader.runtime.mod.ModManifest;
 import org.junit.jupiter.api.Test;
 
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+/**
+ * Integration test for the full Mod discovery + load pipeline.
+ *
+ * Test JARs are resolved with a three-tier fallback so the test runs both
+ * in a developer workspace (where the real test_client/ checkout exists)
+ * and in CI (where only src/test/resources fixtures are available):
+ *
+ * <ol>
+ *   <li>System property {@code mili.it.clientDir} — explicit override.</li>
+ *   <li>A {@code test_client/} directory relative to CWD or one level up
+ *       (developer workspace with built testmod/badmod).</li>
+ *   <li>Embedded classpath fixtures under {@code client-fixtures/mods/}
+ *       extracted to a temporary directory (CI).</li>
+ * </ol>
+ *
+ * The last tier means CI never needs a pre-built test_client; it ships
+ * with the build.
+ */
 class ModDiscoveryIT {
 
-    /**
-     * Locate the test_client directory.
-     * Gradle runs sub-module tests with CWD = mili-loader/, so we check
-     * CWD first, then walk one level up to the workspace root.
-     */
-    private static Path findTestClientDir() {
+    private static final String SYSTEM_PROPERTY = "mili.it.clientDir";
+    private static final String FIXTURE_RESOURCE_DIR = "/client-fixtures/mods";
+
+    private static Path resolveClientDir() {
+        String override = System.getProperty(SYSTEM_PROPERTY);
+        if (override != null && !override.isBlank()) {
+            return Path.of(override).toAbsolutePath().normalize();
+        }
+
         Path cwd = Path.of(System.getProperty("user.dir")).toAbsolutePath().normalize();
+
         Path direct = cwd.resolve("test_client");
-        if (Files.isDirectory(direct)) return direct;
+        if (Files.isDirectory(direct) && hasMods(direct)) return direct;
+
         Path parent = cwd.getParent();
         if (parent != null) {
             Path sibling = parent.resolve("test_client");
-            if (Files.isDirectory(sibling)) return sibling;
+            if (Files.isDirectory(sibling) && hasMods(sibling)) return sibling;
         }
-        return direct; // fall back (will fail downstream with a clear message)
+
+        // CI fallback: extract embedded fixtures into a temp dir.
+        return extractFixturesIntoTemp();
+    }
+
+    private static boolean hasMods(Path gameDir) {
+        Path mods = gameDir.resolve("mods");
+        if (!Files.isDirectory(mods)) return false;
+        try (var stream = Files.list(mods)) {
+            return stream.anyMatch(p -> p.toString().endsWith(".jar"));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static Path extractFixturesIntoTemp() {
+        try {
+            Path tmp = Files.createTempDirectory("mili-it-client-");
+            tmp.toFile().deleteOnExit();
+            Path modsDir = tmp.resolve("mods");
+            Files.createDirectories(modsDir);
+
+            String[] fixtures = {"testmod.jar", "badmod.jar"};
+            ClassLoader cl = ModDiscoveryIT.class.getClassLoader();
+            for (String name : fixtures) {
+                String resource = FIXTURE_RESOURCE_DIR + "/" + name;
+                InputStream is = cl.getResourceAsStream(resource);
+                assertNotNull(is, "Embedded fixture not found on classpath: " + resource);
+                Path dest = modsDir.resolve(name);
+                try (is) {
+                    Files.copy(is, dest);
+                }
+                dest.toFile().deleteOnExit();
+            }
+            return tmp;
+        } catch (Exception e) {
+            throw new IllegalStateException("Failed to extract embedded client fixtures", e);
+        }
     }
 
     @Test
     void discoversTestMod() {
-        Path gameDir = findTestClientDir();
+        Path gameDir = resolveClientDir();
+        System.out.println("[IT] gameDir=" + gameDir);
         var config = LoaderConfig.load(gameDir);
         ModDiscovery discovery = ModDiscovery.scan(config);
         List<ModManifest> mods = discovery.discover();
         System.out.println("[IT] Discovered " + mods.size() + " mod(s)");
         for (ModManifest m : mods) {
-            System.out.println("[IT]   - " + m.id() + " v" + m.version() + " main=" + m.entrypoint());
+            System.out.println("[IT]   - " + m.id() + " v" + m.version() + " entrypoint=" + m.entrypoint());
         }
-        assertFalse(mods.isEmpty());
+        assertFalse(mods.isEmpty(), "Should discover at least one mod in " + gameDir);
+
         ModManifest testmod = mods.stream().filter(m -> m.id().equals("testmod")).findFirst().orElse(null);
-        assertNotNull(testmod);
+        assertNotNull(testmod, "Expected to discover 'testmod'");
         assertEquals("com.example.TestMod", testmod.entrypoint());
     }
 
     @Test
     void loadsTestModClass() throws Exception {
-        Path gameDir = findTestClientDir();
-        Path expectedModJar = gameDir.resolve("mods").resolve("testmod-1.0.0.jar");
+        Path gameDir = resolveClientDir();
         System.out.println("[IT] gameDir=" + gameDir);
-        System.out.println("[IT] expectedModJar=" + expectedModJar + " exists=" + java.nio.file.Files.exists(expectedModJar));
 
         var config = LoaderConfig.load(gameDir);
         ModDiscovery discovery = ModDiscovery.scan(config);
-        ModManifest testmod = discovery.discover().stream().filter(m -> m.id().equals("testmod")).findFirst().orElse(null);
-        assertNotNull(testmod);
+        List<ModManifest> mods = discovery.discover();
+        ModManifest testmod = mods.stream().filter(m -> m.id().equals("testmod")).findFirst().orElse(null);
+        assertNotNull(testmod, "Expected to discover 'testmod'");
 
+        // Locate the actual JAR that ModDiscovery bound to this manifest.
         ModClassLoader mcl = new ModClassLoader(testmod, new java.net.URL[0], null, gameDir);
         System.out.println("[IT] Actual URLs: " + java.util.Arrays.toString(mcl.getClassLoader().getURLs()));
 
@@ -67,36 +130,14 @@ class ModDiscoveryIT {
         Object inst = clazz.getDeclaredConstructor().newInstance();
         System.out.println("[IT] Loaded: " + inst.getClass().getName());
 
-        boolean invoked = false;
-        for (var method : clazz.getMethods()) {
-            if ("initialize".equals(method.getName()) && method.getParameterCount() == 1) {
-                Class<?> pt = method.getParameterTypes()[0];
-                Object arg;
-                if (pt.isInterface()) {
-                    arg = java.lang.reflect.Proxy.newProxyInstance(
-                            pt.getClassLoader(), new Class<?>[]{pt},
-                            (p, m, a) -> {
-                                if ("info".equals(m.getName()) && a != null && a.length > 0)
-                                    System.out.println("[Mod:testmod] " + a[0]);
-                                return null;
-                            });
-                } else {
-                    // Concrete class - try instantiate
-                    try {
-                        arg = pt.getDeclaredConstructor().newInstance();
-                    } catch (Exception e) {
-                        // Skip if not instantiable without deps (like ModContext)
-                        System.out.println("[IT] Skipping non-instantiable entrypoint: " + pt.getSimpleName());
-                        continue;
-                    }
-                }
-                method.invoke(inst, arg);
-                invoked = true;
-                break;
-            }
-        }
-        // For TestMod with ModContext, just verify class loadable
-        System.out.println("[IT] Entrypoint found and loaded: " + invoked);
+        // Look for the single entrypoint method.
+        var methods = clazz.getMethods();
+        long initializeMethods = java.util.Arrays.stream(methods)
+                .filter(m -> "initialize".equals(m.getName()) && m.getParameterCount() == 1)
+                .count();
+        assertTrue(initializeMethods >= 1, "TestMod should expose initialize(ModContext)");
+
+        System.out.println("[IT] Entrypoint OK");
         mcl.close();
     }
 }
