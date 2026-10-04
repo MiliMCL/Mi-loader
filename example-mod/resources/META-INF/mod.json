@@ -1,8 +1,15 @@
 {
+  "schema": 1,
   "id": "examplemod",
   "name": "Mili Example Mod",
   "version": "1.0.0",
   "description": "Official example mod for Mili Client API",
   "environment": "client",
-  "entrypoint": "com.example.ExampleMod"
+  "entrypoint": "com.example.ExampleMod",
+  "mili": {
+    "platform": "0.1.0",
+    "abi": 1,
+    "minecraft": "26.2"
+  },
+  "dependencies": []
 }

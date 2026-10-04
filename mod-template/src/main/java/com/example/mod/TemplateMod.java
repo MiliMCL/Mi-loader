@@ -36,7 +36,7 @@ public class TemplateMod implements Mod {
     private final AtomicLong tickCounter = new AtomicLong(0);
 
     @Override
-    public void onInitialize(ModContext ctx) {
+    public void initialize(ModContext ctx) {
         this.context = ctx;
         this.log = ctx.logger();
         log.info("[" + ctx.metadata().id() + "] 初始化中...");

@@ -43,7 +43,7 @@ java -jar minecraft-runtime-0.1.0-SNAPSHOT.jar <game-dir>
 
 | 类别 | API | 说明 |
 |------|-----|------|
-| 入口 | `Mod.onInitialize(ctx)` | Mod 生命周期入口 |
+| 入口 | `initialize(ModContext ctx)` | Mod 生命周期单一入口（无旧 fallback） |
 | 上下文 | `ModContext` | 核心 API 入口 |
 | 元数据 | `ctx.metadata()` | Mod ID、版本等 |
 | 作用域 | `ctx.scope()` | Mod 独立的 Scope |
@@ -81,7 +81,7 @@ mod-template/
 
 2. **避免长任务阻塞 EventBus** — EventBus 回调中不要执行耗时操作，使用 `scheduler.submit()` 异步执行。
 
-3. **Capability 请求尽早** — 在 `onInitialize` 中请求所需 Capability，如果被拒绝应优雅降级。
+3. **Capability 请求尽早** — 在 `initialize` 中请求所需 Capability，如果被拒绝应优雅降级。
 
 4. **生命周期监听器** — 监听 `STOPPING` 事件来做最后的清理工作。
 

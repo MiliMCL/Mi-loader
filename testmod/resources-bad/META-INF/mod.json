@@ -1,8 +1,14 @@
 {
+  "schema": 1,
   "id": "badmod",
   "name": "Bad Mod",
   "version": "1.0.0",
   "environment": "client",
   "entrypoint": "com.example.badmod.BadMod",
-  "depends": []
+  "mili": {
+    "platform": "0.1.0",
+    "abi": 1,
+    "minecraft": "26.2"
+  },
+  "dependencies": []
 }

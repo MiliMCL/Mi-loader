@@ -38,7 +38,7 @@ class InstanceManagerTest {
         Instance instance = Instance.builder("default-test").build();
 
         assertEquals("default-test", instance.instanceId());
-        assertEquals("1.21.4", instance.minecraftVersion());
+        assertEquals("26.2", instance.minecraftVersion());
         assertEquals(RuntimeEnvironment.DEDICATED_SERVER, instance.environment());
         assertTrue(instance.modIds().isEmpty());
         assertEquals("default-test", instance.displayName());

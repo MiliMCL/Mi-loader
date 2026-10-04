@@ -53,7 +53,7 @@ class LauncherTest {
         assertEquals("mili-platform", info.project());
         assertEquals(VersionInfo.CURRENT_VERSION, info.version());
         assertEquals(VersionInfo.ABI_VERSION, info.abiVersion());
-        assertEquals("25", info.targetJava());
+        assertEquals(25, info.targetJava());
         assertNotNull(info.toString());
     }
 }

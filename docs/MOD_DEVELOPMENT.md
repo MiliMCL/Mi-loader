@@ -111,7 +111,7 @@ Stub 版的 Runtime 组件，允许模组作者在脱离完整 Minecraft 环境�
   "name": "My Mod",
   "version": "1.0.0",
   "entrypoint": "com.example.MyMod",
-  "mili": { "platform": "0.1.0", "abi": "1.0", "minecraft": "26.2" },
+  "mili": { "platform": "0.1.0", "abi": 1, "minecraft": "26.2" },
   "dependencies": [{ "modId": "other-mod", "required": true }]
 }
 ```
@@ -130,12 +130,10 @@ Stub 版的 Runtime 组件，允许模组作者在脱离完整 Minecraft 环境�
 函数可访问性与方法签名匹配。
 
 `mili.platform` 字段声明模组编译所针对的 Mili 平台版本，当 Loader 升级导致平台版本后
-退时该模组会被标记为不兼容而跳过加载。建议模组作者将此项约束设置为一个合理的前向兼容
-范围，例如声明为 `^0.1.0` 而非精确锁定到补丁版本，从而在平台做非破坏性更新时自动复用
-已发布的模组包而不必重新上传。`mili.abi` 字段声明模组 ABI 兼容性版本，用于 API 破坏性
-变更时的隔离，Loader 会将_abi 版本不匹配的模组视为潜在不兼容并发出警告但不强制阻断（
-除非平台处于严格模式）。严格模式由 Loader 启动参数控制，开启后会拒绝所有 ABI 不兼容的
-模组加载，推荐在生产环境中默认开启以确保模组组的整体稳定性。`mili.minecraft` 字段声明
+退时该模组会被标记为不兼容而跳过加载。platform 字段要求与 `VersionInfo.CURRENT_VERSION`
+严格相等，不支持 SemVer 范围表达式（`^0.1.0`、`~0.1.0` 等均无效）。`mili.abi` 字段声明模组 ABI 兼容性版本（整数），用于 API 破坏性
+变更时的隔离。Loader 要求 abi 整数与 `VersionInfo.ABI_VERSION` 完全相等，任何不匹配均
+拒绝加载（无警告放行模式）。`mili.minecraft` 字段声明
 游戏主版本号，当前官方的要求为 `26.2`。`dependencies` 数组中的每一项通过 `modId` 引用
 其他模组，`required` 字段为 `true` 时若依赖不存在则本机加载失败，为 `false` 时仅当依赖
 存在才会初始化本模组，这种软依赖的设计允许模组在不具备某些可选联动能力的情况下仍然正

@@ -11,7 +11,7 @@ Runtime 子系统的可复用性与可测试性。
 ABI 接口即可。
 
 平台目标运行在 Java 25 上，对接 Minecraft 26.2 客户端， LWJGL natives 版本锁定在
-3.4.1+2。版本常量统一维护在`mili-abi`的`org.loader.api.VersionInfo`中：`CURRENT_VERSION="0.1.0"`，`ABI_VERSION="1.0"`，`TARGET_JAVA="25"`，`TARGET_MINECRAFT="26.2"`。
+3.4.1+2。版本常量统一维护在`mili-abi`的`org.loader.api.VersionInfo`中：`CURRENT_VERSION="0.1.0"`，`ABI_VERSION=1`（整数），`TARGET_JAVA=25`（整数），`TARGET_MINECRAFT="26.2"`。
 
 Mili 平台把 Minecraft 客户端作为宿主进程管理，但理念上 Runtime 并不偶然依赖 Minecraft 存在——所有 Minecraft 相关的适配都集中在单一模块，其他模块在处理
 Minecraft 安装不存在时仍能独立完成启动与校验。这一设计为未来无游戏启动场景留出余地。无游戏启动场景包括：服务器专用工具、开发期 CLI 工具、离线分析、集成测试框架等。
@@ -20,7 +20,7 @@ Mili 不反对与其他加载器共用代码路径。`GameProvider` SPI 允许�
 MultiLoader 式的一码多载； Mod 项目在现阶段不应以跨加载器兼容为目标。
 
 设计理念的一条核心原则是：所有面向 Mod 的 API 只通过 abi 包暴露， runtime 包被视为内部，这样即使平台在后续版本中大幅重构其内部系统， Mod 代码的迁移成本也将降到最低。 ABI
-一旦发布，即承诺向后兼容性； ABI 的演化遵循语义化版本规范，`ABI_VERSION="1.0"`表示当前处于初始稳定阶段，跨大版本升级时以主版本号递增，不会在不加警告的情况下删除或破坏性变更已发布的接口。平台还实行强类型规划：除了少数遗留桥接入口外， abi 层
+一旦发布，即承诺向后兼容性； ABI 的演化遵循语义化版本规范，`ABI_VERSION=1`表示当前处于初始稳定阶段，跨大版本升级时以主版本号递增，不会在不加警告的情况下删除或破坏性变更已发布的接口。平台还实行强类型规划：除了少数遗留桥接入口外， abi 层
 API 的返回类型均使用 sealed interface 与 record，以满足 compile-time exhaustive check。
 
 ## 模块职责
@@ -167,10 +167,10 @@ classloader 通过锁定来实现：它的构造参数不接受动态添加 URL�
 minecraft-integration 实现。`MinecraftLifecycle`在启动成功结束后返回客户端实例引用，由`TickBridge`绑定心跳；启动失败则`MinecraftLifecycle.abnormalShutdown()`被调用。
 
 游戏启动后，`ModDiscovery`扫描`mods/`目录中每个
-JAR，读取`META-INF/mod.json`。清单解析期间任何字段缺失、格式错误、能力名无效的情况都会返回`ValidationResult`，其中包含三种错误代码：`MOD_PLATFORM_MISMATCH`表示当前`RuntimeEnvironment`与清单中的`runtimeEnvironment`不匹配；`MOD_ABI_MISMATCH`表示清单`abiVersion`字段与当前
-ABI 规范不兼容；`MOD_MINECRAFT_MATCH`表示清单中`minecraftVersion`字段与当前实际 MC 版本不一致。解析失败的 Mod 不会进入下一步。`VersionBinding`的解析使用
+JAR，读取`META-INF/mod.json`。清单解析期间任何字段缺失、格式错误、能力名无效的情况都会返回`ValidationResult`，其中包含以下错误代码：`MOD_PLATFORM_MISSING`表示清单缺少 `mili` 对象（未绑定）；`MOD_PLATFORM_MISMATCH`表示清单中 `platform` 字段与当前平台版本不匹配；`MOD_ABI_MISMATCH`表示清单中 `abi` 字段（整数）与当前
+ABI 规范不兼容；`MOD_MINECRAFT_MISMATCH`表示清单中`minecraft`字段与当前实际 MC 版本不一致。解析失败的 Mod 不会进入下一步。`VersionBinding`的解析使用
 MavenArtifact 推荐的版本范围表达式，解析结果为一个四段元组： lowerBound、 upperBound、 lowerInclusive、 upperInclusive。 VersionBinding 支持通配范围如"1.0.*"，语义化范围如
-"^1.2.3"、"~1.2.3"，以及显式区间如 "[1.0, 2.0)"。平台当前的实装版本是 "0.1.0"， ABI 版本为"1.0"；按照设计约定，保持 ABI 兼容性的小版本升级仅会改变 CURRENT_VERSION
+"^1.2.3"、"~1.2.3"，以及显式区间如 "[1.0, 2.0)"。平台当前的实装版本是 "0.1.0"， ABI 版本为 `1`（整数）；按照设计约定，保持 ABI 兼容性的小版本升级仅会改变 CURRENT_VERSION
 的帕累托版本号，而 ABI_VERSION 仅在发生破坏性变更时才会升号。
 
 VersionBinding 还支持 "jit-lock" 模式——当`mili.versionBind`字段未指定时， Mod 默认绑定到当前平台版本；在这种模式下升级平台版本会导致 Mod 解析失败，迫使 Mod
@@ -317,11 +317,11 @@ agent 提供了集成接口，当平台检测到某个 Mod 抛出异常频率超
 
 ## 错误码与版本校验
 
-`ModDiscovery` 在解析 `mod.json` 时执行严格校验，任何不符合条件的清单都将返回 `ValidationResult`，其中包含以下三种错误码。`MOD_PLATFORM_MISMATCH` 表示当前 RuntimeEnvironment（CLIENT/SERVER/DEDICATED_SERVER）与清单中 `runtimeEnvironment` 字段声明的不匹配——例如在 CLIENT 环境中加载 `runtimeEnvironment: "SERVER"` 的 Mod。`MOD_ABI_MISMATCH` 表示清单中 `abiVersion` 字段声明的版本号与当前平台 ABI 规范不兼容，通常是因为 Mod 使用了旧版 ABI 编译且 API 已被破坏性变更。`MOD_MINECRAFT_MATCH` 表示清单中 `minecraftVersion` 字段声明的 MC 版本与当前实际客户端版本（26.2）不一致，意味着 Mod 可能依赖了已被移除或更名的 Minecraft 内部成员。
+`ModDiscovery` 在解析 `mod.json` 时执行严格校验，任何不符合条件的清单都将返回 `ValidationResult`，其中包含以下错误码。`MOD_PLATFORM_MISSING` 表示清单中缺少 `mili` 对象，即 Mod 未绑定三元组声明。`MOD_PLATFORM_MISMATCH` 表示清单中 `platform` 字段声明的版本号与当前平台版本声明的不匹配。`MOD_ABI_MISMATCH` 表示清单中 `abi` 字段（整数）声明的版本号与当前平台 ABI 规范不兼容，通常是因为 Mod 使用了旧版 ABI 编译且 API 已被破坏性变更。`MOD_MINECRAFT_MISMATCH` 表示清单中 `minecraft` 字段声明的 MC 版本与当前实际客户端版本（26.2）不一致，意味着 Mod 可能依赖了已被移除或更名的 Minecraft 内部成员。`MOD_MANIFEST_INVALID` 表示 `mod.json` 解析失败或缺少必填字段（如 `id`）。`MOD_ENTRYPOINT_INVALID` 表示 `entrypoint` 未声明或入口类缺少 `void initialize(ModContext)` 方法。
 
-三种错误均为加载阻断型错误，解析失败的 Mod 不会进入 LOADER 阶段。loader 将异常信息与控制台高亮错误路径并返回清单文件路径，便于修复。在开发模式下，`LoaderConfig.strictManifestValidation=false` 可以将部分阻断错误降级为警告，允许 Mod 加载流程继续进行，但 `<WARN>` 标签会附加在每条日志上，便于追踪潜在问题。
+六种错误均为加载阻断型错误，解析失败的 Mod 不会进入下一步加载阶段。loader 将异常信息与清单文件路径一并输出，便于定位修复。
 
-错误码遵循命名约定 `MILI_<DOMAIN>_<CODE>`，目前已定义的完整集合包括上述三种清单校验错误，以及运行时异常码如 `MILI_LIFECYCLE_ILLEGAL_TRANSITION`（非法状态转换）、`MILI_CAPABILITY_TOKEN_EXPIRED`（能力令牌过期）、`MILI_PERMISSION_DENY_DEFAULT`（权限默认拒绝）、`MILI_RESOURCE_LEAK_DETECTED`（资源泄漏检测）等。错误码的增删受 ab compatibility 约束——生成的错误码永不删除，仅可标记 `@Deprecated`，并保留至下一个主版本号发布后方可移除。
+错误码遵循命名约定 `MOD_<CODE>`，目前已定义的清单校验类错误码包括上述六种，均由加载阶段产生并阻断 Mod 加载。错误码以字符串形式存储于 `ModLoadError`，永不删除，仅可标记 `@Deprecated`，并保留至下一个主版本号发布后方可移除。
 
 ## ABI 演化与兼容保证
 

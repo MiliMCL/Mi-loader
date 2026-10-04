@@ -1,9 +1,15 @@
 {
+  "schema": 1,
   "id": "testmod",
   "name": "Mili Test Mod",
   "version": "1.0.0",
   "description": "Test mod for verifying Mili Mod lifecycle",
   "environment": "client",
   "entrypoint": "com.example.TestMod",
+  "mili": {
+    "platform": "0.1.0",
+    "abi": 1,
+    "minecraft": "26.2"
+  },
   "dependencies": []
 }
