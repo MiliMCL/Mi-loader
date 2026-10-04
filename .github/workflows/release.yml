@@ -42,7 +42,7 @@ jobs:
         run: chmod +x gradlew
 
       - name: Clean build + full test matrix
-        run: ./gradlew clean test --no-daemon --console=plain --no-refresh-dependencies
+        run: ./gradlew clean test --no-daemon --console=plain
 
       - name: Build platform fat JAR
         run: ./gradlew :mili-loader:shadowJar :mili-loader:releaseArtifacts --no-daemon --console=plain
