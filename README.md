@@ -23,6 +23,27 @@ Mili 由四个 Gradle 模块组成，依赖关系严格单向：
 
 模块之间的边界不仅是代码层面的约定，也通过 Gradle 的 `api` 与 `implementation` 关键字严格实施。`mili-abi` 只暴露 `api` 依赖，下游 Mod 无法通过传递依赖引入任何内部类型。`mili-runtime` 对 Loader 暴露 `api` 依赖，但对自己内部的实现细节使用 `implementation` 确保编译期隔离。Gradle 编译器插件定期审核这些依赖声明，一旦发现违规（如 ABI 模块引入了意外依赖），构建会立即失败并给出修复建议。
 
+## Minecraft 26.2 集成流水线
+
+Minecraft 26.2 客户端 JAR 是 Mili Platform 的**正式构建输入**——不只是 manifest 里写 `minecraft=26.2`，而是经过完整处理流水线：
+
+```
+Minecraft 26.2 JAR (build input)
+        ↓  verifyMinecraftArtifact   — 验证存在、可读、版本匹配、Bundler 布局
+        ↓  prepareMinecraft          — 处理 Mojang Bundler，规范化到 build/minecraft/
+        ↓  decompileMinecraft        — CFR 反编译到 build/minecraft/decompiled/（临时产物）
+        ↓  generateMinecraftIntegration — 分析反编译源码，生成元数据 + 桥接源码
+        ↓  compileJava               — 编译集成模块（含自动生成的源）
+        ↓  shadowJar                 — 打入 mili-platform.jar
+```
+
+产物：
+- `META-INF/mili/platform.json` — 含 `minecraftArtifact.sha256` 指纹
+- `META-INF/mili/minecraft.json` — Minecraft 构建指纹（版本、SHA-256、反编译器、类/事件/注册中心数量）
+- `build/minecraft/metadata/minecraft-build-report.json` — 完整构建报告
+
+本地开发时把 `test_client/26.2.jar` 放入仓库根目录即可；CI 通过 `MINECRAFT_ARTIFACT` 环境变量定位。反编译源码是临时构建产物（已加入 `.gitignore`），不提交也不随 Release 发布。
+
 ## 快速开始
 
 编译项目需要 Java 25 环境。以下是完整构建命令：

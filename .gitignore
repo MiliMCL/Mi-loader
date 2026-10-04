@@ -2,4 +2,7 @@
 Build
 logs
 test_client
+
+# MC decompiled sources — build intermediates only (never redistribute)
+**/build/minecraft/decompiled/
 tools

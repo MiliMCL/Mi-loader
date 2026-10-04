@@ -12,6 +12,7 @@
 import java.io.File
 import java.security.MessageDigest
 import java.time.Instant
+import java.util.zip.ZipFile
 
 plugins {
     `java-library`
@@ -29,9 +30,7 @@ dependencies {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Generate platform.json descriptor into build/resources/main/META-INF/mili/
-// every time processResources runs. The fat JAR picks it up from the main
-// source set output.
+// 1. Generate platform.json descriptor with Minecraft artifact fingerprint.
 // ---------------------------------------------------------------------------
 tasks.named<Copy>("processResources") {
     doLast {
@@ -41,6 +40,8 @@ tasks.named<Copy>("processResources") {
         val javaVersion = rootProject.findProperty("javaVersion") ?: "25"
         val platformId = "mili-${platformVersion}-mc${minecraftVersion}"
         val timestamp = Instant.now().toString()
+
+        val mcSha = minecraftArtifactSha256(minecraftVersion.toString())
 
         val metaDir = layout.buildDirectory.dir("resources/main/META-INF/mili").get().asFile
         metaDir.mkdirs()
@@ -53,12 +54,42 @@ tasks.named<Copy>("processResources") {
             append("  \"minecraft\": \"$minecraftVersion\",\n")
             append("  \"java\": $javaVersion,\n")
             append("  \"platformId\": \"$platformId\",\n")
-            append("  \"buildTimestamp\": \"$timestamp\"\n")
+            append("  \"buildTimestamp\": \"$timestamp\",\n")
+            append("  \"minecraftArtifact\": {\n")
+            append("    \"version\": \"$minecraftVersion\",\n")
+            append("    \"sha256\": \"$mcSha\"\n")
+            append("  }\n")
             append("}\n")
         }
         metaFile.writeText(body)
-        logger.lifecycle("[platform] Generated ${metaFile.absolutePath}")
+        logger.lifecycle("[platform] Generated ${metaFile.absolutePath} (mc.sha256=${mcSha.take(16)}...)")
     }
+}
+
+/** Resolve the Minecraft build-input JAR and compute its SHA-256 (best-effort — degrades to local file hash or "unknown"). */
+fun minecraftArtifactSha256(version: String): String {
+    val path: String? = rootProject.findProperty("minecraftArtifact") as String?
+        ?: System.getenv("MINECRAFT_ARTIFACT")
+    val jar: File? = when {
+        !path.isNullOrBlank() -> File(path)
+        else -> {
+            val dirs = listOf(
+                rootProject.layout.projectDirectory.dir("test_client").asFile,
+                layout.projectDirectory.dir("test_client").asFile
+            )
+            dirs.filter { it.isDirectory }
+                .mapNotNull { d -> d.listFiles { f -> f.name.endsWith(".jar") && f.name.contains(version) }?.firstOrNull() }
+                .firstOrNull()
+        }
+    }
+    if (jar == null || !jar.exists()) return "unknown"
+    val digest = MessageDigest.getInstance("SHA-256")
+    jar.inputStream().use { input ->
+        val buf = ByteArray(8192)
+        var n = input.read(buf)
+        while (n > 0) { digest.update(buf, 0, n); n = input.read(buf) }
+    }
+    return digest.digest().joinToString("") { "%02x".format(it) }
 }
 
 // ---------------------------------------------------------------------------
@@ -103,6 +134,54 @@ tasks.named<Jar>("jar") {
 // `build` should produce the shadow JAR directly.
 tasks.named("build") {
     dependsOn(tasks.named("shadowJar"))
+}
+
+// ── verifyPlatformJar — integrity check on the platform JAR ────────────────
+val verifyPlatformJar = tasks.register<Task>("verifyPlatformJar") {
+    group = "verification"
+    description = "Validates platform JAR has expected Mili modules + META-INF mili/minecraft.json fingerprint."
+
+    dependsOn(tasks.named("shadowJar"))
+    val platformVersion = rootProject.findProperty("miliPlatformVersion") ?: "0.1.0"
+    val minecraftVersion = rootProject.findProperty("minecraftVersion") ?: "26.2"
+    inputs.file(layout.buildDirectory.file("libs/mili-${platformVersion}-mc${minecraftVersion}.jar"))
+    outputs.file(layout.buildDirectory.file("verification/platform-jar.verified"))
+
+    doLast {
+        val platformVersion = rootProject.findProperty("miliPlatformVersion") ?: "0.1.0"
+        val minecraftVersion = rootProject.findProperty("minecraftVersion") ?: "26.2"
+        val jar = layout.buildDirectory.file("libs/mili-${platformVersion}-mc${minecraftVersion}.jar").get().asFile
+        require(jar.exists()) { "Platform JAR missing: ${jar.absolutePath}" }
+
+        var mcClasses = 0; var miliClasses = 0; var hasPlatformJson = false; var hasMinecraftJson = false
+        var totalEntries = 0
+        var platformJsonText = ""; var minecraftJsonText = ""
+
+        val zf = ZipFile(jar)
+        try {
+            val entries = zf.entries()
+            while (entries.hasMoreElements()) {
+                val entry = entries.nextElement()
+                totalEntries++
+                when (entry.name) {
+                    "META-INF/mili/platform.json" -> { hasPlatformJson = true; platformJsonText = zf.getInputStream(entry).bufferedReader().readText() }
+                    "META-INF/mili/minecraft.json" -> { hasMinecraftJson = true; minecraftJsonText = zf.getInputStream(entry).bufferedReader().readText() }
+                }
+                if (entry.name.startsWith("net/minecraft/") && entry.name.endsWith(".class")) mcClasses++
+                if (entry.name.startsWith("org/loader/") && entry.name.endsWith(".class")) miliClasses++
+            }
+        } finally { zf.close() }
+
+        require(hasPlatformJson) { "META-INF/mili/platform.json missing" }
+        require(hasMinecraftJson) { "META-INF/mili/minecraft.json (MC build fingerprint) missing" }
+        require(platformJsonText.contains(minecraftVersion.toString())) { "platform.json missing minecraft=${minecraftVersion}" }
+        require(minecraftJsonText.contains("artifactSha256")) { "minecraft.json missing artifactSha256 fingerprint" }
+
+        val marker = File(layout.buildDirectory.get().asFile, "verification/platform-jar.verified")
+        marker.parentFile.mkdirs()
+        marker.writeText("verified_at=${Instant.now()}\ntotal=${totalEntries}\nmcClasses=${mcClasses}\nmiliClasses=${miliClasses}\n")
+        logger.lifecycle("[verify] Platform JAR OK — ${totalEntries} entries (${mcClasses} net.minecraft, ${miliClasses} org.loader)")
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -165,7 +244,12 @@ tasks.register("releaseArtifacts") {
 
         val timestamp = Instant.now().toString()
 
+        // minecraft SHA for release manifest (MC build input fingerprint)
+        val mcSha = minecraftArtifactSha256(minecraftVersion.toString())
+
         // release-manifest.json
+        val modulesJson = "{ \"abi\": \"$platformVersion\", \"runtime\": \"$platformVersion\", \"loader\": \"$platformVersion\", \"minecraftIntegration\": \"$platformVersion\" }"
+
         val manifestJson = buildString {
             append("{\n")
             append("  \"platformId\": \"${artifactBase}\",\n")
@@ -176,6 +260,12 @@ tasks.register("releaseArtifacts") {
             append("  \"commit\": \"$commit\",\n")
             append("  \"tag\": \"$tag\",\n")
             append("  \"buildTimestamp\": \"$timestamp\",\n")
+            append("  \"modules\": $modulesJson,\n")
+            append("  \"minecraftBuild\": {\n")
+            append("    \"version\": \"$minecraftVersion\",\n")
+            append("    \"artifactSha256\": \"$mcSha\",\n")
+            append("    \"decompiled\": true\n")
+            append("  },\n")
             append("  \"assets\": {\n")
             append("    \"platform\": \"${destJar.name}\",\n")
             append("    \"sha256\": \"$sha\"\n")
