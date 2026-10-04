@@ -203,7 +203,12 @@ tasks.jar {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fun resolveMinecraftArtifact(explicitPath: String?): File {
-    if (!explicitPath.isNullOrBlank()) return File(explicitPath).absoluteFile
+    if (!explicitPath.isNullOrBlank()) {
+        val f = File(explicitPath)
+        // A relative path here would resolve against the Gradle daemon's working
+        // directory (Gradle user home), not the project — resolve it ourselves.
+        return if (f.isAbsolute) f else project.layout.projectDirectory.file(explicitPath).asFile.absoluteFile
+    }
 
     val projectDir = project.layout.projectDirectory.asFile
     val candidate = projectDir.resolve("test_client")

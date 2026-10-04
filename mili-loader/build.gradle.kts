@@ -71,7 +71,12 @@ fun minecraftArtifactSha256(version: String): String {
     val path: String? = rootProject.findProperty("minecraftArtifact") as String?
         ?: System.getenv("MINECRAFT_ARTIFACT")
     val jar: File? = when {
-        !path.isNullOrBlank() -> File(path)
+        !path.isNullOrBlank() -> {
+            val f = File(path)
+            // Relative paths must be anchored to the project, not the daemon CWD.
+            if (f.isAbsolute) f
+            else rootProject.layout.projectDirectory.file(path).asFile.absoluteFile
+        }
         else -> {
             val dirs = listOf(
                 rootProject.layout.projectDirectory.dir("test_client").asFile,
