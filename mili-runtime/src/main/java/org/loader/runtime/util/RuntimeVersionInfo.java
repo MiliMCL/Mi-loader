@@ -10,9 +10,9 @@ import org.loader.api.VersionInfo;
 public record RuntimeVersionInfo(
         String project,
         String version,
-        String abiVersion,
+        int abiVersion,
         String buildTimestamp,
-        String targetJava,
+        int targetJava,
         String description
 ) {
     public static RuntimeVersionInfo current() {

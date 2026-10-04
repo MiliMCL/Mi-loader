@@ -1,6 +1,6 @@
 # Mili ABI Contract
 
-`org.loader.api` 是 Mili Platform 的稳定契约面。所有 Mod 只编译 `mili-abi`，运行时由 Loader 注入具体实现。`mili-abi` 模块本身零运行时依赖，不引用任何 Minecraft 类、第三方库或 Mili 内部组件。一旦接口进入 1.0 版本，即视为 ABI 稳定——任何破坏性变更必须提升 `ABI_VERSION`，不接受 Patch 级别的隐式变更。`VersionInfo` 常量表是版本信息的唯一权威来源：`CURRENT_VERSION="0.1.0"` 代表 Loader 实现版本，`ABI_VERSION="1.0"` 代表 Mod 契约版本，`TARGET_JAVA="25"` 与 `TARGET_MINECRAFT="26.2"` 锁定平台基线。Loader 在启动时读取这些常量并执行版本三元组校验，任何不匹配都会导致加载流程中止，同时生成结构化的错误报告供用户参考。
+`org.loader.api` 是 Mili Platform 的稳定契约面。所有 Mod 只编译 `mili-abi`，运行时由 Loader 注入具体实现。`mili-abi` 模块本身零运行时依赖，不引用任何 Minecraft 类、第三方库或 Mili 内部组件。一旦接口进入 1.0 版本，即视为 ABI 稳定——任何破坏性变更必须提升 `ABI_VERSION`，不接受 Patch 级别的隐式变更。`VersionInfo` 常量表是版本信息的唯一权威来源：`CURRENT_VERSION="0.1.0"` 代表 Loader 实现版本，`ABI_VERSION=1` 代表 Mod 契约版本（整数），`TARGET_JAVA=25`（整数）与 `TARGET_MINECRAFT="26.2"` 锁定平台基线。Loader 在启动时读取这些常量并执行版本三元组校验，任何不匹配都会导致加载流程中止，同时生成结构化的错误报告供用户参考。
 
 ## 主要接口描述
 

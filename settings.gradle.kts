@@ -5,6 +5,10 @@ pluginManagement {
     }
 }
 
+plugins {
+    id("com.gradleup.shadow") version "9.4.1" apply false
+}
+
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {

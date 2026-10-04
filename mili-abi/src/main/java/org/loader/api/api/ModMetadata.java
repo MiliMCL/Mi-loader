@@ -42,5 +42,5 @@ public interface ModMetadata {
     /**
      * Returns the fully-qualified main class name, or empty string if unspecified.
      */
-    String mainClass();
+    String entrypoint();
 }

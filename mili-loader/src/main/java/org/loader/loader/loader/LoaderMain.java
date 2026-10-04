@@ -5,6 +5,7 @@ import org.loader.loader.config.LoaderConfig;
 import org.loader.loader.discovery.ModDiscovery;
 import org.loader.loader.game.GameProvider;
 import org.loader.runtime.RuntimeEnvironment;
+import org.loader.runtime.error.ModLoadError;
 import org.loader.runtime.mod.Mod;
 import org.loader.runtime.mod.ModContext;
 import org.loader.runtime.mod.ModManifest;
@@ -19,8 +20,18 @@ import java.util.List;
 import java.util.ServiceLoader;
 
 /**
- * Mili Runtime Loader entry point.
- * Boot: discover game -> discover mods -> bootstrap Runtime -> init mods -> launch MC.
+ * Mili Platform Loader 入口。
+ * 启动顺序：
+ * 1. 发现 Minecraft
+ * 2. 读取 Platform Descriptor
+ * 3. 发现 Mod
+ * 4. 解析 Manifest
+ * 5. Manifest Schema 校验
+ * 6. Mili Platform / ABI / Minecraft Version 严格校验
+ * 7. 依赖解析
+ * 8. ClassLoader 创建
+ * 9. 调用 Mod 入口方法 {@code initialize(ModContext)}
+ * 10. 启动 Minecraft
  */
 public class LoaderMain {
 
@@ -63,21 +74,18 @@ public class LoaderMain {
 
         runtime.start();
 
-        // Strict platform version validation before loading
+        // 严格平台版本校验 —— 拒绝任何不匹配或未绑定的 Mod
         validateVersionBindings(resolved);
 
-        // Create Mod objects with their own Scopes
         for (ModManifest manifest : resolved) {
             org.loader.runtime.kernel.Scope modScope = runtime.rootScope().createChild("mod:" + manifest.id());
             createModClassLoader(manifest, gameClasspath);
             var mcl = classLoaderManager.getModClassLoader(manifest.id());
             Mod mod = new Mod(manifest, modScope, mcl.getClassLoader());
             loadedMods.add(mod);
-            // Register mod as resource of its scope
             modScope.registerResource(mod);
         }
 
-        // Invoke entrypoints with full ModContext
         invokeModEntrypoints();
 
         try {
@@ -98,58 +106,41 @@ public class LoaderMain {
         classLoaderManager.createModClassLoaderManifest(mod, Arrays.asList(urls), gameDir);
     }
 
+    /**
+     * 调用 Mod 入口点。
+     * 标准单一入口：{@code void initialize(ModContext ctx)}。
+     * 不再接受 {@code onInitialize(ModContext)}、{@code main(String[])}、{@code init()} 等旧 fallback。
+     * 找不到入口将作为 ModLoadError 抛出，不会静默忽略。
+     */
     private void invokeModEntrypoints() {
         for (Mod mod : loadedMods) {
-            String mainClass = mod.manifest().mainClass();
-            if (mainClass == null || mainClass.isEmpty()) continue;
-
+            String entrypoint = mod.manifest().entrypoint();
+            if (entrypoint == null || entrypoint.isBlank()) {
+                throw new ModLoadError("Mod '" + mod.id() + "' 没有声明 entrypoint", "MOD_ENTRYPOINT_INVALID");
+            }
             try {
                 var mcl = classLoaderManager.getModClassLoader(mod.id());
-                if (mcl == null) continue;
-                Class<?> clazz = mcl.loadModClass(mainClass);
+                if (mcl == null) {
+                    throw new ModLoadError("Mod '" + mod.id() + "' ClassLoader 不存在", "MOD_ENTRYPOINT_INVALID");
+                }
+                Class<?> clazz = mcl.loadModClass(entrypoint);
                 Object instance = clazz.getDeclaredConstructor().newInstance();
                 ModContext ctx = new ModContext(mod);
-                boolean invoked = false;
 
-                // Try initialize(ModContext)
-                for (var method : clazz.getMethods()) {
-                    if ("initialize".equals(method.getName()) && method.getParameterCount() == 1
-                            && method.getParameterTypes()[0].equals(ModContext.class)) {
-                        method.invoke(instance, ctx);
-                        invoked = true;
-                        break;
-                    }
-                }
+                // 严格只允许 void initialize(ModContext ctx)
+                var method = clazz.getMethod("initialize", ModContext.class);
+                method.invoke(instance, ctx);
+                System.out.println("[Mili] Mod initialized: " + mod.id() + " -> " + entrypoint);
 
-                // Fallback to any interface param (ModLog compat)
-                if (!invoked) {
-                    for (var method : clazz.getMethods()) {
-                        if ("initialize".equals(method.getName()) && method.getParameterCount() == 1
-                                && method.getParameterTypes()[0].isInterface()
-                                && !method.getParameterTypes()[0].equals(ModContext.class)) {
-                            Object proxy = java.lang.reflect.Proxy.newProxyInstance(
-                                    method.getParameterTypes()[0].getClassLoader(),
-                                    new Class<?>[]{method.getParameterTypes()[0]},
-                                    (p, m, a) -> {
-                                        if ("info".equals(m.getName()) && a != null && a.length > 0)
-                                            System.out.println("[Mod:" + mod.id() + "] " + a[0]);
-                                        return null;
-                                    });
-                            method.invoke(instance, proxy);
-                            invoked = true;
-                            break;
-                        }
-                    }
-                }
-
-                if (!invoked) {
-                    try { clazz.getMethod("initialize").invoke(instance); } catch (NoSuchMethodException ignored) {}
-                }
-
-                System.out.println("[Mili] Mod initialized: " + mod.id() + " -> " + mainClass);
-
+            } catch (NoSuchMethodException e) {
+                throw new ModLoadError(
+                    "Mod '" + mod.id() + "' 缺少标准入口 void initialize(ModContext ctx)",
+                    "MOD_ENTRYPOINT_INVALID");
+            } catch (ModLoadError e) {
+                throw e;
             } catch (Exception e) {
-                System.err.println("[Loader] Mod '" + mod.id() + "' FAILED: " + e.getMessage());
+                throw new ModLoadError("Mod '" + mod.id() + "' 入口调用失败: " + e.getMessage(),
+                    "MOD_ENTRYPOINT_INVALID");
             }
         }
     }
@@ -169,30 +160,43 @@ public class LoaderMain {
         return rest;
     }
 
-
     /**
-     * Enforces strict platform version matching per spec.
-     * Each discovered mod is checked against the running platform triple
-     * (platform version, ABI version, minecraft version).
+     * 强制平台版本三元组精确匹配。
+     * <ul>
+     *     <li>未绑定 mili metadata: MOD_PLATFORM_MISSING</li>
+     *     <li>platform 不匹配: MOD_PLATFORM_MISMATCH</li>
+     *     <li>ABI 不匹配: MOD_ABI_MISMATCH</li>
+     *     <li>Minecraft 不匹配: MOD_MINECRAFT_MISMATCH</li>
+     * </ul>
      */
     private void validateVersionBindings(List<ModManifest> manifests) {
         for (ModManifest m : manifests) {
             ValidationResult result = m.validateVersionBinding();
-            if (result instanceof ValidationResult.PlatformMismatch pm) {
-                throw new org.loader.runtime.error.ModLoadError(
-                    "Mod '" + m.id() + "' requires Mili platform " + pm.expected()
-                    + ", running " + pm.actual() + " (MOD_PLATFORM_MISMATCH)");
+            if (result instanceof ValidationResult.MissingBinding) {
+                throw new ModLoadError(diagnostic(m, "没有声明 mili 平台绑定",
+                    "MOD_PLATFORM_MISSING"), "MOD_PLATFORM_MISSING");
+            } else if (result instanceof ValidationResult.PlatformMismatch pm) {
+                throw new ModLoadError(diagnostic(m,
+                    "Mili Platform 版本不匹配，需要 " + pm.expected() + "，当前 " + pm.actual(),
+                    "MOD_PLATFORM_MISMATCH"), "MOD_PLATFORM_MISMATCH");
             } else if (result instanceof ValidationResult.AbiMismatch am) {
-                throw new org.loader.runtime.error.ModLoadError(
-                    "Mod '" + m.id() + "' requires Mili ABI " + am.expected()
-                    + ", running " + am.actual() + " (MOD_ABI_MISMATCH)");
+                throw new ModLoadError(diagnostic(m,
+                    "ABI 版本不匹配，需要 " + am.expected() + "，当前 " + am.actual(),
+                    "MOD_ABI_MISMATCH"), "MOD_ABI_MISMATCH");
             } else if (result instanceof ValidationResult.MinecraftMismatch mm) {
-                throw new org.loader.runtime.error.ModLoadError(
-                    "Mod '" + m.id() + "' requires Minecraft " + mm.expected()
-                    + ", running " + mm.actual() + " (MOD_MINECRAFT_MISMATCH)");
+                throw new ModLoadError(diagnostic(m,
+                    "Minecraft 版本不匹配，需要 " + mm.expected() + "，当前 " + mm.actual(),
+                    "MOD_MINECRAFT_MISMATCH"), "MOD_MINECRAFT_MISMATCH");
             }
         }
     }
+
+    private String diagnostic(ModManifest m, String detail, String code) {
+        return "[Mod: " + m.id() + "] " + detail + "\n" +
+               "  ErrorCode: " + code + "\n" +
+               "  ModFile: " + m.name() + " v" + m.version();
+    }
+
     public org.loader.runtime.kernel.Runtime runtime() { return runtime; }
     public List<Mod> getLoadedMods() { return Collections.unmodifiableList(loadedMods); }
 }

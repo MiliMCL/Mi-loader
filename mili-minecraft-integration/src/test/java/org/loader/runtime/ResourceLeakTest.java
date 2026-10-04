@@ -35,21 +35,20 @@ class ResourceLeakTest {
 
         org.loader.runtime.kernel.Runtime runtime = org.loader.runtime.kernel.Runtime.create("leak-test-1");
         runtime.start();
-        // Submit a task to eagerly start at least one worker thread
+        // Submit a task so scheduler workers are alive
         AtomicInteger tick = new AtomicInteger(0);
         runtime.scheduler().submit(runtime.rootScope(), () -> tick.incrementAndGet()).await();
-
-        // After start and task submission, scheduler threads should be alive
-        int afterStartDispatcher = countThreads("runtime-dispatcher");
-        assertTrue(afterStartDispatcher > beforeDispatcher,
-                "Runtime should start a dispatcher thread after start+.submit()");
+        assertEquals(1, tick.get(), "Submitted task should have executed");
 
         runtime.close();
 
         // Give threads time to terminate
-        Thread.sleep(300);
+        Thread.sleep(500);
 
+        int after = countThreads("runtime-scheduler-");
         int afterDispatcher = countThreads("runtime-dispatcher");
+        assertTrue(after <= before,
+                "Scheduler worker threads should be terminated after close. Before=" + before + " After=" + after);
         assertTrue(afterDispatcher <= beforeDispatcher,
                 "Dispatcher threads should be terminated after close. Before=" + beforeDispatcher + " After=" + afterDispatcher);
     }

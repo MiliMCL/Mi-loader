@@ -158,7 +158,7 @@ Each mod ships a `META-INF/mod.json` file that describes its identity, entry poi
 | `version` | String | Yes | Semantic version (e.g. `"1.0.0"`). |
 | `author` | String | No | Mod author name. Default: `""`. |
 | `description` | String | No | Short mod description. Default: `""`. |
-| `mainClass` | String | Yes | Fully-qualified class name with `initialize(ModContext)` method. |
+| `entrypoint` | String | Yes | Fully-qualified class name with `initialize(ModContext)` method. |
 | `dependencies` | Array | No | List of mod dependencies. Default: `[]`. |
 | `capabilities` | Array | No | Declared capability strings. Default: `[]`. |
 | `modules` | Array | No | Child module names for large mods. Default: `[]`. |
@@ -181,7 +181,7 @@ Each mod ships a `META-INF/mod.json` file that describes its identity, entry poi
 
 ## Mod Entry Point
 
-A mod implements the `Mod` interface with a single `onInitialize(ModContext)` method.
+A mod implements the `Mod` interface with a single `initialize(ModContext)` method.
 
 ### Required Signature
 
@@ -194,7 +194,7 @@ import org.loader.runtime.mod.ModContext;
 public class MyMod implements Mod {
 
     @Override
-    public void onInitialize(ModContext ctx) {
+    public void initialize(ModContext ctx) {
         ctx.logger().info("MyMod initializing...");
         // Subscribe to events, schedule tasks, register resources here
     }
@@ -971,7 +971,7 @@ Dependencies are declared in `mod.json` and resolved at load time. Mili uses top
 ```json
 {
   "id": "my-mod",
-  "mainClass": "com.example.MyMod",
+  "entrypoint": "com.example.MyMod",
   "dependencies": [
     {
       "modId": "library-mod",
