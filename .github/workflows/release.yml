@@ -18,14 +18,15 @@ jobs:
           echo "version=$TAG"       >> $GITHUB_OUTPUT
           echo "Tag: ${GITHUB_REF_NAME} -> version $TAG"
 
-      - name: Verify tag matches gradle.properties
+      - name: Verify tag matches minecraft version in gradle.properties
         run: |
-          PROP=$(grep '^miliPlatformVersion=' gradle.properties | cut -d= -f2)
-          if [ "$PROP" != "$TAG_VERSION" ]; then
-            echo "Tag v${TAG_VERSION} != miliPlatformVersion=${PROP}"
+          # Tag convention: v<minecraftVersion>  (e.g. v26.2 -> minecraftVersion=26.2)
+          MC=$(grep '^minecraftVersion=' gradle.properties | cut -d= -f2)
+          if [ "$MC" != "$TAG_VERSION" ]; then
+            echo "Tag v${TAG_VERSION} != minecraftVersion=${MC}"
             exit 1
           fi
-          echo "Tag matches gradle.properties (${PROP})"
+          echo "Tag v${TAG_VERSION} matches minecraftVersion=${MC}"
 
       - name: Set up JDK 25
         uses: actions/setup-java@v4
