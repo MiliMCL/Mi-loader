@@ -30,20 +30,25 @@ jobs:
           fi
           echo "Tag v${TAG_VERSION} matches minecraftVersion=${MC}"
 
-      - name: Detect Minecraft artifact
+      - name: Fetch Minecraft client JAR (official Mojang source)
         id: mc
         run: |
-          ARTIFACT=$(find . -path '*test_client*' -name '*.jar' 2>/dev/null | grep '26' | head -1)
-          if [ -n "$ARTIFACT" ] && [ -f "$ARTIFACT" ]; then
-            echo "found=true" >> $GITHUB_OUTPUT
-            echo "path=$ARTIFACT" >> $GITHUB_OUTPUT
-            echo "size=$(stat -c%s "$ARTIFACT")" >> $GITHUB_OUTPUT
-            echo "sha=$(sha256sum "$ARTIFACT" | cut -d' ' -f1)" >> $GITHUB_OUTPUT
-            echo "[MC] Found 26.2 JAR: $ARTIFACT ($(stat -c%s "$ARTIFACT") bytes)"
-          else
-            echo "found=false" >> $GITHUB_OUTPUT
-            echo "[MC] WARNING: No 26.2 JAR available — pipeline will skip decompile"
-          fi
+          set -euo pipefail
+          MC_VER=$(grep '^minecraftVersion=' gradle.properties | cut -d= -f2)
+          META_URL=$(curl -fsSL https://piston-meta.mojang.com/mc/game/version_manifest_v2.json \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(v['url'] for v in d['versions'] if v['id']=='$MC_VER'))")
+          read -r CLIENT_URL CLIENT_SHA1 <<<"$(curl -fsSL "$META_URL" \
+            | python3 -c "import json,sys; c=json.load(sys.stdin)['downloads']['client']; print(c['url'], c['sha1'])")"
+          mkdir -p test_client
+          curl -fsSL -o "test_client/${MC_VER}.jar" "$CLIENT_URL"
+          echo "${CLIENT_SHA1}  test_client/${MC_VER}.jar" | sha1sum -c -
+          {
+            echo "found=true"
+            echo "path=test_client/${MC_VER}.jar"
+            echo "size=$(stat -c%s "test_client/${MC_VER}.jar")"
+            echo "sha=$(sha256sum "test_client/${MC_VER}.jar" | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+          echo "[MC] Fetched $CLIENT_URL -> test_client/${MC_VER}.jar"
 
       - name: Set up JDK 25
         uses: actions/setup-java@v4

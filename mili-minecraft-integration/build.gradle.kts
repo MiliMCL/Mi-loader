@@ -75,6 +75,16 @@ val verifyMinecraftArtifact = tasks.register("verifyMinecraftArtifact") {
         } catch (e: Exception) {
             mcAvailableMarker.writeText("false")
             logger.lifecycle("[Minecraft] SKIP — ${e.message}")
+            // Generate a minimal minecraft.json so the platform JAR always carries
+            // a fingerprint (even when the decompile pipeline was skipped in CI).
+            minecraftMetadataDir.mkdirs()
+            val mcJson = File(minecraftMetadataDir, "minecraft.json")
+            mcJson.writeText("""{
+              "minecraft": "$minecraftVersion",
+              "artifactSha256": "unknown",
+              "skipped": true
+            }""")
+            logger.lifecycle("[Minecraft] Wrote minimal ${mcJson.absolutePath} (skipped)")
         }
     }
 }
@@ -120,6 +130,9 @@ val decompileMinecraft = tasks.register<JavaExec>("decompileMinecraft") {
     onlyIf { mcAvailableMarker.exists() && mcAvailableMarker.readText().trim() == "true" }
     mainClass.set("org.benf.cfr.reader.Main")
     classpath = decompilerCfg
+    // Full Minecraft is ~10k classes; the default (1/4 RAM) heap OOMs the
+    // runner and the task dies before producing sources.
+    maxHeapSize = "4g"
 
     doFirst {
         minecraftDecompiledDir.mkdirs()
