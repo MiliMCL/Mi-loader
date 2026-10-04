@@ -34,7 +34,8 @@ import static org.junit.jupiter.api.Assertions.*;
 class ModDiscoveryIT {
 
     private static final String SYSTEM_PROPERTY = "mili.it.clientDir";
-    private static final String FIXTURE_RESOURCE_DIR = "/client-fixtures/mods";
+    // NOTE: ClassLoader.getResourceAsStream uses paths without a leading slash.
+    private static final String FIXTURE_RESOURCE_DIR = "client-fixtures/mods";
 
     private static Path resolveClientDir() {
         String override = System.getProperty(SYSTEM_PROPERTY);

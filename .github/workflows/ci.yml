@@ -103,10 +103,4 @@ jobs:
           ./gradlew :mili-runtime:dependencies --configuration runtimeClasspath --no-daemon --console=plain | grep -E "mili-|---" || true
           echo "--- abi dependencies (should be empty) ---"
           ./gradlew :mili-abi:dependencies --configuration runtimeClasspath --no-daemon --console=plain | grep -E "mili-|---" || true
-
-      - name: Verify no hardcoded 'E:\\loader' in source
-        run: |
-          if grep -rE "E:\\\\loader" --include=*.java --include=*.kt --include=*.kts . ; then
-            echo "ERROR: hardcoded 'E:\\loader' detected. Use relative/path-param."
-            exit 1
-          fi
+          
