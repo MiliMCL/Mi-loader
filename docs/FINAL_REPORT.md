@@ -1,5 +1,10 @@
 # Mili Platform — 工程交付最终审计报告
 
+> 审计日期：2026-10-04  
+> 代码基线：commit `1fc964b`  
+> Mili Platform `0.1.0-mc26.2`（ABI 1，Minecraft 26.2，Java 25）工程交付审计——含 **Minecraft 26.2 完整集成流水线**。  
+> 本次变更：MC 26.2 JAR 成为正式构建输入（验证→解压→反编译→元数据生成→编译→封入平台 JAR），同时Release manifest 增加 `minecraftBuild` 指纹段。
+
 ---
 
 ## 0. 测试矩阵
@@ -55,6 +60,36 @@ ABI 在 `mod.json` schema 中也以整数 `1` 编码（非字符串 `"1.0"`）�
 ```
 
 参见：`mili-loader/build.gradle.kts — processResources.doLast`。
+
+## 2.5 Minecraft 26.2 集成流水线（完整实现）
+
+Minecraft 26.2 客户端 JAR 现在是正式构建输入——经过完整流水线处理后封入平台 JAR：
+
+| Stage | Gradle task | 输入 | 产物 |
+|---|---|---|---|
+| 1. 验证 | `verifyMinecraftArtifact` | `test_client/26.2.jar` 或 `$MINECRAFT_ARTIFACT` | 版本确认 + bundler 探测 |
+| 2. 解压 | `prepareMinecraft` | MC JAR | `build/minecraft/extracted/`（规范化 class 文件） |
+| 3. 反编译 | `decompileMinecraft` | 上一步提取的 class | `build/minecraft/decompiled/*.java`（CFR，临时产物） |
+| 4. 元数据生成 | `generateMinecraftIntegration` | 反编译源码 | `Minecraft26_2Metadata.java`（编译入模块）+ `minecraft.json` + `minecraft-build-report.json` |
+
+元数据文件 `META-INF/mili/minecraft.json` 含：
+- `artifactSha256` — MC 构建输入 SHA-256 指纹
+- `decompiler` — 使用的反编译器（cfr）
+- `totalClasses` — 反编译发现的 MC 类数（本次: 6513）
+- `eventTypes` / `registries` — 自动枚举的 MC 事件类型 / 注册中心
+
+`build/minecraft/decompiled/` 已加入 `.gitignore`，不提交也不进入 Release（遵守 Mojang EULA）。
+
+平台 JAR 验证任务 `verifyPlatformJar` 明确检查 `mETA-INF/mili/minecraft.json` 存在且含 `artifactSha256` 字段，**不通过则 BUILD FAIL**——确保任何声称含 MC 指纹的 Release 真实有效。
+
+Release manifest 新增 `minecraftBuild` 段（spec §37）：
+```json
+"minecraftBuild": {
+  "version": "26.2",
+  "artifactSha256": "<sha256>",
+  "decompiled": true
+}
+```
 
 ---
 
