@@ -1,35 +1,32 @@
 plugins {
-    java
+    `java-library`
 }
 
-group = "org.loader"
-version = "0.1.0-SNAPSHOT"
+// Root project: aggregates submodules, no source code.
+// All source lives in mili-abi, mili-runtime, mili-loader, mili-minecraft-integration.
 
-java {
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
-}
+subprojects {
+    apply(plugin = "java-library")
 
-repositories {
-    mavenCentral()
-}
+    group = "org.loader"
+    version = rootProject.findProperty("miliPlatformVersion") ?: "0.1.0"
 
-dependencies {
-    testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
-    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
-}
+    java {
+        sourceCompatibility = JavaVersion.VERSION_25
+        targetCompatibility = JavaVersion.VERSION_25
+        withSourcesJar()
+    }
 
-tasks.test {
-    useJUnitPlatform()
-}
+    dependencies {
+        testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
+        testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    }
 
-tasks.jar {
-    manifest {
-        attributes(
-            "Main-Class" to "org.loader.loader.LoaderMain",
-            "Implementation-Title" to "Mili Runtime Loader",
-            "Implementation-Version" to version,
-            "Multi-Release" to "false"
-        )
+    tasks.test {
+        useJUnitPlatform()
+        testLogging {
+            events("passed", "failed")
+            showStandardStreams = false
+        }
     }
 }
