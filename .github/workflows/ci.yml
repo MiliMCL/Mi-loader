@@ -34,10 +34,10 @@ jobs:
         run: chmod +x gradlew
 
       - name: Compile all modules
-        run: ./gradlew compileJava compileTestJava --no-daemon --console=plain --no-refresh-dependencies
+        run: ./gradlew compileJava compileTestJava --no-daemon --console=plain
 
       - name: Run all tests
-        run: ./gradlew test --no-daemon --console=plain --no-refresh-dependencies
+        run: ./gradlew test --no-daemon --console=plain
 
       - name: Build platform fat JAR
         run: ./gradlew :mili-loader:shadowJar --no-daemon --console=plain
