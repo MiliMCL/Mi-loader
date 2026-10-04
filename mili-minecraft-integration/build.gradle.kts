@@ -9,6 +9,7 @@
 //         ↓  generateMinecraftIntegration
 //         ↓  compileJava → shadowJar
 //
+// Pipeline is GRACEFULLY SKIPPED when no MC artifact is available (CI).
 // Decompiled sources are build intermediates only — never committed, never shipped.
 
 import java.security.MessageDigest
@@ -43,30 +44,38 @@ val minecraftDecompiledDir = File(minecraftBuildDir, "decompiled")
 val minecraftGeneratedDir = File(minecraftBuildDir, "generated")
 val minecraftMetadataDir = File(minecraftBuildDir, "metadata")
 
+// Availability marker — written by verifyMinecraftArtifact.
+// If "false" or missing, all downstream tasks are skipped via onlyIf.
+val mcAvailableMarker = layout.buildDirectory.file("minecraft/mc-available").get().asFile
+
 // ── Task: Verify Minecraft artifact ──────────────────────────────────────────
+// NEVER fails the build. Writes marker: "true" if artifact found, "false" otherwise.
 val verifyMinecraftArtifact = tasks.register("verifyMinecraftArtifact") {
     group = "minecraft"
-    description = "Verifies the Minecraft ${minecraftVersion} artifact exists, matches version, is valid JAR."
+    description = "Checks if Minecraft ${minecraftVersion} artifact is available. Skips gracefully if not."
 
     inputs.property("minecraftVersion", minecraftVersion)
-    outputs.file(layout.buildDirectory.file("minecraft/verified"))
+    outputs.file(mcAvailableMarker)
 
     doLast {
-        val artifact = resolveMinecraftArtifact(minecraftArtifactPath)
-        logger.lifecycle("[Minecraft] Verifying: ${artifact.absolutePath} (${artifact.length()} bytes)")
+        mcAvailableMarker.parentFile.mkdirs()
+        try {
+            val artifact = resolveMinecraftArtifact(minecraftArtifactPath)
+            logger.lifecycle("[Minecraft] Verifying: ${artifact.absolutePath} (${artifact.length()} bytes)")
 
-        require(artifact.exists()) { "Minecraft artifact not found: ${artifact.absolutePath}" }
-        require(artifact.canRead()) { "Minecraft artifact not readable: ${artifact}" }
-        require(artifact.length() > 1_000_000) { "Artifact too small: ${artifact.length()} bytes" }
+            require(artifact.exists()) { "Minecraft artifact not found: ${artifact.absolutePath}" }
+            require(artifact.canRead()) { "Minecraft artifact not readable: ${artifact}" }
+            require(artifact.length() > 1_000_000) { "Artifact too small: ${artifact.length()} bytes" }
 
-        val (actualVersion, _) = probeMinecraftJar(artifact, minecraftVersion)
-        require(actualVersion != null || artifact.name.endsWith(".jar")) { "Invalid JAR: ${artifact.name}" }
+            val (actualVersion, _) = probeMinecraftJar(artifact, minecraftVersion)
+            require(actualVersion != null || artifact.name.endsWith(".jar")) { "Invalid JAR: ${artifact.name}" }
 
-        val marker = File(minecraftBuildDir, "verified")
-        marker.parentFile.mkdirs()
-        marker.writeText("verified_at=${Instant.now()}\nversion=${actualVersion ?: "unknown"}\n")
-
-        logger.lifecycle("[Minecraft] OK — version ${actualVersion ?: "assumed ${minecraftVersion}"}")
+            mcAvailableMarker.writeText("true")
+            logger.lifecycle("[Minecraft] OK — version ${actualVersion ?: "assumed ${minecraftVersion}"}")
+        } catch (e: Exception) {
+            mcAvailableMarker.writeText("false")
+            logger.lifecycle("[Minecraft] SKIP — ${e.message}")
+        }
     }
 }
 
@@ -76,6 +85,7 @@ val prepareMinecraft = tasks.register<Task>("prepareMinecraft") {
     description = "Normalizes Minecraft JAR (handles bundler) into build/minecraft/extracted/."
 
     dependsOn(verifyMinecraftArtifact)
+    onlyIf { mcAvailableMarker.exists() && mcAvailableMarker.readText().trim() == "true" }
     inputs.property("minecraftVersion", minecraftVersion)
     outputs.dir(minecraftExtractedDir)
 
@@ -94,7 +104,9 @@ val prepareMinecraft = tasks.register<Task>("prepareMinecraft") {
 val decompileMinecraftInputs = tasks.register<Jar>("decompileMinecraftInputs") {
     group = "minecraft"
     description = "(internal) Packs extracted classes into a JAR for CFR."
+
     dependsOn(prepareMinecraft)
+    onlyIf { mcAvailableMarker.exists() && mcAvailableMarker.readText().trim() == "true" }
     from(minecraftExtractedDir) { include("**/*.class") }
     destinationDirectory.set(File(minecraftBuildDir, "tmp"))
     archiveFileName.set("minecraft-classes.jar")
@@ -105,6 +117,7 @@ val decompileMinecraft = tasks.register<JavaExec>("decompileMinecraft") {
     description = "Runs CFR decompiler on extracted Minecraft classes."
 
     dependsOn(decompileMinecraftInputs)
+    onlyIf { mcAvailableMarker.exists() && mcAvailableMarker.readText().trim() == "true" }
     mainClass.set("org.benf.cfr.reader.Main")
     classpath = decompilerCfg
 
@@ -127,6 +140,7 @@ val generateMinecraftIntegration = tasks.register("generateMinecraftIntegration"
     description = "Analyzes decompiled sources, emits metadata + bridge sources."
 
     dependsOn(decompileMinecraft)
+    onlyIf { mcAvailableMarker.exists() && mcAvailableMarker.readText().trim() == "true" }
     outputs.dirs(minecraftGeneratedDir, minecraftMetadataDir)
 
     doLast {
@@ -146,9 +160,6 @@ val generateMinecraftIntegration = tasks.register("generateMinecraftIntegration"
 }
 
 // ── Wire into build ──────────────────────────────────────────────────────────
-// Add generated sources directly to the main source set. This way Gradle sees
-// them at configuration time, avoiding the sync-into-src/main/java mutation
-// that breaks --rerun-tasks compile ordering.
 sourceSets {
     main {
         java {
@@ -181,14 +192,12 @@ tasks.jar {
 fun resolveMinecraftArtifact(explicitPath: String?): File {
     if (!explicitPath.isNullOrBlank()) return File(explicitPath).absoluteFile
 
-    // Resolve relative to the *project* directory (not the Gradle daemon dir).
     val projectDir = project.layout.projectDirectory.asFile
     val candidate = projectDir.resolve("test_client")
         .listFiles { f -> f.name.endsWith(".jar") && f.name.contains(minecraftVersion) }
         ?.firstOrNull()
     if (candidate != null && candidate.exists()) return candidate.absoluteFile
 
-    // Also try relative to the repo root (parent of mili-minecraft-integration).
     val rootDir = project.rootProject.layout.projectDirectory.asFile
     val rootCandidate = rootDir.resolve("test_client")
         .listFiles { f -> f.name.endsWith(".jar") && f.name.contains(minecraftVersion) }
@@ -256,7 +265,6 @@ fun unpackBundler(artifact: File, classesRoot: String?, targetDir: File) {
         ZipFile(tmpInner).use { inner ->
             for (entry in inner.entries()) {
                 if (entry.isDirectory) continue
-                // Preserve full package path (net/minecraft/...)
                 val out = File(targetDir, entry.name)
                 out.parentFile.mkdirs()
                 inner.getInputStream(entry).use { input -> out.outputStream().use { output -> input.copyTo(output) } }
@@ -345,7 +353,6 @@ fun computeSha256(file: File): String {
     return digest.digest().joinToString("") { "%02x".format(it) }
 }
 
-// extension: digest.outputStream()
 fun MessageDigest.outputStream() = object : java.io.OutputStream() {
     override fun write(b: Int) { update(b.toByte()) }
     override fun write(b: ByteArray, off: Int, len: Int) { update(b, off, len) }
