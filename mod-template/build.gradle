@@ -1,0 +1,40 @@
+plugins {
+    java
+}
+
+group = "com.example"
+version = "1.0.0"
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+}
+
+repositories {
+    mavenCentral()
+    // Mili API 仓库 (如果发布到 Maven)
+    // maven { url "https://repo.mili.example/maven" }
+}
+
+dependencies {
+    // Mili Public API - 仅编译时需要，运行时由 Loader 提供
+    compileOnly(files("${rootDir}/../build/libs/minecraft-runtime-0.1.0-SNAPSHOT.jar"))
+
+    // 如果发布到 Maven:
+    // compileOnly("com.mili:mili-api:0.1.0")
+}
+
+tasks.jar {
+    archiveFileName.set("${project.name}-${project.version}.jar")
+}
+
+// 将 Mod JAR 复制到 game 目录的任务
+tasks.register("deploy", Copy) {
+    from(tasks.jar)
+    into("${rootDir}/../test_client/mods")
+    rename { "template.jar" }
+}
+
+test {
+    useJUnitPlatform()
+}

@@ -1,0 +1,12 @@
+{
+  "id": "template",
+  "name": "Mili Mod 开发模板",
+  "version": "1.0.0",
+  "description": "A comprehensive template demonstrating the complete Mili Mod SDK",
+  "author": "Mili Developer",
+  "environment": "client",
+  "entrypoint": "com.example.mod.TemplateMod",
+  "dependencies": [],
+  "capabilities": [],
+  "modules": []
+}

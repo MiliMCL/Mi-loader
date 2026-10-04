@@ -1,0 +1,8 @@
+{
+  "id": "badmod",
+  "name": "Bad Mod",
+  "version": "1.0.0",
+  "environment": "client",
+  "entrypoint": "com.example.badmod.BadMod",
+  "depends": []
+}

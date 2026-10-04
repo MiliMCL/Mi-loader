@@ -1,0 +1,9 @@
+{
+  "id": "testmod",
+  "name": "Mili Test Mod",
+  "version": "1.0.0",
+  "description": "Test mod for verifying Mili Mod lifecycle",
+  "environment": "client",
+  "entrypoint": "com.example.TestMod",
+  "dependencies": []
+}
