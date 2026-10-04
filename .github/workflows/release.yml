@@ -1,14 +1,12 @@
 name: Mili Platform Release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
 
 jobs:
   release:
     runs-on: ubuntu-latest
-
+    
     steps:
       - uses: actions/checkout@v4
 
