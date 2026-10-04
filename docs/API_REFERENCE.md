@@ -139,16 +139,13 @@ Each mod ships a `META-INF/mod.json` file that describes its identity, entry poi
   "version": "1.0.0",
   "author": "YourName",
   "description": "A short description of what this mod does.",
-  "mainClass": "com.example.MyMod",
+    "entrypoint": "com.example.MyMod",
   "dependencies": [
     {
       "modId": "other-mod",
-      "versionRange": "1.0.0",
       "required": true
     }
-  ],
-  "capabilities": ["RENDER", "INPUT"],
-  "modules": ["sub-feature-a", "sub-feature-b"]
+  ]
 }
 ```
 
@@ -184,18 +181,20 @@ Each mod ships a `META-INF/mod.json` file that describes its identity, entry poi
 
 ## Mod Entry Point
 
-A mod is a plain Java class with a single `initialize` method that accepts `ModContext`.
+A mod implements the `Mod` interface with a single `onInitialize(ModContext)` method.
 
 ### Required Signature
 
 ```java
 package com.example;
 
+import org.loader.api.Mod;
 import org.loader.runtime.mod.ModContext;
 
-public class MyMod {
+public class MyMod implements Mod {
 
-    public void initialize(ModContext ctx) {
+    @Override
+    public void onInitialize(ModContext ctx) {
         ctx.logger().info("MyMod initializing...");
         // Subscribe to events, schedule tasks, register resources here
     }

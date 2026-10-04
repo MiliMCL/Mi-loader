@@ -1,153 +1,101 @@
-# Mili Runtime Client Mod Loader
+# Mili Client Mod Loader
 
-A from-scratch Minecraft 26.2 Client Mod Loader built on Mili Runtime.
+Minecraft 26.2 客户端 Mod 加载器，基于 Mili 自研 Runtime。
 
-**NOT** a Fabric clone. **NOT** a Bukkit/Paper/Folia server. **NOT** a Mixin framework.
+**不是** Fabric 复刻，**不是** Bukkit/Paper，**不是** Mixin 框架。
 
-## Quick Start
+## 快速开始
 
-### Build
+### 构建
+
 ```bash
 gradle clean build
 ```
 
-### Run
+### 运行
+
 ```bash
-java -jar build/libs/mili-runtime-loader-0.1.0-SNAPSHOT.jar <game-dir>
+java -jar build/libs/minecraft-runtime-0.1.0-SNAPSHOT.jar <game-dir>
 ```
 
-The game directory should contain:
-- `26.2.jar` (Mojang-signed Minecraft 26.2 Client JAR)
-- `libraries/` (dependencies, resolved automatically from MC manifest JSON)
-- `mods/` (your Mili mods, each a JAR with `mod.json` + entrypoint class)
+### 开发 Mod
 
-### Write a Mod
+1. 创建 Java 类实现 `Mod` 接口
+2. 创建 `META-INF/mod.json`
+3. 编译打包为 JAR
+4. 放入 `mods/` 文件夹
 
-**1.** Create a Java class with `initialize(ModContext ctx)`:
-
-```java
-import org.loader.runtime.mod.ModContext;
-import org.loader.runtime.scheduler.TaskPriority;
-
-public class MyMod {
-    public void initialize(ModContext ctx) {
-        ctx.logger().info("MyMod loaded!");
-
-        // Schedule async work
-        ctx.scheduler().submit(ctx.scope(), () -> {
-            ctx.logger().info("Hello from scheduler!");
-        }, TaskPriority.NORMAL);
-
-        // Subscribe to events
-        ctx.events().addListener(String.class, msg -> {
-            ctx.logger().info("Event: " + msg);
-        });
-
-        // Register a resource (auto-cleanup on mod stop)
-        ctx.scope().registerResource(new MyResource());
-    }
-}
-
-class MyResource implements org.loader.runtime.kernel.Resource {
-    private volatile boolean closed = false;
-    public String id() { return "my-mod:resource"; }
-    public org.loader.runtime.kernel.Scope owner() { return null; }
-    public boolean isClosed() { return closed; }
-    public void close() { closed = true; }
-}
-```
-
-**2.** Create `src/main/resources/META-INF/mod.json`:
-
-```json
-{
-  "id": "mymod",
-  "name": "My Mod",
-  "version": "1.0.0",
-  "description": "A brief description.",
-  "mainClass": "com.example.MyMod",
-  "depends": []
-}
-```
-
-**3.** Package and drop into the `mods/` directory of your game folder.
-
----
-
-## Architecture
+## 项目结构
 
 ```
-Minecraft Launcher
-        |
-        v
-Mili Client Loader
-        |
-        v
-Mili Runtime (Scope tree)
-        |
-        +-- ClientScope
-        |     +-- ModScope:testmod
-        |     +-- ModScope:example
-        |
-        v
-Minecraft 26.2 Client (in-process URLClassLoader)
-        |
-        v
-ClientTickPoller (reflection-based, NO Mixin)
-        |
-        v
-EventBus -> all subscribed mods
+E:\loader\
+├── build/libs/minecraft-runtime-0.1.0-SNAPSHOT.jar
+├── src/main/java/org/loader/
+│   ├── api/          (公共 API 层)
+│   ├── runtime/      (Runtime 内核)
+│   ├── loader/       (Loader + GameProvider)
+│   ├── minecraft/    (Minecraft 集成)
+│   ├── service/      (EventBus, Registry, Configuration)
+│   └── mod/          (Mod SDK 实现)
+├── testmod/          (测试 Mod)
+├── example-mod/      (API-only 示例)
+├── mod-template/     (第三方开发模板)
+└── docs/             (文档)
 ```
 
 ## Mod SDK (ModContext)
 
-```java
-ModContext ctx = ...;
-ctx.modId();          // Mod ID from mod.json
-ctx.manifest();       // Full manifest record
-ctx.scope();          // Mod's own Scope (lifecycle aware)
-ctx.isActive();       // True if scope is active
-ctx.classLoader();    // Isolated ClassLoader
-ctx.scheduler();      // Scope-bound Scheduler
-ctx.events();         // Scope-bound EventBus (auto-cleanup)
-ctx.registry();       // Scope-bound registry
-ctx.resources();      // Resource manager (filesystem)
-ctx.createConfig(""); // Create/load config
-ctx.environment();    // RuntimeEnvironment (CLIENT/SERVER)
-ctx.logger();         // Mod-scoped logger
-ctx.getCapability(Class); // Capability lookup
-```
+| API | 说明 |
+|-----|------|
+| `ctx.modId()` | Mod 唯一标识 |
+| `ctx.manifest()` | Mod 元数据 |
+| `ctx.scope()` | Mod 作用域 |
+| `ctx.lifecycle()` | 生命周期监听 |
+| `ctx.classLoader()` | 隔离的 ClassLoader |
+| `ctx.scheduler()` | 任务调度 |
+| `ctx.events()` | 事件总线 |
+| `ctx.resources()` | 资源管理 |
+| `ctx.capabilities()` | 能力系统 |
+| `ctx.permissions()` | 权限系统 |
+| `ctx.environment()` | 环境信息 |
+| `ctx.logger()` | Mod 日志 |
 
-## Lifecycle
+## 生命周期
 
 ```
-DISCOVERED -> RESOLVED -> LOADED -> INITIALIZED -> REGISTERED -> RUNNING -> STOPPING -> STOPPED
-                                              \-> FAILED
+DISCOVERED → RESOLVED → LOADED → INITIALIZED → REGISTERED → RUNNING → STOPPING → STOPPED
+                                                                              ↘ FAILED
 ```
 
-Mod stop triggers:
-1. Cancel all scheduler tasks
-2. Unsubscribe all events
-3. Revoke capabilities
-4. Close all resources
-5. Close ClassLoader
+Mod 停止时自动：取消任务、取消事件订阅、撤销能力、关闭资源、关闭 ClassLoader。
 
-## Verified
+## 架构
 
-- Real Minecraft 26.2 Client boot (LWJGL 3.4.1 + OpenGL)
-- Real Mod loading via ModContext SDK
-- 143+ unit/integration tests passing
-- Second start: no thread/classloader/resource leaks
+```
+Minecraft Launcher
+        ↓
+Mili Client Loader
+        ↓
+Mili Runtime (Scope tree)
+  +-- ClientScope
+        +-- ModScope:mod-a
+        +-- ModScope:mod-b
+        ↓
+Minecraft 26.2 Client (in-process URLClassLoader, no Mixin)
+        ↓
+ClientTickPoller (reflection bridge) → EventBus → 订阅的 Mod
+```
 
-## Anti-Goals
+## 文档
 
-- NOT Fabric: no Mixin, no LaunchWrapper, no Fabric API
-- NOT Server: no Bukkit/Paper/Folia/Plugin
-- NOT a compatibility layer: Mili mods use Mili SDK only
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — 完整架构
+- [MOD_DEVELOPMENT.md](docs/MOD_DEVELOPMENT.md) — Mod 开发指南
+- [API_REFERENCE.md](docs/API_REFERENCE.md) — API 参考
 
-## Documentation
+## 已验证
 
-- [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) -- Full API reference with examples
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) -- Runtime architecture overview
-- [`docs/MOD_DEVELOPMENT.md`](docs/MOD_DEVELOPMENT.md) -- Mod author guide
-"# Mi-loader" 
+- ✅ 真实 MC 26.2 Client 启动 (LWJGL 3.4.1, OpenGL, NVIDIA GPU)
+- ✅ 真实 Mod 加载 (ModContext, Scope, EventBus, Scheduler, Resource)
+- ✅ 143 测试零回归
+- ✅ 失败隔离
+- ✅ 二次启动无泄漏
