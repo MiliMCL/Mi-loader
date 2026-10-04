@@ -42,13 +42,16 @@ jobs:
           mkdir -p test_client
           curl -fsSL -o "test_client/${MC_VER}.jar" "$CLIENT_URL"
           echo "${CLIENT_SHA1}  test_client/${MC_VER}.jar" | sha1sum -c -
+          # Must be absolute: a relative MINECRAFT_ARTIFACT is resolved against the
+          # Gradle *daemon* working directory, not the project dir.
+          ARTIFACT="$GITHUB_WORKSPACE/test_client/${MC_VER}.jar"
           {
             echo "found=true"
-            echo "path=test_client/${MC_VER}.jar"
-            echo "size=$(stat -c%s "test_client/${MC_VER}.jar")"
-            echo "sha=$(sha256sum "test_client/${MC_VER}.jar" | cut -d' ' -f1)"
+            echo "path=$ARTIFACT"
+            echo "size=$(stat -c%s "$ARTIFACT")"
+            echo "sha=$(sha256sum "$ARTIFACT" | cut -d' ' -f1)"
           } >> "$GITHUB_OUTPUT"
-          echo "[MC] Fetched $CLIENT_URL -> test_client/${MC_VER}.jar"
+          echo "[MC] Fetched $CLIENT_URL -> $ARTIFACT"
 
       - name: Set up JDK 25
         uses: actions/setup-java@v4
