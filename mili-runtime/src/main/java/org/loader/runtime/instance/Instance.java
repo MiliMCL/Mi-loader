@@ -17,7 +17,7 @@ public class Instance {
     private final String instanceId;
     private final String minecraftVersion;
     private final String runtimeVersion;
-    private final String abiVersion;
+    private final int abiVersion;
     private final RuntimeEnvironment environment;
     private final List<String> modIds;
     private final Map<String, String> configuration;
@@ -53,7 +53,7 @@ public class Instance {
         return runtimeVersion;
     }
 
-    public String abiVersion() {
+    public int abiVersion() {
         return abiVersion;
     }
 
@@ -102,9 +102,9 @@ public class Instance {
      */
     public static class Builder {
         private final String instanceId;
-        private String minecraftVersion = "1.21.4";
+        private String minecraftVersion = VersionInfo.TARGET_MINECRAFT;
         private String runtimeVersion = VersionInfo.CURRENT_VERSION;
-        private String abiVersion = VersionInfo.ABI_VERSION;
+        private int abiVersion = VersionInfo.ABI_VERSION;
         private RuntimeEnvironment environment = RuntimeEnvironment.DEDICATED_SERVER;
         private final List<String> modIds = new ArrayList<>();
         private final Map<String, String> configuration = new LinkedHashMap<>();
@@ -124,7 +124,7 @@ public class Instance {
             return this;
         }
 
-        public Builder abiVersion(String version) {
+        public Builder abiVersion(int version) {
             this.abiVersion = version;
             return this;
         }

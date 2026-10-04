@@ -1,6 +1,8 @@
 package org.loader.loader.discovery;
 
 import org.loader.loader.config.LoaderConfig;
+import org.loader.loader.util.MiliJson;
+import org.loader.runtime.error.ModLoadError;
 import org.loader.runtime.mod.ModManifest;
 import org.loader.runtime.mod.ModManifest.VersionBinding;
 
@@ -10,7 +12,8 @@ import java.util.*;
 import java.util.stream.Stream;
 
 /**
- * Discovers mods from the mods/ directory.
+ * 从 mods/ 目录发现 Mod。
+ * 使用 {@link MiliJson} 可靠地解析 mod.json。
  */
 public class ModDiscovery {
 
@@ -45,7 +48,6 @@ public class ModDiscovery {
     private void scanModJar(Path jarPath) {
         try {
             java.util.zip.ZipFile zip = new java.util.zip.ZipFile(jarPath.toFile());
-            // Check both root and META-INF/ for mod.json
             java.util.zip.ZipEntry entry = zip.getEntry("mod.json");
             if (entry == null) entry = zip.getEntry("META-INF/mod.json");
             if (entry != null) {
@@ -54,7 +56,7 @@ public class ModDiscovery {
                 discovered.add(manifest);
                 byId.put(manifest.id(), manifest);
             }
-        } catch (IOException e) { /* skip */ }
+        } catch (IOException e) { /* skip bad jar */ }
     }
 
     private void scanModDir(Path dir) {
@@ -65,103 +67,80 @@ public class ModDiscovery {
                 ModManifest manifest = parseManifest(content, dir);
                 discovered.add(manifest);
                 byId.put(manifest.id(), manifest);
-            } catch (IOException e) { /* skip */ }
+            } catch (IOException e) { /* skip bad dir */ }
         }
     }
 
+    @SuppressWarnings("unchecked")
     private ModManifest parseManifest(String json, Path source) {
-        String id = extractJsonField(json, "id");
-        String name = extractJsonField(json, "name");
-        String version = extractJsonField(json, "version");
-        String mainClass = extractJsonField(json, "entrypoint");
-        if (id == null) id = source.getFileName().toString();
-        if (name == null) name = id;
-        if (version == null) version = "1.0.0";
-        List<ModManifest.DependencyEntry> deps = parseDependencies(json);
-        // Parse optional platform version binding: {"mili": {"platform":..., "abi":..., "minecraft":...}}
-        VersionBinding binding = parseVersionBinding(json);
-        return new ModManifest(id, name, version, "",
-                "", deps, List.of(), mainClass != null ? mainClass : "", List.of(), binding);
-    }
-
-    /**
-     * Extracts the platform version binding from the "mili" object, if present.
-     */
-    private VersionBinding parseVersionBinding(String json) {
-        int miliIdx = json.indexOf("\"mili\"");
-        if (miliIdx < 0) return VersionBinding.unbound();
-        int braceStart = json.indexOf('{', miliIdx + 6);
-        if (braceStart < 0) return VersionBinding.unbound();
-        int braceEnd = findMatchingBrace(json, braceStart);
-        if (braceEnd < 0) return VersionBinding.unbound();
-        String miliObj = json.substring(braceStart, braceEnd + 1);
-        String platform = extractJsonField(miliObj, "platform");
-        String abi = extractJsonField(miliObj, "abi");
-        String minecraft = extractJsonField(miliObj, "minecraft");
-        return new VersionBinding(
-                platform != null ? platform : "",
-                abi != null ? abi : "",
-                minecraft != null ? minecraft : ""
-        );
-    }
-
-    /**
-     * Finds the index of the closing brace matching the opening brace at openIdx.
-     */
-    private int findMatchingBrace(String s, int openIdx) {
-        int depth = 0;
-        for (int i = openIdx; i < s.length(); i++) {
-            char c = s.charAt(i);
-            if (c == '{') depth++;
-            else if (c == '}') {
-                depth--;
-                if (depth == 0) return i;
-            }
+        Map<String, Object> root;
+        try {
+            root = MiliJson.parseObject(json);
+        } catch (Exception e) {
+            throw new ModLoadError(diagnostic(source, "mod.json 解析失败: " + e.getMessage(),
+                    "MOD_MANIFEST_INVALID"), "MOD_MANIFEST_INVALID");
         }
-        return -1;
+
+        String id = str(root, "id");
+        if (id == null || id.isBlank()) {
+            throw new ModLoadError(diagnostic(source, "mod.json 缺少必填字段 id",
+                    "MOD_MANIFEST_INVALID"), "MOD_MANIFEST_INVALID");
+        }
+        String name = str(root, "name");
+        String version = str(root, "version");
+        String entrypoint = str(root, "entrypoint");
+        String author = str(root, "author");
+        if (name == null || name.isBlank()) name = id;
+        if (version == null || version.isBlank()) version = "1.0.0";
+        if (entrypoint == null) entrypoint = "";
+
+        List<ModManifest.DependencyEntry> deps = parseDependencies(root.get("dependencies"));
+        VersionBinding binding = parseVersionBinding(root.get("mili"));
+        return new ModManifest(id, name, version, author != null ? author : "", "",
+                deps, List.of(), entrypoint, List.of(), binding);
     }
 
-    private List<ModManifest.DependencyEntry> parseDependencies(String json) {
+    @SuppressWarnings("unchecked")
+    private VersionBinding parseVersionBinding(Object miliObj) {
+        if (!(miliObj instanceof Map)) return VersionBinding.unbound();
+        Map<String, Object> mili = (Map<String, Object>) miliObj;
+        String platform = str(mili, "platform");
+        Object abiObj = mili.get("abi");
+        String minecraft = str(mili, "minecraft");
+        int abi = 0;
+        if (abiObj instanceof Number) {
+            abi = ((Number) abiObj).intValue();
+        } else if (abiObj instanceof String && !((String) abiObj).isBlank()) {
+            try { abi = Integer.parseInt((String) abiObj); } catch (NumberFormatException ignored) {}
+        }
+        if (platform == null || platform.isBlank()) return VersionBinding.unbound();
+        return new VersionBinding(platform, abi, minecraft != null ? minecraft : "");
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<ModManifest.DependencyEntry> parseDependencies(Object depObj) {
         List<ModManifest.DependencyEntry> deps = new ArrayList<>();
-        int arrayStart = json.indexOf("\"dependencies\"");
-        if (arrayStart < 0) return deps;
-        int bracketStart = json.indexOf('[', arrayStart);
-        if (bracketStart < 0) return deps;
-        int bracketEnd = json.indexOf(']', bracketStart);
-        if (bracketEnd < 0) return deps;
-        String arrayContent = json.substring(bracketStart, bracketEnd);
-        String[] objects = arrayContent.split("\\{");
-        for (String obj : objects) {
-            String modId = extractJsonField(obj, "modId");
-            if (modId != null) {
-                String required = extractJsonField(obj, "required");
-                deps.add(new ModManifest.DependencyEntry(modId, "*",
-                        required == null || required.equals("true")));
-            }
+        if (!(depObj instanceof List)) return deps;
+        for (Object item : (List<Object>) depObj) {
+            if (!(item instanceof Map)) continue;
+            Map<String, Object> dep = (Map<String, Object>) item;
+            String modId = str(dep, "modId");
+            if (modId == null) continue;
+            Object reqObj = dep.get("required");
+            boolean required = !(reqObj instanceof Boolean) || (Boolean) reqObj;
+            deps.add(new ModManifest.DependencyEntry(modId, "*", required));
         }
         return deps;
     }
 
-    private String extractJsonField(String json, String field) {
-        String search = "\"" + field + "\"";
-        int idx = json.indexOf(search);
-        if (idx < 0) return null;
-        int colon = json.indexOf(':', idx + search.length());
-        if (colon < 0) return null;
-        // Skip whitespace after colon
-        int valueStart = colon + 1;
-        while (valueStart < json.length() && Character.isWhitespace(json.charAt(valueStart))) valueStart++;
-        if (valueStart >= json.length()) return null;
-        // Handle quoted string
-        if (json.charAt(valueStart) == '"') {
-            int quoteEnd = json.indexOf('"', valueStart + 1);
-            if (quoteEnd < 0) return null;
-            return json.substring(valueStart + 1, quoteEnd);
-        }
-        // Handle unquoted value (number, boolean)
-        int valueEnd = valueStart;
-        while (valueEnd < json.length() && json.charAt(valueEnd) != ',' && json.charAt(valueEnd) != '}' && json.charAt(valueEnd) != '\n') valueEnd++;
-        return json.substring(valueStart, valueEnd).trim();
+    private static String str(Map<String, Object> map, String key) {
+        Object v = map.get(key);
+        return v instanceof String ? (String) v : null;
+    }
+
+    private String diagnostic(Path source, String detail, String code) {
+        return "[ModSource: " + source.getFileName() + "] " + detail + "\n" +
+               "  ErrorCode: " + code;
     }
 
     public List<ModManifest> discover() {

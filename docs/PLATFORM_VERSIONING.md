@@ -18,7 +18,7 @@ Mili 平台通过三个独立的版本字符串来描述运行环境。三者职
 
 **minecraft** 指目标 Minecraft 客户端的版本号。由于 Mili 的 `mili-minecraft-integration` 模块负责与 Minecraft 内部代码桥接，Minecraft 版本的变化往往意味着映射关系、方法签名甚至底层协议的变化，因此 minecraft 版本必须精确匹配，不允许任何漂移。
 
-三个版本合称为"Mili 三元组"。当前常量定义在 `org.loader.api.VersionInfo` 中：`CURRENT_VERSION` 对应 platform，值为 `"0.1.0"`；`ABI_VERSION` 对应 abi，值为 `"1.0"`；`TARGET_MINECRAFT` 对应 minecraft，值为 `"26.2"`。此外该类还声明 `TARGET_JAVA = "25"`，代表构建和运行所需的最小 Java 级别。
+三个版本合称为"Mili 三元组"。当前常量定义在 `org.loader.api.VersionInfo` 中：`CURRENT_VERSION` 对应 platform，值为 `"0.1.0"`；`ABI_VERSION` 对应 abi，整数值 `1`；`TARGET_MINECRAFT` 对应 minecraft，值为 `"26.2"`。此外该类还声明 `TARGET_JAVA = 25`（整数），代表构建和运行所需的最小 Java 级别。
 
 ## mod.json 中的版本声明
 
@@ -34,7 +34,7 @@ Mili 平台通过三个独立的版本字符串来描述运行环境。三者职
   "entrypoint": "com.example.MyMod",
   "mili": {
     "platform": "0.1.0",
-    "abi": "1.0",
+    "abi": 1,
     "minecraft": "26.2"
   },
   "dependencies": []
@@ -51,23 +51,29 @@ Mili 平台通过三个独立的版本字符串来描述运行环境。三者职
 
 对于 platform 字段：Mod 声明的 platform 字符串必须与 `VersionInfo.CURRENT_VERSION` 逐字符相等。任何差异——包括尾部空格、前导零差异、预发布标签差异——均视为不匹配。不允许 SemVer 范围表达式、前缀匹配或通配符。
 
-对于 abi 字段：Mod 声明的 abi 字符串必须与 `VersionInfo.ABI_VERSION` 逐字符相等。由于 ABI 的核心价值在于接口稳定性，abi 的变化代表破坏性更新，因此不存在"兼容"的概念，必须精确一致。
+对于 abi 字段：Mod 声明的 abi 整数必须与 `VersionInfo.ABI_VERSION` 完全相等。由于 ABI 的核心价值在于接口稳定性，abi 的变化代表破坏性更新，因此不存在"兼容"的概念，必须精确一致。
 
 对于 minecraft 字段：Mod 声明的 minecraft 字符串必须与 `VersionInfo.TARGET_MINECRACT` 逐字符相等。Minecraft 版本格式遵循 Mojang 官方的主版本.次版本命名，不携带补丁段或快照标识。
 
 三个字段独立校验，任一不匹配即产生对应的错误码。如果同一 Mod 同时存在多个字段不匹配，加载器应报告所有不匹配项，而非在首个错误处停止，以便开发者一次性修全部问题。
 
-"未绑定"Mod 不参与严格匹配。加载器仅输出警告，跳过三元组校验。这是有意为之的过渡行为，旨在降低从旧式 Mod 体系迁移到 Mili 体系的摩擦。
+"未绑定"Mod（即缺少 `"mili"` 对象）不参与严格匹配，将产生 **MOD_PLATFORM_MISSING** 错误码。按当前规范，未绑定视为校验失败，阻断加载——不再有静默降级或警告放行。
 
 ## 错误码
 
 当校验失败时，`ModManifest.ValidationResult` 携带具体的错误码，供加载器分支处理并向用户展示友好的诊断信息。
+
+**MOD_PLATFORM_MISSING** 表示 Mod 的 `mod.json` 中缺少 `"mili"` 对象（或 `platform` 字段）。Mod 未声明三元组绑定，不能参与加载。开发者需在 `mod.json` 中补充 `"mili": {"platform": "0.1.0", "abi": 1, "minecraft": "26.2"}` 声明。
 
 **MOD_PLATFORM_MISMATCH** 表示 Mod 声明的 platform 版本与当前运行平台的 `CURRENT_VERSION` 不同。该错误通常意味着 Mod 尚未适配最新平台的实现变更，或者平台本身尚未更新到 Mod 期望的版本。开发者应对比 Mod 所基于的平台源码与当前运行平台的差异，重新编译并更新声明。
 
 **MOD_ABI_MISMATCH** 表示 Mod 声明的 abi 版本与当前平台的 `ABI_VERSION` 不同。这通常发生在平台进行了破坏性接口变更之后，而 Mod 仍在使用旧版 API。解决该错误需要获取与当前 abi 版本匹配的 Mod SDK，重新编译 Mod，并更新 `mod.json` 中的 abi 字段。
 
 **MOD_MINECRAFT_MISMATCH** 表示 Mod 声明的 minecraft 版本与当前平台的 `TARGET_MINECRAFT` 不同。该错误常见于 Minecraft 版本更新后，Mod 尚未适配新的客户端。开发者需要等待或参与 Mod 针对新版 Minecraft 的移植工作。
+
+**MOD_MANIFEST_INVALID** 表示 `mod.json` 解析失败（非法 JSON）或缺少必填字段（如 `id`）。开发者需检查 JSON 语法并补全必填字段。
+
+**MOD_ENTRYPOINT_INVALID** 表示 Mod 未声明 `entrypoint`、`ClassLoader` 加载失败、或入口类缺少 `void initialize(ModContext)` 方法。开发者需确认 `entrypoint` 类名正确、类文件已打入 JAR，并实现标准的 `initialize(ModContext)` 方法。
 
 所有错误码均为校验失败类错误，会阻断该 Mod 的加载。加载器应收集所有 Mod 的校验结果后统一报告，避免逐个弹出错误导致诊断效率低下。
 

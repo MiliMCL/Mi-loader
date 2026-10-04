@@ -299,18 +299,18 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
 
                 if (task.ownerScope().isStopped()) {
                     task.state().set(TaskState.CANCELLED);
-                    task.future().cancel(true);
                     cancelledTasks.incrementAndGet();
+                    task.future().cancel(true);
                     return;
                 }
                 task.work().run();
                 task.state().set(TaskState.COMPLETED);
-                task.future().complete(null);
                 completedTasks.incrementAndGet();
+                task.future().complete(null);
             } catch (Exception e) {
                 task.state().set(TaskState.FAILED);
-                task.future().completeExceptionally(e);
                 failedTasks.incrementAndGet();
+                task.future().completeExceptionally(e);
             } finally {
                 long execNanos = System.nanoTime() - startTime;
                 totalExecutionTime.addAndGet(execNanos);

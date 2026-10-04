@@ -139,7 +139,7 @@ Mod 的生命周期严格受 `Lifecycle` 状态机约束：加载（`LOADING`）
 | 维度 | 值 | 含义 |
 |---|---|---|
 | `CURRENT_VERSION` | `0.1.0` | Loader 实现版本 |
-| `ABI_VERSION` | `1.0` | Mod 契约版本（已进入稳定） |
+| `ABI_VERSION` | `1` | Mod 契约版本（已进入稳定，整数形式） |
 | `TARGET_JAVA` | `25` | 运行时最低 Java 版本 |
 | `TARGET_MINECRAFT` | `26.2` | 唯一支持的 Minecraft 版本 |
 

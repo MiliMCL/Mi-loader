@@ -6,34 +6,50 @@ import org.loader.loader.classloader.ModClassLoader;
 import org.loader.runtime.mod.ModManifest;
 import org.junit.jupiter.api.Test;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class ModDiscoveryIT {
 
-    private static final String GAME = "E:\\loader\\test_client";
+    /**
+     * Locate the test_client directory.
+     * Gradle runs sub-module tests with CWD = mili-loader/, so we check
+     * CWD first, then walk one level up to the workspace root.
+     */
+    private static Path findTestClientDir() {
+        Path cwd = Path.of(System.getProperty("user.dir")).toAbsolutePath().normalize();
+        Path direct = cwd.resolve("test_client");
+        if (Files.isDirectory(direct)) return direct;
+        Path parent = cwd.getParent();
+        if (parent != null) {
+            Path sibling = parent.resolve("test_client");
+            if (Files.isDirectory(sibling)) return sibling;
+        }
+        return direct; // fall back (will fail downstream with a clear message)
+    }
 
     @Test
     void discoversTestMod() {
-        var config = LoaderConfig.load(Paths.get(GAME));
+        Path gameDir = findTestClientDir();
+        var config = LoaderConfig.load(gameDir);
         ModDiscovery discovery = ModDiscovery.scan(config);
         List<ModManifest> mods = discovery.discover();
         System.out.println("[IT] Discovered " + mods.size() + " mod(s)");
         for (ModManifest m : mods) {
-            System.out.println("[IT]   - " + m.id() + " v" + m.version() + " main=" + m.mainClass());
+            System.out.println("[IT]   - " + m.id() + " v" + m.version() + " main=" + m.entrypoint());
         }
         assertFalse(mods.isEmpty());
         ModManifest testmod = mods.stream().filter(m -> m.id().equals("testmod")).findFirst().orElse(null);
         assertNotNull(testmod);
-        assertEquals("com.example.TestMod", testmod.mainClass());
+        assertEquals("com.example.TestMod", testmod.entrypoint());
     }
 
     @Test
     void loadsTestModClass() throws Exception {
-        Path gameDir = Paths.get(GAME);
+        Path gameDir = findTestClientDir();
         Path expectedModJar = gameDir.resolve("mods").resolve("testmod-1.0.0.jar");
         System.out.println("[IT] gameDir=" + gameDir);
         System.out.println("[IT] expectedModJar=" + expectedModJar + " exists=" + java.nio.file.Files.exists(expectedModJar));

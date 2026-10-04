@@ -103,15 +103,15 @@ public class ModClassLoader implements AutoCloseable {
      * Creates a Mod instance from this classloader.
      */
     public Mod createMod() {
-        String mainClass = manifest.mainClass();
-        if (mainClass == null || mainClass.isEmpty()) {
+        String entrypoint = manifest.entrypoint();
+        if (entrypoint == null || entrypoint.isEmpty()) {
             return new Mod(manifest, null, classLoader);
         }
         try {
-            Class<?> clazz = loadModClass(mainClass);
+            Class<?> clazz = loadModClass(entrypoint);
             return new Mod(manifest, null, classLoader);
         } catch (ClassNotFoundException e) {
-            throw new ModLoadException("Cannot find mod main class: " + mainClass, e);
+            throw new ModLoadException("Cannot find mod entrypoint: " + entrypoint, e);
         }
     }
 

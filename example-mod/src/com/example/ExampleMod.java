@@ -40,7 +40,7 @@ public class ExampleMod implements Mod {
     private int tickCount = 0;
 
     @Override
-    public void onInitialize(ModContext context) {
+    public void initialize(ModContext context) {
         ModMetadata meta = context.metadata();
         Logger log = context.logger();
 

@@ -2,6 +2,10 @@
 // Tick poller, event bridge, registry bridge.
 // Depends on runtime (no direct loader dependency).
 
+plugins {
+    `java-library`
+}
+
 dependencies {
     implementation(project(":mili-runtime"))
     implementation(project(":mili-abi"))
