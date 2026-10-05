@@ -315,6 +315,12 @@ val platformJarFileProvider = layout.buildDirectory.file(
 
 // 两种格式共用同一份内容规格。platformJarFileProvider 用 provider 延迟求值 ——
 // 脚本执行期该文件尚不存在，直接 from(File) 会在配置阶段就解析。
+// 两种格式共用同一份内容规格。platformJarFileProvider 用 provider 延迟求值 ——
+// 脚本执行期该文件尚不存在，直接 from(File) 会在配置阶段就解析。
+//
+// 每个目标都用显式 into(...) 块。裸的 into("x") 之后再调 from(...) 会让后续
+// from 落到兄弟层级，而 from(file){into("README.txt")} 在嵌套 CopySpec 里又会被
+// 当成目录 —— 两种写法都曾产出过错误布局。
 fun configureDistContents(spec: CopySpec) {
     spec.into(distDirName()) {
         into("core") {
@@ -324,13 +330,11 @@ fun configureDistContents(spec: CopySpec) {
             from(layout.projectDirectory.dir("distribution/bin"))
         }
         into("mods") {
-            // 占位文件，否则打包器会丢弃空目录
             from(layout.projectDirectory.file("distribution/mods/.keep"))
         }
-        // `into("README.txt")` would make Gradle treat it as a directory;
-        // map the file explicitly instead.
+        // 用文件重命名而非 into()，避免 README.txt 被当成目录
         from(layout.projectDirectory.file("distribution/README.txt")) {
-            into("README.txt")
+            fileName = "README.txt"
         }
     }
 }
