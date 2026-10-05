@@ -9,6 +9,7 @@ import org.loader.runtime.kernel.Scope;
 import org.loader.runtime.scheduler.Scheduler;
 import org.loader.runtime.service.EventBus;
 import org.loader.runtime.tick.TickEngine;
+import org.loader.runtime.minecraft.transform.TickCallbackDispatch;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -105,6 +106,27 @@ public final class MinecraftBootstrap {
         minecraftScope.registerResource(worldBridge);
 
         minecraftScope.grantCapability(RuntimeEnvironment.class, env);
+
+        // 把 tick 桥接安装到注入分发器 —— 这是 tick 链闭合的最后一步。
+        //
+        // 审计发现：在装配这一步之前，TickBridge.beginTick()/endTick()
+        // 在生产路径上**零调用者**。整条链是断的：
+        //   MinecraftServer.tickServer()   ← 真实 tick
+        //        ↓ （缺失这一环）
+        //   TickBridge → TickEngine → TickContract → Mod 的 TickHandler
+        // 表现是「Mod 的 tick 回调从不执行」，而平台日志里什么也没有。
+        //
+        // 现在 MiliTickTransformer 会在 MinecraftServer#tickServer 的方法头
+        // 与每个返回路径前注入对 TickCallbackDispatch 的调用，
+        // 由它转发到这里刚装配好的桥接。
+        //
+// 安装时机：必须在任何 net.minecraft.* 类被加载之前 ——
+// 类一旦 defineClass 完成，字节码转换就再也来不及了。
+        //
+        // 用 register 而非裸 install：让分发器随 minecraftScope 一同释放，
+        // 否则它的静态 activeBridge 引用会让整条 tick 对象图在游戏退出后仍可达。
+        TickCallbackDispatch.register(minecraftScope);
+        TickCallbackDispatch.install(this.tickBridge);
     }
 
     // ── 状态查询 ───────────────────────────────────────────────────────────
@@ -206,18 +228,25 @@ public final class MinecraftBootstrap {
 
     /**
      * 进入 RUNNING —— Minecraft 主循环运行中，Tick 生效。
+     *
+     * <p><b>必须由 BOOTSTRAPPING 迁移而来。</b>本方法刻意<b>不</b>提供
+     * 「从 CREATED 自动补齐中间阶段」的便利路径：那样做等于把跳步迁移
+     * 伪装成合法迁移，于是「忘记调用 {@link #beginDiscovery()} /
+     * {@link #beginLoading()}」这类集成错误永远不会暴露 —— 游戏会在
+     * 根本没做发现、准备、加载的情况下启动起来，等到 Mod 加载失败时
+     * 才暴露，且离真正的原因隔了三个阶段。
+     *
+     * <p>状态机存在的意义就是在这里拦住它。非法迁移会抛
+     * {@link BootstrapState.IllegalStateTransitionException}。
      */
     public void start() {
-        if (state.get() == BootstrapState.RUNNING) {
+        BootstrapState current = state.get();
+        if (current == BootstrapState.RUNNING) {
             throw new IllegalStateException("MinecraftBootstrap 已启动");
         }
-        if (state.get() == BootstrapState.CREATED) {
-            // 允许直接 start()（测试 / 简化路径），先补齐中间阶段
-            transition(BootstrapState.DISCOVERING);
-            transition(BootstrapState.PREPARING);
-            transition(BootstrapState.LOADING);
-            transition(BootstrapState.BOOTSTRAPPING);
-        }
+        // 先校验迁移：非法时必须在发事件之前就抛出去，否则监听方会先收到
+        // 「服务器要启动了」，紧接着看到启动失败 —— 顺序颠倒比失败本身更糟。
+        current.requireTransitionTo(BootstrapState.RUNNING);
 
         eventBridge.post(new MinecraftEventBridge.ServerStartingEvent());
 

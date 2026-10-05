@@ -128,6 +128,10 @@ class ResourceLeakTest {
         runtime.start();
 
         MinecraftBootstrap bootstrap = new MinecraftBootstrap(runtime);
+        bootstrap.beginDiscovery();
+        bootstrap.beginPreparing();
+        bootstrap.beginLoading();
+        bootstrap.beginMinecraftBootstrap();
         bootstrap.start();
         assertTrue(bootstrap.isRunning());
 

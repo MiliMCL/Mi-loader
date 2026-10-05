@@ -14,6 +14,12 @@ plugins {
     application
 }
 
+// ── 版本单一来源（由根项目从 gradle.properties 强制注入，此处只读取） ────────
+val miliPlatformVersion: String = rootProject.extra["miliPlatformVersion"] as String
+val miliAbiVersion: String = rootProject.extra["miliAbiVersion"] as String
+val minecraftVersion: String = rootProject.extra["minecraftVersion"] as String
+
+
 application {
     mainClass.set("org.loader.installer.InstallerMain")
 }
@@ -40,9 +46,9 @@ tasks.jar {
             "Implementation-Title" to "Mili Minecraft Installer",
             "Implementation-Version" to version,
             "Main-Class" to "org.loader.installer.InstallerMain",
-            "Mili-Platform" to (rootProject.findProperty("miliPlatformVersion") ?: "0.1.0"),
-            "Mili-Abi" to (rootProject.findProperty("miliAbiVersion") ?: "1"),
-            "Mili-Minecraft" to (rootProject.findProperty("minecraftVersion") ?: "26.2")
+            "Mili-Platform" to miliPlatformVersion,
+            "Mili-Abi" to miliAbiVersion,
+            "Mili-Minecraft" to minecraftVersion
         )
     }
 }

@@ -16,10 +16,42 @@ public final class ItemHandle {
     private final ItemSpec spec;
 
     ItemHandle(String modId, String path, int numericId, ItemSpec spec) {
-        this.modId = modId;
+        this.modId = requireValidModId(modId, path);
         this.path = path;
         this.numericId = numericId;
         this.spec = spec;
+    }
+
+    /**
+     * 由平台实现调用，创建已注册物品的句柄。
+     *
+     * <p>与 {@link org.loader.api.world.BlockHandle#create} 同理：构造器包私有
+     * 以防 Mod 凭空造句柄，但平台绑定层在另一个包里，必须有公开出口，
+     * 否则契约无法实现。
+     *
+     * @param modId     注册该物品的 Mod ID（非空非空串）
+     * @param path      命名空间内路径（非空，不含 {@code ':'}）
+     * @param numericId 游戏分配的数值 ID
+     * @param spec      注册时使用的规格
+     * @throws IllegalArgumentException modId 或 path 不合法
+     */
+    public static ItemHandle create(String modId, String path, int numericId, ItemSpec spec) {
+        return new ItemHandle(modId, path, numericId, spec);
+    }
+
+    private static String requireValidModId(String modId, String path) {
+        if (modId == null || modId.isBlank()) {
+            throw new IllegalArgumentException("modId must not be blank");
+        }
+        if (path == null || path.isBlank()) {
+            throw new IllegalArgumentException("item path must not be blank");
+        }
+        if (path.indexOf(':') >= 0) {
+            throw new IllegalArgumentException(
+                    "item path must not contain ':' (namespace comes from the mod id): "
+                            + path);
+        }
+        return modId;
     }
 
     public String modId() {

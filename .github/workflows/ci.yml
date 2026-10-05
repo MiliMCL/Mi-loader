@@ -91,6 +91,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # This job MUST download Minecraft itself.
+      #
+      # It `needs: minecraft-pipeline`, but GitHub Actions jobs run on
+      # separate runners — the jar downloaded there is NOT on this runner's
+      # filesystem. Without this step, Minecraft26_2SmokeTest would silently
+      # skip and CI would still be green.
+      #
+      # That is precisely the failure mode the requirement forbids: a green
+      # pipeline that never actually validated against real Minecraft. The
+      # "Assert real-Minecraft smoke test actually ran" step below turns a
+      # silent skip into a build failure.
+      - name: Fetch Minecraft 26.2 client JAR for smoke test
+        id: mc
+        run: |
+          set -euo pipefail
+          MC_VER=$(grep '^minecraftVersion=' gradle.properties | cut -d= -f2)
+          VERSION_URL=$(curl -fsSL https://piston-meta.mojang.com/mc/game/version_manifest_v2.json \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(v['url'] for v in d['versions'] if v['id']=='$MC_VER'))")
+          read -r CLIENT_URL CLIENT_SHA1 <<<"$(curl -fsSL "$VERSION_URL" \
+            | python3 -c "import json,sys; c=json.load(sys.stdin)['downloads']['client']; print(c['url'], c['sha1'])")"
+          mkdir -p test_client
+          curl -fsSL -o "test_client/${MC_VER}.jar" "$CLIENT_URL"
+          echo "${CLIENT_SHA1}  test_client/${MC_VER}.jar" | sha1sum -c -
+          {
+            echo "path=$GITHUB_WORKSPACE/test_client/${MC_VER}.jar"
+          } >> "$GITHUB_OUTPUT"
+          echo "[MC] Fetched $CLIENT_URL for smoke test"
+
       - name: Set up JDK 25
         uses: actions/setup-java@v4
         with:
@@ -105,9 +133,53 @@ jobs:
 
       - name: Compile (incl. Minecraft metadata gen if artifact present)
         run: ./gradlew compileJava compileTestJava --no-daemon --console=plain
+        env:
+          # Must be absolute: a relative path resolves against the Gradle
+          # daemon's working directory, not the project.
+          MINECRAFT_ARTIFACT: ${{ steps.mc.outputs.path }}
 
       - name: Run all tests
         run: ./gradlew test --no-daemon --console=plain
+
+      # Mechanical guarantee that the real-Minecraft smoke test really executed.
+      #
+      # A JUnit assumption (assumeTrue) turns "jar missing" into a SKIPPED
+      # test, and a skipped test does not fail the build. Without this check,
+      # losing the jar (network flake, Mojang CDN change, a renamed property)
+      # would degrade CI to green while the integration went unverified —
+      # exactly the "claims integration works without proving it" outcome
+      # that the requirement forbids.
+      #
+      # So: read the JUnit XML and require that Minecraft26_2SmokeTest
+      # reported zero tests AND zero failures — i.e. it ran, fully passed,
+      # and was not skipped.
+      - name: Assert real-Minecraft smoke test actually ran
+        run: |
+          set -euo pipefail
+          RESULT=$(find mili-minecraft-integration/build/test-results/test \
+                   -name 'TEST-*Minecraft26_2SmokeTest.xml' 2>/dev/null | head -1 || true)
+          if [ -z "$RESULT" ]; then
+            echo "ERROR: no test result for Minecraft26_2SmokeTest."
+            echo "       The real-Minecraft smoke test never ran. Integration is UNVERIFIED."
+            echo "       Check that test_client/$(grep '^minecraftVersion=' gradle.properties | cut -d= -f2).jar exists."
+            exit 1
+          fi
+          python3 - "$RESULT" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          suite = ET.parse(sys.argv[1]).getroot()
+          tests = int(suite.get('tests', 0))
+          skipped = int(suite.get('skipped', 0))
+          failures = int(suite.get('failures', 0)) + int(suite.get('errors', 0))
+          print(f"Minecraft26_2SmokeTest: tests={tests} skipped={skipped} failures={failures}")
+          if tests == 0:
+              sys.exit("ERROR: smoke test ran 0 tests — it was skipped, not verified.")
+          if skipped > 0:
+              sys.exit(f"ERROR: {skipped} smoke test(s) were SKIPPED (Minecraft jar not found?)."
+                       " A skipped smoke test proves nothing about integration.")
+          if failures > 0:
+              sys.exit(f"ERROR: {failures} smoke test failure(s).")
+          print("OK: real Minecraft 26.2 smoke test executed and passed.")
+          PY
 
       - name: Build platform fat JAR
         run: ./gradlew :mili-loader:shadowJar --no-daemon --console=plain
@@ -210,6 +282,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fetch Minecraft for symbol validation
+        id: mc
+        run: |
+          # MiliSymbol 的坐标必须在**真实** Minecraft 上校验。
+          # 不用 mock、不用反编译源码 —— 只有真实 class 文件才能反映
+          # 字节码层面的真实坐标（owner / name / descriptor）。
+          #
+          # 符号表过期是本平台最危险的静默失效：转换器注入不到任何东西，
+          # 游戏照常运行，Mod 的功能消失，日志里什么也没有。
+          MC_VER=$(grep '^minecraftVersion=' gradle.properties | cut -d= -f2)
+          VERSION_URL=$(curl -fsSL "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(v['url'] for v in d['versions'] if v['id']=='$MC_VER'))")
+          CLIENT_URL=$(curl -fsSL "$VERSION_URL" \
+            | python3 -c "import json,sys; c=json.load(sys.stdin)['downloads']['client']; print(c['url'], c['sha1'])")
+          CLIENT_SHA1=$(echo "$CLIENT_URL" | cut -d' ' -f2)
+          CLIENT_URL=$(echo "$CLIENT_URL" | cut -d' ' -f1)
+          mkdir -p test_client
+          curl -fsSL -o "test_client/${MC_VER}.jar" "$CLIENT_URL"
+          echo "${CLIENT_SHA1}  test_client/${MC_VER}.jar" | sha1sum -c -
+          echo "[MC] Fetched $CLIENT_URL"
+
       - name: Set up JDK 25
         uses: actions/setup-java@v4
         with:
@@ -239,9 +332,144 @@ jobs:
             exit 1
           fi
 
+      - name: Verify abi module does not expose ASM to Mods
+        run: |
+          # ADR-0011: ASM 是平台内部的实现细节，不得出现在 ABI 的公开签名里。
+          # 一旦泄漏，Mod 就获得了直接操作 Minecraft 字节码的能力 ——
+          # 平台将无法再做目标校验、权限判定与冲突检测。
+          if grep -rE "import org\.objectweb\.asm" mili-abi/src/main/java/ ; then
+            echo "ERROR: mili-abi must not depend on ASM — ASM is a platform-internal detail (ADR-0011)"
+            exit 1
+          fi
+
+      - name: Verify transformation symbols exist in real Minecraft
+        # 无条件执行：上面的下载步骤失败时整个 job 已经红了。
+        # Gradle 任务自身在 jar 缺失时会 SKIPPED，因此这里不需要额外守卫。
+        run: ./gradlew verifyTransformationSymbols --no-daemon --console=plain
+        # MiliSymbol 是全部转换器的坐标来源。符号表过期是一种极其危险的静默失效：
+        # 转换器注入不到任何东西，游戏照常运行，Mod 功能消失，日志里什么都没有。
+        # 本任务用真实 Minecraft jar（不是 mock、不是反编译源码）逐条比对
+        # owner + name + descriptor，任何一条不符即让构建失败。
+
       - name: Verify dependency graph
         run: |
           echo "--- runtime deps ---"
           ./gradlew :mili-runtime:dependencies --configuration runtimeClasspath --no-daemon --console=plain | grep -E "mili-|---" || true
           echo "--- abi deps ---"
           ./gradlew :mili-abi:dependencies --configuration runtimeClasspath --no-daemon --console=plain | grep -E "mili-|---" || true
+
+  distribution-boundary:
+    runs-on: ubuntu-latest
+    name: Distribution Boundary (No Minecraft)
+    needs: minecraft-pipeline
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      # The hard legal/architectural red line: Mili must NEVER redistribute
+      # Minecraft. This job builds the release artifacts and scans them.
+      - name: Build release artifacts
+        run: |
+          ./gradlew :mili-loader:shadowJar --no-daemon --console=plain
+          ./gradlew :mili-loader:releaseArtifacts --no-daemon --console=plain
+          ./gradlew :mili-loader:distTar :mili-loader:distZip --no-daemon --console=plain
+
+      - name: Run distribution boundary check (Gradle gate)
+        run: ./gradlew :mili-loader:distributionBoundaryCheck --no-daemon --console=plain
+
+      # Independent shell-level scan. Deliberately does NOT reuse the Gradle
+      # logic: two independent implementations must both agree, otherwise a
+      # bug in one is invisible.
+      - name: Independent shell scan of distributions
+        run: |
+          set -euo pipefail
+          FAILED=0
+          echo "=== scanning fat JAR ==="
+          JAR=$(find mili-loader/build/libs -name 'mili-*.jar' | grep -v sources | grep -v javadoc | head -1)
+          echo "JAR: $JAR"
+          if unzip -l "$JAR" | grep -qE 'net/minecraft/|com/mojang/|decompiled/'; then
+            echo "ERROR: platform JAR contains Minecraft classes"
+            unzip -l "$JAR" | grep -E 'net/minecraft/|com/mojang/' | head -20
+            FAILED=1
+          else
+            echo "OK: no Minecraft classes in platform JAR"
+          fi
+
+          echo "=== scanning distribution archives ==="
+          for ARCHIVE in mili-loader/build/distributions/*.tar.gz mili-loader/build/distributions/*.zip; do
+            [ -e "$ARCHIVE" ] || continue
+            echo "--- $ARCHIVE ---"
+            if [[ "$ARCHIVE" == *.tar.gz ]]; then
+              LIST=$(tar tzf "$ARCHIVE")
+            else
+              LIST=$(unzip -Z1 "$ARCHIVE")
+            fi
+            # No Minecraft internal packages anywhere in the archive
+            if echo "$LIST" | grep -qE '(^|/)(net/minecraft|com/mojang|decompiled)/'; then
+              echo "ERROR: $ARCHIVE contains Minecraft internals"
+              echo "$LIST" | grep -E '(^|/)(net/minecraft|com/mojang|decompiled)/' | head -20
+              FAILED=1
+            fi
+            # No Minecraft本体 JAR
+            if echo "$LIST" | grep -qiE '(minecraft|server|client)[^/]*\.jar$'; then
+              echo "ERROR: $ARCHIVE ships a Minecraft jar"
+              echo "$LIST" | grep -iE '(minecraft|server|client)[^/]*\.jar$'
+              FAILED=1
+            fi
+          done
+
+          echo "=== checking release dir ==="
+          ls -la mili-loader/build/release/ || true
+          test -f mili-loader/build/release/SHA256SUMS || { echo "ERROR: no SHA256SUMS"; FAILED=1; }
+          test -f mili-loader/build/release/release-manifest.json || { echo "ERROR: no release-manifest.json"; FAILED=1; }
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "=== DISTRIBUTION BOUNDARY VIOLATED ==="
+            exit 1
+          fi
+          echo "=== distribution boundary: CLEAN ==="
+
+  version-single-source:
+    runs-on: ubuntu-latest
+    name: Version Single Source of Truth
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Every module, the manifest, the installer and CI must read the SAME
+      # version triple. Drift here silently ships incompatible Mods.
+      - name: Assert versions are defined exactly once
+        run: |
+          set -euo pipefail
+          echo "--- gradle.properties (canonical) ---"
+          cat gradle.properties
+          for KEY in miliPlatformVersion miliAbiVersion minecraftVersion javaVersion; do
+            COUNT=$(grep -c "^${KEY}=" gradle.properties)
+            test "$COUNT" -eq 1 || { echo "ERROR: $KEY declared $COUNT times in gradle.properties"; exit 1; }
+          done
+          echo "all four version keys declared exactly once"
+
+      - name: Assert no hardcoded version drift in build scripts
+        run: |
+          set -euo pipefail
+          # Build scripts may only echo the canonical value, never a literal.
+          # Searching for literal MC versions outside gradle.properties:
+          if grep -rnE '"(1\.)?[0-9]+\.[0-9]+(\.[0-9]+)?"' --include=*.kts . \
+               | grep -iE 'minecraft|mcVersion|minecraftVersion' \
+               | grep -vE 'findProperty|gradle.properties'; then
+            echo "NOTE: review the literals above — versions must come from gradle.properties"
+          fi
+          echo "--- ABI/runtime must read the canonical ABI version ---"
+          grep -n "ABI_VERSION\|TARGET_MINECRAFT\|CURRENT_VERSION" mili-abi/src/main/java/org/loader/api/VersionInfo.java

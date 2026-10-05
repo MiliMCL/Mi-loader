@@ -123,8 +123,11 @@ class ModDiscoveryIT {
         assertNotNull(testmod, "Expected to discover 'testmod'");
 
         // Locate the actual JAR that ModDiscovery bound to this manifest.
-        ModClassLoader mcl = new ModClassLoader(testmod, new java.net.URL[0], null, gameDir);
-        System.out.println("[IT] Actual URLs: " + java.util.Arrays.toString(mcl.getClassLoader().getURLs()));
+        // ModClassLoader 的 parent 必须是 MinecraftClassLoader（唯一的 MC 类来源）。
+        var gameCL = new org.loader.loader.classloader.MinecraftClassLoader(
+                "minecraft-game", new java.net.URL[0], getClass().getClassLoader());
+        ModClassLoader mcl = new ModClassLoader(testmod, gameCL, gameDir);
+        System.out.println("[IT] Actual URLs: " + java.util.Arrays.toString(mcl.getURLs()));
 
         Class<?> clazz = assertDoesNotThrow(() -> mcl.loadModClass("com.example.TestMod"),
                 "Should load TestMod class");

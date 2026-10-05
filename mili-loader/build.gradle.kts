@@ -19,6 +19,14 @@ plugins {
     id("com.gradleup.shadow")
 }
 
+// ── 版本单一来源（由根项目从 gradle.properties 强制注入，此处只读取） ────────
+val miliPlatformVersion: String = rootProject.extra["miliPlatformVersion"] as String
+val miliAbiVersion: String = rootProject.extra["miliAbiVersion"] as String
+val minecraftVersion: String = rootProject.extra["minecraftVersion"] as String
+val javaVersion: String = rootProject.extra["javaVersion"] as String
+val asmVersion: String = rootProject.extra["asmVersion"] as String
+
+
 dependencies {
     implementation(project(":mili-runtime"))
     implementation(project(":mili-minecraft-integration"))
@@ -30,7 +38,9 @@ dependencies {
 
     // ASM lets the api-boundary test introspect the loader's compiled classes
     // and flag any accidental reference to runtime-internal packages.
-    testImplementation("org.ow2.asm:asm:9.7")
+    // Version from gradle.properties (single source of truth) — Minecraft 26.2
+    // is class major 69 (Java 25); ASM 9.7 cannot read it.
+    testImplementation("org.ow2.asm:asm:$asmVersion")
 }
 
 // ---------------------------------------------------------------------------
@@ -38,14 +48,14 @@ dependencies {
 // ---------------------------------------------------------------------------
 tasks.named<Copy>("processResources") {
     doLast {
-        val platformVersion = rootProject.findProperty("miliPlatformVersion") ?: "0.1.0"
-        val abiVersion = rootProject.findProperty("miliAbiVersion") ?: "1"
-        val minecraftVersion = rootProject.findProperty("minecraftVersion") ?: "26.2"
-        val javaVersion = rootProject.findProperty("javaVersion") ?: "25"
+        val platformVersion = miliPlatformVersion
+        val abiVersion = miliAbiVersion
+        val minecraftVersion = minecraftVersion
+        val javaVersion = javaVersion
         val platformId = "mili-${platformVersion}-mc${minecraftVersion}"
         val timestamp = Instant.now().toString()
 
-        val mcSha = minecraftArtifactSha256(minecraftVersion.toString())
+        val mcSha = minecraftArtifactSha256(minecraftVersion)
 
         val metaDir = layout.buildDirectory.dir("resources/main/META-INF/mili").get().asFile
         metaDir.mkdirs()
@@ -114,7 +124,7 @@ tasks.named<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("shadowJ
     description = "Assembles the Mili platform fat JAR (all modules merged via Shadow)"
 
     archiveBaseName.set("mili")
-    archiveVersion.set("${rootProject.findProperty("miliPlatformVersion")}-mc${rootProject.findProperty("minecraftVersion")}")
+    archiveVersion.set("${miliPlatformVersion}-mc${minecraftVersion}")
     archiveClassifier.set("")
 
     mergeServiceFiles()
@@ -124,9 +134,9 @@ tasks.named<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("shadowJ
             "Main-Class" to "org.loader.loader.LoaderMain",
             "Implementation-Title" to "Mili Platform",
             "Implementation-Version" to version,
-            "Mili-Platform" to (rootProject.findProperty("miliPlatformVersion") ?: "0.1.0"),
-            "Mili-Abi" to (rootProject.findProperty("miliAbiVersion") ?: "1"),
-            "Mili-Minecraft" to (rootProject.findProperty("minecraftVersion") ?: "26.2"),
+            "Mili-Platform" to miliPlatformVersion,
+            "Mili-Abi" to miliAbiVersion,
+            "Mili-Minecraft" to minecraftVersion,
             "Multi-Release" to "false",
             "Sealed" to "false"
         )
@@ -151,14 +161,14 @@ val verifyPlatformJar = tasks.register<Task>("verifyPlatformJar") {
     description = "Validates platform JAR has expected Mili modules + META-INF mili/minecraft.json fingerprint."
 
     dependsOn(tasks.named("shadowJar"))
-    val platformVersion = rootProject.findProperty("miliPlatformVersion") ?: "0.1.0"
-    val minecraftVersion = rootProject.findProperty("minecraftVersion") ?: "26.2"
+    val platformVersion = miliPlatformVersion
+    val minecraftVersion = minecraftVersion
     inputs.file(layout.buildDirectory.file("libs/mili-${platformVersion}-mc${minecraftVersion}.jar"))
     outputs.file(layout.buildDirectory.file("verification/platform-jar.verified"))
 
     doLast {
-        val platformVersion = rootProject.findProperty("miliPlatformVersion") ?: "0.1.0"
-        val minecraftVersion = rootProject.findProperty("minecraftVersion") ?: "26.2"
+        val platformVersion = miliPlatformVersion
+        val minecraftVersion = minecraftVersion
         val jar = layout.buildDirectory.file("libs/mili-${platformVersion}-mc${minecraftVersion}.jar").get().asFile
         require(jar.exists()) { "Platform JAR missing: ${jar.absolutePath}" }
 
@@ -183,10 +193,15 @@ val verifyPlatformJar = tasks.register<Task>("verifyPlatformJar") {
 
         require(hasPlatformJson) { "META-INF/mili/platform.json missing" }
         require(hasMinecraftJson) { "META-INF/mili/minecraft.json (MC build fingerprint) missing" }
-        require(platformJsonText.contains(minecraftVersion.toString())) { "platform.json missing minecraft=${minecraftVersion}" }
-        // minecraft.json always exists (skip-path writes a minimal version with
-        // artifactSha256: "unknown" when pipeline is not run). Only validate
-        // the fingerprint is non-trivial when pipeline actually executed.
+        require(platformJsonText.contains(minecraftVersion)) { "platform.json missing minecraft=${minecraftVersion}" }
+
+        // ── 分发边界红线：平台 JAR 绝不可包含 Minecraft 类 ──────────────────
+        // 这条断言过去只是打日志（mcClasses 仅用于展示），等于没有约束。
+        require(mcClasses == 0) {
+            "分发边界违规：平台 JAR 含 $mcClasses 个 net.minecraft.* 类。" +
+            "Mili 不得重新分发 Minecraft —— Minecraft 只能作为构建输入。"
+        }
+        logger.lifecycle("[verify] 分发边界 OK —— 平台 JAR 中 net.minecraft.* 类数 = 0")
 
         val marker = File(layout.buildDirectory.get().asFile, "verification/platform-jar.verified")
         marker.parentFile.mkdirs()
@@ -208,10 +223,10 @@ tasks.register("releaseArtifacts") {
     dependsOn(tasks.named("shadowJar"))
 
     doLast {
-        val platformVersion = rootProject.findProperty("miliPlatformVersion") ?: "0.1.0"
-        val minecraftVersion = rootProject.findProperty("minecraftVersion") ?: "26.2"
-        val javaVersion = rootProject.findProperty("javaVersion") ?: "25"
-        val abiVersion = rootProject.findProperty("miliAbiVersion") ?: "1"
+        val platformVersion = miliPlatformVersion
+        val minecraftVersion = minecraftVersion
+        val javaVersion = javaVersion
+        val abiVersion = miliAbiVersion
         val artifactBase = "mili-${platformVersion}-mc${minecraftVersion}"
 
         // Shadow writes the fat JAR to build/libs/<archiveBaseName>-<version>.jar
@@ -256,7 +271,7 @@ tasks.register("releaseArtifacts") {
         val timestamp = Instant.now().toString()
 
         // minecraft SHA for release manifest (MC build input fingerprint)
-        val mcSha = minecraftArtifactSha256(minecraftVersion.toString())
+        val mcSha = minecraftArtifactSha256(minecraftVersion)
 
         // release-manifest.json
         val modulesJson = "{ \"abi\": \"$platformVersion\", \"runtime\": \"$platformVersion\", \"loader\": \"$platformVersion\", \"minecraftIntegration\": \"$platformVersion\" }"
@@ -306,11 +321,11 @@ tasks.register("releaseArtifacts") {
 // -----------------------------------------------------------------------------
 
 fun distDirName(): String =
-    "mili-${rootProject.findProperty("miliPlatformVersion")}-mc${rootProject.findProperty("minecraftVersion")}"
+    "mili-${miliPlatformVersion}-mc${minecraftVersion}"
 
 // 平台 fat JAR 的产出路径（provider 形式，配置期不要求文件存在）。
 val platformJarFileProvider = layout.buildDirectory.file(
-    "libs/mili-${rootProject.findProperty("miliPlatformVersion")}-mc${rootProject.findProperty("minecraftVersion")}.jar"
+    "libs/mili-${miliPlatformVersion}-mc${minecraftVersion}.jar"
 )
 
 // 两种格式共用同一份内容规格。
@@ -342,7 +357,7 @@ val distTar = tasks.register<Tar>("distTar") {
 
     archiveBaseName.set("mili")
     archiveVersion.set(
-        "${rootProject.findProperty("miliPlatformVersion")}-mc${rootProject.findProperty("minecraftVersion")}"
+        "${miliPlatformVersion}-mc${minecraftVersion}"
     )
     // Gradle defaults GZIP-compressed tars to .tgz; the release notes and
     // README both say .tar.gz, so pin the full name.
@@ -361,7 +376,7 @@ val distZip = tasks.register<Zip>("distZip") {
 
     archiveBaseName.set("mili")
     archiveVersion.set(
-        "${rootProject.findProperty("miliPlatformVersion")}-mc${rootProject.findProperty("minecraftVersion")}"
+        "${miliPlatformVersion}-mc${minecraftVersion}"
     )
     destinationDirectory.set(layout.buildDirectory.dir("distributions"))
 
@@ -369,4 +384,13 @@ val distZip = tasks.register<Zip>("distZip") {
 }
 
 tasks.named("build") { dependsOn(distTar) }
+
+// ── 分发边界验证（Minecraft 分发红线） ──────────────────────────────────────
+// 递归扫描分发产物，任何 Minecraft 类/源码/本体 JAR 都让构建失败。
+// 详见 distribution-boundary.gradle.kts 顶部的规则说明。
+apply(from = "distribution-boundary.gradle.kts")
+
+tasks.named("check") {
+    dependsOn("distributionBoundaryCheck")
+}
 

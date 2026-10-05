@@ -8,10 +8,22 @@ package org.loader.runtime.minecraft;
  *
  * <p>优先路径（MULTIPLAYER / DEDICATED_SERVER）：
  * <pre>
- *   net.minecraft.server.MinecraftServer#tickChildren(long)   ← 每 tick 调用
+ *   net.minecraft.server.MinecraftServer#tickServer(BooleanSupplier)   ← 每 tick 调用
  * </pre>
- * 该方法在服务器主循环中每个 tick 恰好被调用一次，接收当前 tick 计数，
+ * 该方法在服务器主循环中每个 tick 恰好被调用一次，接收一个
+ * {@code BooleanSupplier} 参数（MC 26.x 用于传递「服务器是否已卡住」的标志），
  * 是最稳定的真实 tick 锚点。
+ *
+ * <p><b>签名勘误（2026-10-05 审计修正）</b>：本注释原先写的是
+ * {@code tickChildren(long)} 与无参 {@code tickServer()}。经直接解析
+ * Minecraft 26.2 class 文件的常量池核实，真实签名为：
+ * <pre>
+ *   MinecraftServer#tickServer(BooleanSupplier)V
+ *   MinecraftServer#tickChildren(BooleanSupplier)V
+ * </pre>
+ * 二者都带 {@code BooleanSupplier} 参数，均非无参。坐标已固化到
+ * {@code org.loader.api.transform.symbol.MiliSymbol}，由 CI 与真实
+ * jar 交叉校验，避免再次漂移。
  *
  * <p>回退路径（SINGLEPLAYER / CLIENT）：
  * <pre>

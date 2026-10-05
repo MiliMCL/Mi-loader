@@ -37,13 +37,38 @@ class ApiBoundaryTest {
 
     /** Narrow runtime surface the loader is allowed to depend on. Any other
      *  package rooted at {@code org.loader.runtime.} must come in via a
-     *  wildcard import or be added here deliberately. */
+     *  wildcard import or be added here deliberately.
+     *
+     *  <p><b>Phase 2/3 note</b>: the loader legitimately needs three more
+     *  surfaces now that the ClassLoader topology and the bootstrap state
+     *  machine are real:
+     *  <ul>
+     *    <li>{@code org.loader.runtime.minecraft.BootstrapState} — the state
+     *        machine the hook must advance. Only the enum, not the bridge
+     *        internals.</li>
+     *    <li>{@code org.loader.runtime.tick.TickContract} — the tick execution
+     *        envelope, needed to expose the active contract to injectors.</li>
+     *    <li>{@code org.loader.runtime.scheduler} — task handles.</li>
+     *  </ul>
+     *  {@code LoaderMain} is still forbidden from importing the bridge at all
+     *  (enforced separately below); these are for the hook/provider layer. */
     private static final List<String> ALLOWED_RUNTIME_PREFIXES = List.of(
             "import org.loader.runtime.RuntimeEnvironment;",
             "import org.loader.runtime.error.",
             "import org.loader.runtime.mod.",
             "import org.loader.runtime.kernel.Runtime;",
-            "import org.loader.runtime.kernel.Scope;"
+            "import org.loader.runtime.kernel.Scope;",
+            "import org.loader.runtime.tick.TickContract;",
+            "import org.loader.runtime.scheduler.",
+            // ClassTransformInterceptor 是「类加载 → 字节码转换」的唯一接缝。
+            // 它按定义必须持有 TransformerPipeline —— 否则转换链无法被调用，
+            // 整条 Transformation System 就是死代码。
+            //
+            // 这条白名单不放松 loader 的整体边界：白名单是<b>具体类</b>而非包，
+            // 因此 loader 仍然不能碰 registry / verifier / ASM 等内部件。
+            // 边界真正要防的是「loader 自行实现转换逻辑」，
+            // 而不是「loader 调用平台提供的转换入口」。
+            "import org.loader.runtime.transform.engine.TransformerPipeline;"
     );
 
     /** Path to loader's src/main/java. Gradle runs subproject tests with

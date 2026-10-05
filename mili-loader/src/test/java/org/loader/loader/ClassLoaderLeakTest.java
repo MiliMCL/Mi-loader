@@ -65,6 +65,49 @@ class ClassLoaderLeakTest {
         return ref.get() == null;
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // 下面三个 helper 是泄漏测试的关键结构。
+    //
+    // <b>为什么必须把被测对象关进独立方法</b>：局部变量在方法帧存活期间始终
+    // 是 GC root，哪怕源码上它已经「出了作用域」—— 字节码里 local slot 仍然
+    // 持有引用，JVM 不会清除。直接在测试方法里写
+    //
+    //     ModClassLoader mcl = ...;
+    //     WeakReference<ClassLoader> ref = new WeakReference<>(mcl);
+    //     mcl.close();
+    //     assertTrue(awaitCollected(ref, 30));   // 必然失败
+    //
+    // 因为 mcl 所在的那个槽还指向对象本身。放进 helper 方法后，helper 返回时
+    // 整个帧被弹出，引用才真正消失。GC 断言才有意义。
+    // ══════════════════════════════════════════════════════════════════════
+
+    private static WeakReference<ClassLoader> createCloseAndForgetModLoader(
+            MinecraftClassLoader game, Path tmp, String modId) throws Exception {
+        try (ModClassLoader mcl = new ModClassLoader(
+                ModManifest.of(modId, modId, "1.0"), game, tmp)) {
+            // 真实加载一个共享类，制造 ModClassLoader 内部状态
+            mcl.loadModClass("org.loader.api.Mod");
+            return new WeakReference<>(mcl);
+        }
+    }
+
+    private static WeakReference<ClassLoader> createCloseAndForgetManager(
+            MinecraftClassLoader game, Path tmp) throws Exception {
+        ModClassLoaderManager mgr = new ModClassLoaderManager(game, tmp);
+        ModClassLoader mod = mgr.create(ModManifest.of("gc-1", "1", "1.0"));
+        WeakReference<ClassLoader> ref = new WeakReference<>(mod);
+        mgr.close();
+        return ref;
+    }
+
+    private static WeakReference<ClassLoader> createCloseAndForgetGameLoader()
+            throws Exception {
+        MinecraftClassLoader game = new MinecraftClassLoader("minecraft-game",
+                new URL[0], ClassLoaderLeakTest.class.getClassLoader());
+        game.close();
+        return new WeakReference<>(game);
+    }
+
     @Test
     @DisplayName("关闭后的 ModClassLoader 可被 GC 回收")
     void closedModClassLoaderIsCollectable() throws Exception {
@@ -72,12 +115,8 @@ class ClassLoaderLeakTest {
         createModJar(tmp.resolve("mods"), "leakmod", "marker.txt");
         MinecraftClassLoader game = newGameLoader();
 
-        WeakReference<ClassLoader> ref;
-        try (ModClassLoader mcl = new ModClassLoader(
-                ModManifest.of("leakmod", "LeakMod", "1.0"), game, tmp)) {
-            mcl.loadModClass("org.loader.api.api.Mod");
-            ref = new WeakReference<>(mcl);
-        }
+        WeakReference<ClassLoader> ref = createCloseAndForgetModLoader(game, tmp, "leakmod");
+
         assertTrue(awaitCollected(ref, 30),
                 "关闭的 ModClassLoader 应可被回收；仍被引用的原因通常是闭包捕获或未关闭");
 
@@ -134,15 +173,10 @@ class ClassLoaderLeakTest {
         Path tmp = Files.createTempDirectory("mili-leak-mgr");
         MinecraftClassLoader game = newGameLoader();
 
-        WeakReference<ClassLoader> ref;
-        {
-            ModClassLoaderManager mgr = new ModClassLoaderManager(game, tmp);
-            ModClassLoader mod = mgr.create(ModManifest.of("gc-1", "1", "1.0"));
-            // Manager 本身不是 ClassLoader；泄漏风险在它持有的 ModClassLoader 上，
-            // 所以引用它创建的 Mod ClassLoader。
-            ref = new WeakReference<>(mod);
-            mgr.close();
-        }
+        // Manager 本身不是 ClassLoader；泄漏风险在它持有的 ModClassLoader 上，
+        // 所以引用它创建的 Mod ClassLoader。
+        WeakReference<ClassLoader> ref = createCloseAndForgetManager(game, tmp);
+
         assertTrue(awaitCollected(ref, 30),
                 "已关闭的 ModClassLoader 应可被回收");
         Files.deleteIfExists(tmp.resolve("mods"));
@@ -152,10 +186,7 @@ class ClassLoaderLeakTest {
     @Test
     @DisplayName("关闭后的 gameClassLoader 可被 GC 回收")
     void closedGameClassLoaderIsCollectable() throws Exception {
-        WeakReference<ClassLoader> ref;
-        MinecraftClassLoader game = newGameLoader();
-        game.close();
-        ref = new WeakReference<>(game);
+        WeakReference<ClassLoader> ref = createCloseAndForgetGameLoader();
         assertTrue(awaitCollected(ref, 30),
                 "已关闭的 MinecraftClassLoader 应可被回收");
     }

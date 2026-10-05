@@ -20,6 +20,10 @@ class GameBridgeTest {
         runtime.start();
 
         MinecraftBootstrap bootstrap = new MinecraftBootstrap(runtime);
+        bootstrap.beginDiscovery();
+        bootstrap.beginPreparing();
+        bootstrap.beginLoading();
+        bootstrap.beginMinecraftBootstrap();
         bootstrap.start();
 
         EntityBridge entityBridge = bootstrap.entityBridge();
@@ -39,6 +43,10 @@ class GameBridgeTest {
         runtime.start();
 
         MinecraftBootstrap bootstrap = new MinecraftBootstrap(runtime);
+        bootstrap.beginDiscovery();
+        bootstrap.beginPreparing();
+        bootstrap.beginLoading();
+        bootstrap.beginMinecraftBootstrap();
         bootstrap.start();
 
         EntityBridge entityBridge = bootstrap.entityBridge();
@@ -58,6 +66,10 @@ class GameBridgeTest {
         runtime.start();
 
         MinecraftBootstrap bootstrap = new MinecraftBootstrap(runtime);
+        bootstrap.beginDiscovery();
+        bootstrap.beginPreparing();
+        bootstrap.beginLoading();
+        bootstrap.beginMinecraftBootstrap();
         bootstrap.start();
 
         WorldBridge worldBridge = bootstrap.worldBridge();

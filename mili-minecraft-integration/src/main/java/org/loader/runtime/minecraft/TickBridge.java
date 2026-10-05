@@ -1,37 +1,41 @@
 package org.loader.runtime.minecraft;
 
-import org.loader.runtime.kernel.*;
-import org.loader.runtime.scheduler.Scheduler;
-import org.loader.runtime.scheduler.TaskPriority;
+import org.loader.runtime.kernel.Resource;
+import org.loader.runtime.kernel.Scope;
+import org.loader.runtime.tick.TickContract;
+import org.loader.runtime.tick.TickEngine;
 
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Tick bridge connects Minecraft's tick loop to the Runtime Scheduler.
- * <p>
- * Minecraft runs at 20 TPS (50ms per tick). The tick bridge schedules
- * per-tick work through the Runtime's task system.
+ * TickBridge —— 把 Minecraft 的<b>真实</b> tick 循环接到 Mili TickEngine。
+ *
+ * <p><b>与历史实现的根本区别</b>：旧版靠 10Hz 轮询 {@code level.getGameTime()}
+ * "推测" tick 是否发生。那在 20 TPS 下不成立：轮询粒度与 tick 不同步、
+ * 轮询线程不是主线程、单人世界下 {@code level} 为 null 时 tick 直接停摆。
+ *
+ * <p><b>现在的契约</b>：Minecraft 集成层在<b>真实</b> tick 入口调用
+ * {@link #beginTick()} 与 {@link #endTick()}。二者必须在 Minecraft 主线程上成对调用。
+ * 桥接层不猜测 tick 是否发生 —— 它只在被真实调用时推进状态机。
+ *
+ * <p><b>调用方</b>：{@link MinecraftTickSource} 的实现（字节码注入或官方启动路径）。
  */
-public class TickBridge implements Resource {
+public final class TickBridge implements Resource {
 
     private final String id;
     private final Scope owner;
-    private final Scheduler scheduler;
-    private final List<TickListener> listeners = new java.util.concurrent.CopyOnWriteArrayList<>();
-    private final Map<String, TickTask> scheduledTasks = new LinkedHashMap<>();
-    private final AtomicLong tickCounter = new AtomicLong(0);
-    private volatile boolean closed = false;
-    private volatile boolean paused = false;
+    private final TickEngine engine;
 
-    private static final long DEFAULT_TPS = 20;
-    private static final long DEFAULT_TICK_DURATION_MS = 1000 / DEFAULT_TPS;
+    /** 驱动 tick 的线程（= Minecraft 主线程）。 */
+    private volatile Thread tickThread;
+    /** 当前 tick 契约；tick 之间为 null。 */
+    private volatile TickContract activeContract;
+    private final AtomicBoolean closed = new AtomicBoolean(false);
 
-    public TickBridge(Scope owner, Scheduler scheduler) {
+    public TickBridge(Scope owner, TickEngine engine) {
         this.id = "minecraft-tick-bridge";
         this.owner = owner;
-        this.scheduler = scheduler;
+        this.engine = engine;
     }
 
     @Override
@@ -46,117 +50,109 @@ public class TickBridge implements Resource {
 
     @Override
     public boolean isClosed() {
-        return closed;
+        return closed.get();
     }
 
-    /**
-     * Returns the current tick count.
-     */
+    public TickEngine engine() {
+        return engine;
+    }
+
+    /** 当前 tick 契约；不在 tick 内返回 null。 */
+    public TickContract activeContract() {
+        return activeContract;
+    }
+
+    /** 当前 tick 序号。 */
     public long currentTick() {
-        return tickCounter.get();
+        return engine.currentTick();
+    }
+
+    // ── 真实 tick 入口（Minecraft 主线程调用） ──────────────────────────────
+
+    /**
+     * 标记一个真实 Minecraft tick 的开始。
+     *
+     * <p>必须在 Minecraft 主线程、且确实进入 tick 循环时调用。
+     *
+     * @return 本 tick 的执行契约
+     */
+    public TickContract beginTick() {
+        if (closed.get()) {
+            throw new IllegalStateException("TickBridge 已关闭");
+        }
+        Thread current = Thread.currentThread();
+        if (tickThread == null) {
+            tickThread = current;
+        } else if (tickThread != current) {
+            throw new IllegalStateException(
+                    "tick 必须在 Minecraft 主线程推进。当前 " + current.getName()
+                            + "，tick 线程 " + tickThread.getName());
+        }
+        TickContract contract = engine.beginTick();
+        activeContract = contract;
+        return contract;
     }
 
     /**
-     * Advances the tick counter and runs registered listeners.
-     * Called by the Minecraft main loop.
+     * 标记真实 tick 结束，产出指标。
+     *
+     * @return 本 tick 指标；不在 tick 内返回 null
      */
-    public void onTick() {
-        if (closed || paused) {
+    public TickContract.TickMetrics endTick() {
+        TickContract contract = activeContract;
+        if (contract == null) {
+            return null;
+        }
+        try {
+            return engine.endTick(contract);
+        } finally {
+            activeContract = null;
+        }
+    }
+
+    /**
+     * 便捷方法：在真实 tick 内执行一段工作，自动包裹 SCHEDULE→CORE_TICK→执行。
+     *
+     * <p>这是 Mod 参与 tick 的推荐入口。
+     */
+    public void onTick(Runnable work) {
+        TickContract c = activeContract;
+        if (c == null || work == null) {
             return;
         }
-        long tick = tickCounter.incrementAndGet();
-        for (TickListener listener : listeners) {
-            try {
-                listener.onTick(tick);
-            } catch (Exception e) {
-                // Tick listeners must not break the tick loop
-            }
-        }
+        engine.submit("mod-task-" + c.tickId(), work, TickContract.TaskPriority.NORMAL);
     }
 
-    /**
-     * Registers a tick listener.
-     */
-    public void addListener(TickListener listener) {
-        listeners.add(listener);
+    // ── 诊断 ───────────────────────────────────────────────────────────────
+
+    /** 最近一次 tick 指标。 */
+    public TickContract.TickMetrics lastMetrics() {
+        var all = engine.recentMetrics();
+        return all.isEmpty() ? null : all.get(all.size() - 1);
     }
 
-    /**
-     * Removes a tick listener.
-     */
-    public void removeListener(TickListener listener) {
-        listeners.remove(listener);
-    }
-
-    /**
-     * Submits a task to be executed on the next tick.
-     */
-    public void runOnNextTick(Runnable task) {
-        addListener(new TickListener() {
-            @Override
-            public void onTick(long tick) {
-                task.run();
-                removeListener(this);
-            }
-        });
-    }
-
-    /**
-     * Submits a task to be executed after N ticks.
-     */
-    public void runAfterTicks(int ticks, Runnable task) {
-        if (ticks <= 0) {
-            runOnNextTick(task);
-            return;
-        }
-        final int[] remaining = {ticks};
-        addListener(new TickListener() {
-            @Override
-            public void onTick(long tick) {
-                if (--remaining[0] <= 0) {
-                    task.run();
-                    removeListener(this);
-                }
-            }
-        });
-    }
-
-    /**
-     * Pauses tick processing.
-     */
-    public void pause() {
-        paused = true;
-    }
-
-    /**
-     * Resumes tick processing.
-     */
-    public void resume() {
-        paused = false;
-    }
-
-    public boolean isPaused() {
-        return paused;
+    public String diagnostics() {
+        return engine.diagnostics();
     }
 
     @Override
     public void close() {
-        closed = true;
-        listeners.clear();
-        scheduledTasks.clear();
+        if (closed.compareAndSet(false, true)) {
+            TickContract c = activeContract;
+            if (c != null && !c.isCompleted()) {
+                c.cancel();
+            }
+            activeContract = null;
+        }
     }
 
-    /**
-     * Tick listener interface.
-     */
-    @FunctionalInterface
-    public interface TickListener {
-        void onTick(long tick);
+    /** 简化 close（供 try-with-resources）。 */
+    public void closeQuietly() {
+        close();
     }
 
-    /**
-     * Internal tick task representation.
-     */
-    private record TickTask(String id, Runnable work, int interval, boolean repeating) {
+    /** 仅供测试：重置线程归属。 */
+    void resetThreadBindingForTesting() {
+        tickThread = null;
     }
 }

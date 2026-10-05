@@ -24,14 +24,45 @@ plugins {
 
 val decompilerCfg = configurations.create("decompiler")
 
+// ── ASM 版本（单一来源：根项目从 gradle.properties 注入） ─────────────────────
+// Minecraft 26.2 的 class major = 69（Java 25），ASM 9.7 读不了，
+// 会抛 "Unsupported class file major version 69"。9.8+ 才支持 Java 25。
+val asmVersion: String = rootProject.extra["asmVersion"] as String
+// asm-analysis / asm-util 独立锁定（离线缓存只有 9.8），原因见 gradle.properties。
+val asmAnalysisVersion: String = rootProject.extra["asmAnalysisVersion"] as String
+
 dependencies {
     implementation(project(":mili-runtime"))
     implementation(project(":mili-abi"))
+    // ASM generates the Block subclasses that delegate to mod behaviour.
+    // Still zero compile-time coupling to Minecraft: we emit bytecode against
+    // string-named types and let the game classloader link them.
+    //
+    // 四个 artifact 而不是一个：注入逻辑需要 AdviceAdapter（asm-commons）与
+    // 方法解析（asm-tree 的 MethodNode），只用核心包写不出转换器。
+    implementation("org.ow2.asm:asm:$asmVersion")
+    implementation("org.ow2.asm:asm-tree:$asmVersion")
+    implementation("org.ow2.asm:asm-commons:$asmVersion")
+    // asm-analysis 走独立版本锁定，原因见 gradle.properties。
+    implementation("org.ow2.asm:asm-analysis:$asmAnalysisVersion")
+    // asm-util 提供 CheckClassAdapter，字节码验证测试直接依赖它。
+    //
+    // test 侧显式声明而非靠 implementation 传递：把「测试观察字节码内部结构」
+    // 这件事写成一条显式依赖，比让它隐式继承更清楚 —— 这个模块的测试
+    // （尤其是真实 Minecraft 26.2 冒烟测试）需要读常量池、扫指令序列。
+    testImplementation("org.ow2.asm:asm:$asmVersion")
+    testImplementation("org.ow2.asm:asm-tree:$asmVersion")
+    testImplementation("org.ow2.asm:asm-commons:$asmVersion")
+    testImplementation("org.ow2.asm:asm-analysis:$asmAnalysisVersion")
+    testImplementation("org.ow2.asm:asm-util:$asmAnalysisVersion")
     decompilerCfg("org.benf:cfr:0.152")
 }
 
 // ── Minecraft build extension ────────────────────────────────────────────────
-val minecraftVersion: String = rootProject.findProperty("minecraftVersion")?.toString() ?: "26.2"
+// 版本来自 gradle.properties（根项目已强制校验存在，无字面量兜底）
+val miliPlatformVersion: String = rootProject.extra["miliPlatformVersion"] as String
+val miliAbiVersion: String = rootProject.extra["miliAbiVersion"] as String
+val minecraftVersion: String = rootProject.extra["minecraftVersion"] as String
 
 val minecraftArtifactPath: String? = providers.gradleProperty("minecraftArtifact")
     .orElse(providers.environmentVariable("MINECRAFT_ARTIFACT"))
@@ -193,8 +224,8 @@ tasks.jar {
         attributes(
             "Implementation-Title" to "Mili Minecraft ${minecraftVersion} Integration",
             "Implementation-Version" to version,
-            "Mili-Platform" to (rootProject.findProperty("miliPlatformVersion") ?: "0.1.0"),
-            "Mili-Abi" to (rootProject.findProperty("miliAbiVersion") ?: "1"),
+            "Mili-Platform" to miliPlatformVersion,
+            "Mili-Abi" to miliAbiVersion,
             "Mili-Minecraft" to minecraftVersion
         )
     }
@@ -341,7 +372,7 @@ fun generateMinecraftJson(a: MinecraftAnalysis): String {
       "minecraft": "${a.version}",
       "artifactSha256": "$sha",
       "decompiler": "cfr",
-      "integration": "${rootProject.findProperty("miliPlatformVersion")}",
+      "integration": $miliPlatformVersion,
       "totalClasses": ${a.totalClasses},
       "eventTypes": [${a.eventTypes.joinToString(", ") { "\"$it\"" }}],
       "registries": [${a.registries.joinToString(", ") { "\"$it\"" }}]

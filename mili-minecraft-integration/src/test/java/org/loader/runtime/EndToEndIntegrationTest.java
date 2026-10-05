@@ -3,231 +3,338 @@ package org.loader.runtime;
 import org.junit.jupiter.api.*;
 import org.loader.runtime.kernel.*;
 import org.loader.runtime.minecraft.*;
-import org.loader.runtime.mod.*;
 import org.loader.runtime.observability.RuntimeDiagnostics;
-import org.loader.runtime.scheduler.*;
-import org.loader.runtime.service.*;
+import org.loader.runtime.scheduler.Scheduler;
+import org.loader.runtime.service.EventBus;
+import org.loader.runtime.tick.TickContract;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * End-to-end integration test that mirrors END_TO_END.md:
- * Launcher → Runtime bootstrap → Mod discovery → Dependency resolution → Mod loading → Running → Shutdown → Cleanup.
+ * 端到端集成测试：Runtime bootstrap → Minecraft 集成 → 真实 tick 契约 → 关闭清理。
+ *
+ * <p>验证的是平台内部各层协同一致，不启动真实 Minecraft。
+ * 真实 Minecraft 26.2 启动由 CI smoke test 覆盖。
  */
 class EndToEndIntegrationTest {
 
+    /** 走完状态机到 RUNNING。 */
+    private static MinecraftBootstrap startedBootstrap(org.loader.runtime.kernel.Runtime rt) {
+        MinecraftBootstrap b = new MinecraftBootstrap(rt);
+        b.beginDiscovery();
+        b.beginPreparing();
+        b.beginLoading();
+        b.beginMinecraftBootstrap();
+        b.start();
+        return b;
+    }
+
     @Test
     void full_lifecycle_bootstrap_running_shutdown() throws Exception {
-        // 1. Runtime bootstrap
-        org.loader.runtime.kernel.Runtime runtime = org.loader.runtime.kernel.Runtime.create("e2e-test");
+        var runtime = org.loader.runtime.kernel.Runtime.create("e2e-test");
         runtime.start();
         assertTrue(runtime.isRunning());
 
-        // 2. Create diagnostics for verification
         RuntimeDiagnostics diagnostics = new RuntimeDiagnostics("e2e-diags", runtime.rootScope());
         runtime.rootScope().registerResource(diagnostics);
 
-        // 3. Create Minecraft bootstrap (NOT started yet)
-        MinecraftBootstrap bootstrap = new MinecraftBootstrap(runtime);
+        MinecraftBootstrap bootstrap = startedBootstrap(runtime);
 
-        // 4. Register events listener BEFORE starting
+        // 事件监听在 start 之后注册（started 事件已发出）
         MinecraftEventBridge eventBridge = bootstrap.eventBridge();
-        List<String> receivedEvents = new ArrayList<>();
-        eventBridge.on(MinecraftEventBridge.ServerStartedEvent.class, e -> receivedEvents.add("started"));
+        List<String> received = new ArrayList<>();
+        eventBridge.on(MinecraftEventBridge.TickEvent.class, e -> received.add("tick:" + e.tick()));
 
-        // Now start
-        bootstrap.start();
         assertTrue(bootstrap.isRunning());
         assertEquals(LifecycleState.RUNNING, bootstrap.scope().state());
 
-        // 5. Tick bridge — schedule work on next tick
-        TickBridge tickBridge = bootstrap.tickBridge();
-        AtomicInteger tickCounter = new AtomicInteger(0);
-        tickBridge.addListener(t -> tickCounter.incrementAndGet());
+        // 真实 tick 契约：begin/end 成对
+        TickBridge bridge = bootstrap.tickBridge();
+        AtomicInteger tickCount = new AtomicInteger(0);
+        for (int i = 1; i <= 3; i++) {
+            var contract = bridge.beginTick();
+            bridge.engine().advanceToSchedule(contract);
+            bridge.engine().advanceToCoreTick(contract);
+            bridge.onTick(tickCount::incrementAndGet);
+            bridge.engine().runPendingTasks(contract);
+            var metrics = bridge.endTick();
+            assertNotNull(metrics);
+            eventBridge.post(new MinecraftEventBridge.TickEvent(i));
+        }
 
-        // Execute ticks
-        tickBridge.onTick();
-        tickBridge.onTick();
-        tickBridge.onTick();
-        assertEquals(3, tickBridge.currentTick());
-        assertEquals(3, tickCounter.get());
+        assertEquals(3, bridge.currentTick());
+        assertEquals(3, tickCount.get(), "Mod 任务应每 tick 执行一次");
+        assertTrue(received.contains("tick:1"));
+        assertTrue(received.contains("tick:3"));
 
-        // 6. Registry bridge — register items
-        MinecraftRegistryBridge registry = bootstrap.registryBridge();
+        // 注册表桥接
+        var registry = bootstrap.registryBridge();
         registry.register("blocks", "stone", "minecraft:stone");
-        assertTrue(registry.get("blocks", "stone").isPresent());
-        assertEquals("minecraft:stone", registry.get("blocks", "stone").get());
+        assertEquals("minecraft:stone", registry.get("blocks", "stone").orElseThrow());
 
-        // 7. Scheduler — submit a task
-        Scheduler scheduler = runtime.scheduler();
-        assertNotNull(scheduler);
-        AtomicBoolean taskExecuted = new AtomicBoolean(false);
-        scheduler.submit(runtime.rootScope(), () -> taskExecuted.set(true)).await();
-        assertTrue(taskExecuted.get());
-
-        // 8. Capture snapshot before shutdown
-        RuntimeDiagnostics.DiagnosticSnapshot snapshot = diagnostics.captureSnapshot();
-        assertNotNull(snapshot);
-        assertTrue(snapshot.uptimeMillis() >= 0);
-        assertTrue(snapshot.rootScope().totalScopes() >= 2); // root + minecraft scope at minimum
-
-        // 9. Shutdown via MinecraftStop event
-        eventBridge.post(new MinecraftEventBridge.ServerStoppingEvent());
-
-        // 10. Stop bootstrap and runtime
+        // 关闭
         bootstrap.stop();
         assertFalse(bootstrap.isRunning());
         runtime.close();
         assertFalse(runtime.isRunning());
-
-        // 11. Verify events were received
-        assertTrue(receivedEvents.contains("started"));
     }
 
     @Test
-    void minecraft_lifecycle_receives_all_phases() {
-        org.loader.runtime.kernel.Runtime runtime = org.loader.runtime.kernel.Runtime.create("lifecycle-test");
+    void minecraft_lifecycle_reachesRunningThenStopped() {
+        var runtime = org.loader.runtime.kernel.Runtime.create("lifecycle-test");
         runtime.start();
+        try {
+            MinecraftBootstrap bootstrap = new MinecraftBootstrap(runtime);
+            MinecraftLifecycle lifecycle = bootstrap.lifecycle();
+            assertEquals(MinecraftLifecycle.Phase.CREATED, lifecycle.phase());
 
-        MinecraftBootstrap bootstrap = new MinecraftBootstrap(runtime);
-        MinecraftLifecycle lifecycle = bootstrap.lifecycle();
+            bootstrap.beginDiscovery();
+            bootstrap.beginPreparing();
+            bootstrap.beginLoading();
+            bootstrap.beginMinecraftBootstrap();
+            bootstrap.start();
 
-        List<MinecraftBootstrap.MinecraftLifecycleEvent> events = new ArrayList<>();
-        lifecycle.addListener(events::add);
+            assertEquals(MinecraftLifecycle.Phase.RUNNING, lifecycle.phase());
+            assertTrue(lifecycle.isRunning());
 
-        bootstrap.start();
-        bootstrap.stop();
-
-        assertTrue(events.contains(MinecraftBootstrap.MinecraftLifecycleEvent.STARTING));
-        assertTrue(events.contains(MinecraftBootstrap.MinecraftLifecycleEvent.STARTED));
-        assertTrue(events.contains(MinecraftBootstrap.MinecraftLifecycleEvent.STOPPING));
-        assertTrue(events.contains(MinecraftBootstrap.MinecraftLifecycleEvent.STOPPED));
-
-        runtime.close();
+            bootstrap.stop();
+            assertEquals(MinecraftLifecycle.Phase.STOPPED, lifecycle.phase());
+            assertFalse(lifecycle.isRunning());
+        } finally {
+            runtime.close();
+        }
     }
 
     @Test
-    void tickBridge_scheduledTasksExecute() {
-        org.loader.runtime.kernel.Runtime runtime = org.loader.runtime.kernel.Runtime.create("tick-task-e2e");
+    void tickContract_strictStageOrderingEndToEnd() {
+        var runtime = org.loader.runtime.kernel.Runtime.create("tick-stages-e2e");
         runtime.start();
+        try {
+            MinecraftBootstrap bootstrap = startedBootstrap(runtime);
+            TickBridge bridge = bootstrap.tickBridge();
+            List<String> observed = new ArrayList<>();
 
-        MinecraftBootstrap bootstrap = new MinecraftBootstrap(runtime);
-        bootstrap.start();
+            bridge.engine().onPreTick((c, p) -> observed.add(p.name()));
+            bridge.engine().onSchedule((c, p) -> observed.add(p.name()));
+            bridge.engine().onCoreTick((c, p) -> observed.add(p.name()));
+            bridge.engine().onAsyncCompletion((c, p) -> observed.add(p.name()));
+            bridge.engine().onPostTick((c, p) -> observed.add(p.name()));
+            bridge.engine().onTickEnd((c, p) -> observed.add(p.name()));
 
-        TickBridge tickBridge = bootstrap.tickBridge();
-        AtomicLong executedAtTick = new AtomicLong(-1);
+            var contract = bridge.beginTick();
+            assertEquals(TickContract.TickPhase.PRE_TICK, contract.phase());
 
-        // Schedule to run after 2 more ticks
-        tickBridge.runAfterTicks(2, () -> executedAtTick.set(tickBridge.currentTick()));
+            bridge.engine().advanceToSchedule(contract);
+            bridge.engine().advanceToCoreTick(contract);
+            bridge.endTick();
 
-        tickBridge.onTick(); // tick 1
-        tickBridge.onTick(); // tick 2 — task should execute
+            assertEquals(List.of("PRE_TICK", "SCHEDULE", "CORE_TICK",
+                    "ASYNC_COMPLETION", "POST_TICK", "TICK_END"), observed,
+                    "阶段必须严格按序，不跳步不重复");
 
-        assertEquals(2L, executedAtTick.get());
+            bootstrap.stop();
+        } finally {
+            runtime.close();
+        }
+    }
 
-        bootstrap.stop();
-        runtime.close();
+    @Test
+    void modTaskException_doesNotBreakTickLoop() {
+        var runtime = org.loader.runtime.kernel.Runtime.create("tick-exception-e2e");
+        runtime.start();
+        try {
+            MinecraftBootstrap bootstrap = startedBootstrap(runtime);
+            TickBridge bridge = bootstrap.tickBridge();
+
+            AtomicInteger survived = new AtomicInteger();
+            for (int i = 0; i < 3; i++) {
+                var contract = bridge.beginTick();
+                bridge.engine().advanceToSchedule(contract);
+                bridge.onTick(() -> {
+                    throw new RuntimeException("mod blew up");
+                });
+                bridge.onTick(survived::incrementAndGet);
+                bridge.engine().runPendingTasks(contract);
+
+                var metrics = bridge.endTick();
+                assertNotNull(metrics.error(), "异常应被记录到 tick 契约");
+                assertEquals(TickContract.TaskState.COMPLETED,
+                        contract.tasks().get(1).state(),
+                        "异常任务之后的任务仍应执行");
+            }
+
+            assertEquals(3, survived.get(), "每个 tick 的正常任务都应执行");
+            assertEquals(3, bridge.engine().failedTickCount(),
+                    "三个 tick 都记录了失败");
+
+            bootstrap.stop();
+        } finally {
+            runtime.close();
+        }
     }
 
     @Test
     void capability_grant_revoke_and_availability() {
-        org.loader.runtime.kernel.Runtime runtime = org.loader.runtime.kernel.Runtime.create("cap-e2e");
+        var runtime = org.loader.runtime.kernel.Runtime.create("cap-e2e");
         runtime.start();
+        try {
+            Scope testScope = runtime.rootScope().createChild("cap-test");
 
-        Scope testScope = runtime.rootScope().createChild("cap-test");
+            var token = testScope.grantCapability(String.class, "test-value");
+            assertTrue(token.isActive());
+            assertEquals("test-value", token.get());
+            assertTrue(testScope.getCapability(String.class).isPresent());
 
-        // Grant a capability
-        CapabilityToken<String> token = testScope.grantCapability(String.class, "test-value");
-        assertTrue(token.isActive());
-        assertEquals("test-value", token.get());
-
-        // Retrieve via scope
-        var retrieved = testScope.getCapability(String.class);
-        assertTrue(retrieved.isPresent());
-
-        // Revoke
-        token.revoke();
-        assertFalse(token.isActive());
-        assertTrue(testScope.getCapability(String.class).isEmpty());
-
-        runtime.close();
+            token.revoke();
+            assertFalse(token.isActive());
+            assertTrue(testScope.getCapability(String.class).isEmpty());
+        } finally {
+            runtime.close();
+        }
     }
 
     @Test
     void scheduler_metrics_execute_and_report() throws Exception {
-        org.loader.runtime.kernel.Runtime runtime = org.loader.runtime.kernel.Runtime.create("metrics-e2e");
+        var runtime = org.loader.runtime.kernel.Runtime.create("metrics-e2e");
         runtime.start();
+        try {
+            Scheduler scheduler = runtime.scheduler();
+            AtomicInteger counter = new AtomicInteger(0);
 
-        Scheduler scheduler = runtime.scheduler();
-        AtomicInteger counter = new AtomicInteger(0);
+            for (int i = 0; i < 10; i++) {
+                scheduler.submit(runtime.rootScope(), counter::incrementAndGet).await();
+            }
 
-        // Submit 10 tasks
-        for (int i = 0; i < 10; i++) {
-            scheduler.submit(runtime.rootScope(), () -> {
-                try { Thread.sleep(1); } catch (InterruptedException ignored) {}
-                counter.incrementAndGet();
-            }).await();
+            var metrics = scheduler.metrics();
+            assertTrue(metrics.completed() >= 10);
+            assertEquals(10, counter.get());
+            assertTrue(metrics.totalExecutionTimeNanos() > 0);
+            assertTrue(metrics.averageExecutionTimeMs() >= 0);
+        } finally {
+            runtime.close();
         }
-
-        Scheduler.SchedulerMetrics metrics = scheduler.metrics();
-        assertTrue(metrics.completed() >= 10);
-        assertEquals(10, counter.get());
-        assertTrue(metrics.totalExecutionTimeNanos() > 0);
-        assertTrue(metrics.averageExecutionTimeMs() >= 0);
-
-        runtime.close();
     }
 
     @Test
     void eventBridge_typed_dispatch() {
-        org.loader.runtime.kernel.Runtime runtime = org.loader.runtime.kernel.Runtime.create("event-e2e");
+        var runtime = org.loader.runtime.kernel.Runtime.create("event-e2e");
         runtime.start();
+        try {
+            MinecraftBootstrap bootstrap = startedBootstrap(runtime);
 
-        MinecraftBootstrap bootstrap = new MinecraftBootstrap(runtime);
-        bootstrap.start();
+            EventBus eventBus = new EventBus("test-bus", runtime.rootScope());
+            runtime.rootScope().registerResource(eventBus);
 
-        EventBus eventBus = new EventBus("test-bus", runtime.rootScope());
-        runtime.rootScope().registerResource(eventBus);
+            List<String> received = new ArrayList<>();
+            eventBus.addListener(String.class, received::add);
+            eventBus.post("hello");
+            eventBus.post("world");
+            eventBus.post(42); //类型不匹配，不应被 String 监听器收到
 
-        List<String> received = new ArrayList<>();
-        eventBus.addListener(String.class, received::add);
-        eventBus.post("hello");
-        eventBus.post("world");
-        eventBus.post(42); // Integer — should NOT be received by String listener
+            assertEquals(2, received.size());
+            assertTrue(received.contains("hello"));
+            assertTrue(received.contains("world"));
 
-        assertEquals(2, received.size());
-        assertTrue(received.contains("hello"));
-        assertTrue(received.contains("world"));
-
-        bootstrap.stop();
-        runtime.close();
+            bootstrap.stop();
+        } finally {
+            runtime.close();
+        }
     }
 
     @Test
     void dispose_and_cleanup_all_scopes() {
-        org.loader.runtime.kernel.Runtime runtime = org.loader.runtime.kernel.Runtime.create("dispose-e2e");
+        var runtime = org.loader.runtime.kernel.Runtime.create("dispose-e2e");
         runtime.start();
 
-        // Create scope tree
         Scope modScope = runtime.rootScope().createChild("mod-a");
-        Scope moduleScope = modScope.createChild("module-a1");
+        modScope.createChild("module-a1");
 
-        // Register resources
-        EventBus bus = new EventBus("mod-bus", modScope);
-        modScope.registerResource(bus);
-        Scheduler modScheduler = new Scheduler("mod-scheduler", modScope);
-        modScope.registerResource(modScheduler);
+        modScope.registerResource(new EventBus("mod-bus", modScope));
+        modScope.registerResource(new Scheduler("mod-scheduler", modScope));
 
-        // Close runtime — should clean up all
         runtime.close();
+        assertTrue(runtime.rootScope().isStopped(), "关闭 Runtime 应递归清理所有 Scope");
+    }
 
-        // Verify root is stopped
-        assertTrue(runtime.rootScope().isStopped());
+    @Test
+    void scopeHierarchy_isCreatedUnderRoot() {
+        var runtime = org.loader.runtime.kernel.Runtime.create("scope-tree-e2e");
+        runtime.start();
+        try {
+            MinecraftBootstrap bootstrap = startedBootstrap(runtime);
+            Scope mcScope = bootstrap.scope();
+
+            assertEquals(runtime.rootScope(), mcScope.parent(),
+                    "Minecraft Scope 应挂在 RootScope 之下");
+            assertFalse(mcScope.children().stream()
+                            .anyMatch(c -> c.id().equals("render-scope")),
+                    "SERVER 环境不应有 render scope；CLIENT 才有");
+
+            bootstrap.stop();
+        } finally {
+            runtime.close();
+        }
+    }
+
+    @Test
+    void tickDiagnostics_exposeEngineMetrics() {
+        var runtime = org.loader.runtime.kernel.Runtime.create("tick-diag-e2e");
+        runtime.start();
+        try {
+            MinecraftBootstrap bootstrap = startedBootstrap(runtime);
+            TickBridge bridge = bootstrap.tickBridge();
+            for (int i = 0; i < 5; i++) {
+                bridge.beginTick();
+                bridge.endTick();
+            }
+
+            String diag = bridge.diagnostics();
+            assertTrue(diag.contains("tickCount=5"));
+            assertTrue(diag.contains("avg="));
+            bootstrap.stop();
+        } finally {
+            runtime.close();
+        }
+    }
+
+    @Test
+    void bootstrapStop_releasesSchedulerAndTickResources() {
+        var runtime = org.loader.runtime.kernel.Runtime.create("release-e2e");
+        runtime.start();
+        try {
+            MinecraftBootstrap bootstrap = startedBootstrap(runtime);
+            assertFalse(bootstrap.scheduler().isClosed());
+            assertFalse(bootstrap.tickEngine().isClosed());
+            assertFalse(bootstrap.tickBridge().isClosed());
+
+            bootstrap.stop();
+
+            assertTrue(bootstrap.scheduler().isClosed(), "停止后 Scheduler 必须关闭");
+            assertTrue(bootstrap.tickEngine().isClosed(), "停止后 TickEngine 必须关闭");
+            assertTrue(bootstrap.tickBridge().isClosed(), "停止后 TickBridge 必须关闭");
+        } finally {
+            runtime.close();
+        }
+    }
+
+    @Test
+    void externalResource_releasedOnStop() {
+        var runtime = org.loader.runtime.kernel.Runtime.create("extrel-e2e");
+        runtime.start();
+        try {
+            MinecraftBootstrap bootstrap = startedBootstrap(runtime);
+            AtomicBoolean released = new AtomicBoolean(false);
+            bootstrap.registerExternalResource(() -> released.set(true));
+
+            bootstrap.stop();
+            assertTrue(released.get(), "stop 必须释放已注册的外部资源");
+        } finally {
+            runtime.close();
+        }
     }
 }

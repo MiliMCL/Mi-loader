@@ -98,7 +98,15 @@ public class InstanceManager implements Resource {
                 managed.runtime().start();
             }
             if (!managed.bootstrap().isRunning()) {
-                managed.bootstrap().start();
+                // 显式走完状态机，确保实例启动序列与主启动路径一致
+                var bootstrap = managed.bootstrap();
+                if (bootstrap.state() == org.loader.runtime.minecraft.BootstrapState.CREATED) {
+                    bootstrap.beginDiscovery();
+                    bootstrap.beginPreparing();
+                    bootstrap.beginLoading();
+                    bootstrap.beginMinecraftBootstrap();
+                }
+                bootstrap.start();
             }
             activeInstanceId = instanceId;
             logger.info("Started instance: " + instanceId);
