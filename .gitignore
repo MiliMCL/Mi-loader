@@ -5,6 +5,16 @@ test_client
 
 # MC decompiled sources — build intermediates only (never redistribute)
 **/build/minecraft/decompiled/
-tools
+
+# tools/ 混着两类东西，必须分开处理：
+#   - 26.2/ fabric/ our/ 是从原 Mod 扒下来的分析数据，体积大且不可分发 → 忽略
+#   - SymbolVerifier.java 是平台自己的工具源码，且是 verifyTransformationSymbols
+#     任务声明在 inputs.file 里的必需输入。忽略它会让 CI 直接失败：
+#     "Input file does not exist ... tools/SymbolVerifier.java"
+#     而失败点在构建配置里，与 Minecraft 版本无关，极难一眼看出是缺文件。
+#     （ignore 整个目录再放行单个文件：gitignore 不支持「先全忽略再白名单」，
+#      所以这里写成「忽略除它以外的一切」。）
+tools/*
+!tools/SymbolVerifier.java
 test_client_bak
 Stardewvalley_mod-main
