@@ -17,6 +17,9 @@ public class LoaderConfig {
 
     public LoaderConfig(Path gameDir, Path minecraftPath, Path modsPath, Path librariesPath, Path configPath) {
         this.gameDir = Objects.requireNonNull(gameDir);
+        // Default: server.jar (vanilla server layout). The installer writes
+        // <version>.jar instead, but MinecraftDiscovery falls back to scanning
+        // the game dir for a JAR containing MC classes, so both layouts work.
         this.minecraftPath = minecraftPath != null ? minecraftPath : gameDir.resolve("server.jar");
         this.modsPath = modsPath != null ? modsPath : gameDir.resolve("mods");
         this.librariesPath = librariesPath != null ? librariesPath : gameDir.resolve("libraries");

@@ -11,6 +11,8 @@ import org.loader.runtime.mod.ModContext;
 import org.loader.runtime.mod.ModManifest;
 import org.loader.runtime.mod.ModManifest.ValidationResult;
 
+import java.io.InputStream;
+import java.lang.reflect.Method;
 import java.net.URL;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -65,7 +67,79 @@ public class LoaderMain {
         m.launch(args);
     }
 
+    /**
+     * 确保 gameDir 里存在可用的 Minecraft，缺失时调用安装器现场拉取。
+     *
+     * <p>这是「下载即启动」的关键一环：用户解压分发包后直接运行，
+     * 不需要先手动跑一次安装器。安装器是幂等的，重复调用只补齐缺失文件。
+     *
+     * <p>安装失败不会中断启动流程 —— 后续 {@code locateGame} 会抛出带
+     * 明确原因的 GameDiscoveryException，用户仍有机会手动排查。
+     */
+    private void ensureMinecraftPresent() {
+        try {
+            MinecraftDiscovery probe = MinecraftDiscovery.scan(LoaderConfig.at(gameDir));
+            if (probe.found()) {
+                return;
+            }
+        } catch (Exception ignored) {
+            // 探测异常不阻断，直接尝试安装
+        }
+
+        String version = detectTargetMinecraftVersion();
+        System.out.println("[Mili] 未在 " + gameDir + " 找到 Minecraft，"
+                + "开始自动安装 " + version + "（首次约需下载 600MB）");
+
+        try {
+            Class<?> installer = Class.forName("org.loader.installer.InstallerMain");
+            Method main = installer.getMethod("main", String[].class);
+            // --skip-assets 不适合这里：缺资源会在进世界时崩溃，必须完整安装
+            main.invoke(null, (Object) new String[]{
+                    "--game-dir", gameDir.toString(),
+                    "--version", version
+            });
+            System.out.println("[Mili] Minecraft 安装完成，继续启动");
+        } catch (ClassNotFoundException e) {
+            System.err.println("[Mili] 提示: 分发包中缺少 mili-installer，"
+                    + "请手动提供 Minecraft 安装到 " + gameDir);
+        } catch (Exception e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            System.err.println("[Mili] 自动安装失败: " + cause.getMessage());
+        }
+    }
+
+    /**
+     * 读取平台绑定的 Minecraft 版本。
+     *
+     * <p>优先用 JAR 内嵌的 platform.json（由构建时指纹写入，保证与
+     * 平台编译版本一致）；读不到时回退到 26.2 这个当前支持版本。
+     */
+    private String detectTargetMinecraftVersion() {
+        try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(
+                LoaderMain.class.getProtectionDomain().getCodeSource()
+                        .getLocation().toURI())) {
+            var entry = zf.getEntry("META-INF/mili/platform.json");
+            if (entry != null) {
+                String text;
+                try (InputStream in = zf.getInputStream(entry)) {
+                    text = new String(in.readAllBytes(),
+                            java.nio.charset.StandardCharsets.UTF_8);
+                }
+                var matcher = java.util.regex.Pattern
+                        .compile("\"minecraft\"\\s*:\\s*\"([^\"]+)\"")
+                        .matcher(text);
+                if (matcher.find()) {
+                    return matcher.group(1);
+                }
+            }
+        } catch (Exception ignored) {
+            // 运行期无 JAR（IDE 启动）或读取失败，走回退值
+        }
+        return "26.2";
+    }
+
     public void launch(String[] mcArgs) throws Exception {
+        ensureMinecraftPresent();
         String[] passThrough = stripGameDirArg(mcArgs);
         List<Path> gameClasspath = gameProvider.locateGame(gameDir);
         LoaderConfig gameConfig = LoaderConfig.at(gameDir);

@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Mili Platform launcher (Linux / macOS)
+#
+# 首次运行会发现 game 目录里没有 Minecraft，自动从 Mojang 官方源下载并
+# 校验（约 600MB）。之后每次启动直接进入游戏。
+#
+# 用法:
+#   ./bin/mili-loader                启动游戏
+#   ./bin/mili-loader --dry-run      只检查环境，不启动
+#   ./bin/mili-loader --server       以服务端模式启动
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DIST_DIR="$(dirname "$SCRIPT_DIR")"
+GAME_DIR="$DIST_DIR/game"
+MODS_DIR="$DIST_DIR/mods"
+
+PLATFORM_JAR="$(ls "$DIST_DIR"/core/mili-*.jar 2>/dev/null | head -1 || true)"
+if [ -z "$PLATFORM_JAR" ]; then
+  echo "[Mili] 错误: 在 $DIST_DIR/core/ 下找不到平台 JAR" >&2
+  exit 1
+fi
+
+# 定位 Java 25。Minecraft 26.2 需要 Java 25，低版本会在启动时失败。
+find_java() {
+  if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+    echo "$JAVA_HOME/bin/java"
+    return
+  fi
+  if command -v java >/dev/null 2>&1; then
+    command -v java
+    return
+  fi
+  # Gradle 下载的 JDK 通常在这里
+  for candidate in "$HOME"/.gradle/jdks/*/bin/java; do
+    if [ -x "$candidate" ]; then
+      echo "$candidate"
+      return
+    fi
+  done
+  echo ""
+}
+
+JAVA_BIN="$(find_java)"
+if [ -z "$JAVA_BIN" ]; then
+  echo "[Mili] 错误: 找不到 Java。请安装 JDK 25 并设置 JAVA_HOME。" >&2
+  exit 1
+fi
+
+JAVA_MAJOR="$("$JAVA_BIN" -XshowSettings:properties -version 2>&1 \
+  | awk -F'= *' '/java.specification.version/ {print $2}' | tr -d '[:space:]')"
+if [ -n "$JAVA_MAJOR" ] && [ "$JAVA_MAJOR" -lt 25 ] 2>/dev/null; then
+  echo "[Mili] 警告: 当前 Java $JAVA_MAJOR，Minecraft 26.2 需要 Java 25。" >&2
+  echo "        加载器可能启动失败，建议切换到 JDK 25。" >&2
+fi
+
+mkdir -p "$GAME_DIR" "$MODS_DIR"
+
+# --dry-run 等参数原样透传给加载器
+exec "$JAVA_BIN" \
+  -Xmx2G \
+  -Dfile.encoding=UTF-8 \
+  -Djava.library.path="$DIST_DIR/game/natives" \
+  -jar "$PLATFORM_JAR" "$GAME_DIR" "$@"
