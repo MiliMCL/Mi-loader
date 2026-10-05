@@ -116,6 +116,31 @@ jobs:
       - name: Build ready-to-run distributions (tar.gz + zip)
         run: ./gradlew :mili-loader:distTar :mili-loader:distZip --no-daemon --console=plain --no-configuration-cache
 
+      # The release job is the one that actually publishes, so the layout must be
+      # asserted here too — a check that only lives in ci.yml lets a broken
+      # archive ship unnoticed.
+      - name: Verify distribution layout
+        run: |
+          TARBALL=$(ls mili-loader/build/distributions/*.tar.gz)
+          ROOT=$(basename "$TARBALL" .tar.gz)
+          LIST=$(tar tzf "$TARBALL" | sed 's:/$::' | sort)
+          echo "--- archive contents ---"
+          echo "$LIST"
+          for p in "$ROOT/README.txt" \
+                   "$ROOT/bin/mili-loader" \
+                   "$ROOT/bin/mili-loader.bat"; do
+            echo "$LIST" | grep -qx "$p" || { echo "ERROR: missing $p"; exit 1; }
+          done
+          # core/ must hold exactly the versioned platform JAR
+          echo "$LIST" | grep -qE "^$ROOT/core/mili-[0-9.]+-mc[0-9.]+\.jar$" || \
+            { echo "ERROR: platform JAR missing from core/"; exit 1; }
+          echo "$LIST" | grep -qx "$ROOT/mods/.keep" || \
+            { echo "ERROR: mods/.keep missing"; exit 1; }
+          # No accidental directory-in-directory such as README.txt/README.txt
+          echo "$LIST" | grep -qE "^$ROOT/[^/]+/[^/]+/[^/]+" && \
+            { echo "ERROR: unexpected nesting depth in archive"; exit 1; }
+          echo "distribution layout OK (root=$ROOT)"
+
       - name: Show release artifacts
         run: |
           echo "--- SHA256SUMS ---"
