@@ -130,8 +130,16 @@ public final class AssetInstaller {
                     }
                 }));
             }
+            // Each task already traps its own IOException into `warnings`, so a
+            // throw here can only be interruption. Propagate it rather than
+            // silently reporting a truncated install as complete.
             for (Future<?> f : futures) {
-                f.get();
+                try {
+                    f.get();
+                } catch (java.util.concurrent.ExecutionException e) {
+                    warnings.add("资源下载任务异常终止: "
+                            + (e.getCause() == null ? e : e.getCause()));
+                }
             }
         } finally {
             pool.shutdownNow();

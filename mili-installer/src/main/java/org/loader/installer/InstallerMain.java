@@ -42,7 +42,7 @@ public final class InstallerMain {
             return;
         }
 
-        int requiredJava = detectRequiredJava(opts.version);
+        String requiredJava = detectRequiredJava(opts.version);
         String actualJava = System.getProperty("java.version", "?");
         if (requiredJava != null && !requiredJava.equals(actualJava)) {
             // 仅提示，不阻断：JVM 通常可以运行目标版本以下字节码，
