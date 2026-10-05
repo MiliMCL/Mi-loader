@@ -41,6 +41,26 @@ public interface ModContext {
     org.loader.api.event.EventBus events();
 
     /**
+     * Returns the Minecraft registry, for declaring blocks and items.
+     *
+     * <p>Registration is only open while the mod is initializing; the platform
+     * closes it before the world loads, because Minecraft's registries are
+     * frozen at that point. Registering later fails loudly rather than
+     * corrupting the registry.
+     *
+     * @return the registry bound to this mod's namespace
+     */
+    org.loader.api.registry.MinecraftRegistry registry();
+
+    /**
+     * Returns a world view bound to this mod.
+     *
+     * <p>Returns {@code null} before a world is loaded and after shutdown.
+     * Mods must null-check rather than assume a world is always present.
+     */
+    org.loader.api.world.WorldView world();
+
+    /**
      * Returns the mod's resource manager.
      * Provides path-based resource loading with security checks.
      */
