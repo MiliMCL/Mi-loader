@@ -229,9 +229,17 @@ public final class Json {
 
     // ── 类型安全访问器 ──────────────────────────────────────────────────────
 
-    /** 取对象字段；不存在或非 Map 返回 null。 */
+    /**
+     * 取对象字段；不存在或非 Map 返回 null。
+     *
+     * <p>key 传空串时返回节点自身（若它是对象）——用于在只持有子节点引用
+     * 的地方把它当 Map 读取，而不必知道它是从哪个字段来的。
+     */
     @SuppressWarnings("unchecked")
     public static Map<String, Object> obj(Object node, String key) {
+        if (key != null && key.isEmpty() && node instanceof Map) {
+            return (Map<String, Object>) node;
+        }
         Object v = get(node, key);
         return v instanceof Map ? (Map<String, Object>) v : null;
     }

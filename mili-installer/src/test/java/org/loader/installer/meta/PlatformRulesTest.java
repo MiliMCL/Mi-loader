@@ -21,11 +21,20 @@ class PlatformRulesTest {
         String me = PlatformRules.currentOsName();
         VersionMeta.Rule allow = new VersionMeta.Rule(
                 Map.of("name", me), null, null, "allow");
-        VersionMeta.Rule other = new VersionMeta.Rule(
-                Map.of("name", me.equals("windows") ? "osx" : "windows"),
-                null, null, "allow");
         assertTrue(PlatformRules.evaluate(List.of(allow)));
-        assertFalse(PlatformRules.evaluate(List.of(other)));
+
+        // A rule naming this host actually matches, so disallow excludes.
+        VersionMeta.Rule selfDisallow = new VersionMeta.Rule(
+                Map.of("name", me), null, null, "disallow");
+        assertFalse(PlatformRules.evaluate(List.of(selfDisallow)));
+
+        // A rule naming a foreign OS does NOT match, so it falls through to
+        // the default (allow) regardless of its action.
+        String foreign = me.equals("windows") ? "osx" : "windows";
+        assertTrue(PlatformRules.evaluate(List.of(
+                new VersionMeta.Rule(Map.of("name", foreign), null, null, "allow"))));
+        assertTrue(PlatformRules.evaluate(List.of(
+                new VersionMeta.Rule(Map.of("name", foreign), null, null, "disallow"))));
     }
 
     @Test
@@ -39,20 +48,14 @@ class PlatformRulesTest {
     @Test
     void firstMatchingRuleDecides() {
         String me = PlatformRules.currentOsName();
-        String other = me.equals("windows") ? "osx" : "windows";
-        // 第一条匹配本机 → disallow；后面的 allow 不再生效
+        // Both rules match this host, so only declaration order can decide:
+        // the leading disallow wins and the trailing allow is never consulted.
         VersionMeta.Rule disallow = new VersionMeta.Rule(
                 Map.of("name", me), null, null, "disallow");
         VersionMeta.Rule allow = new VersionMeta.Rule(
-                Map.of("name", other), null, null, "allow");
+                Map.of("name", me), null, null, "allow");
         assertFalse(PlatformRules.evaluate(List.of(disallow, allow)));
-    }
-
-    @Test
-    void noMatchingRuleDefaultsToAllow() {
-        VersionMeta.Rule unrelated = new VersionMeta.Rule(
-                Map.of("name", "plan9"), null, null, "disallow");
-        assertTrue(PlatformRules.evaluate(List.of(unrelated)));
+        assertTrue(PlatformRules.evaluate(List.of(allow, disallow)));
     }
 
     @Test
@@ -68,10 +71,18 @@ class PlatformRulesTest {
     @Test
     void featuresWithinRuleAreAnded() {
         String me = PlatformRules.currentOsName();
-        // os 匹配但 arch 不匹配 → 整条 rule 不命中
-        VersionMeta.Rule rule = new VersionMeta.Rule(
-                Map.of("name", me), Map.of("name", "definitely-not-this-arch"), null, "allow");
-        assertTrue(PlatformRules.evaluate(List.of(rule)));
+        // os matches but arch does not -> the whole rule fails to match, so the
+        // trailing disallow never fires and the default (allow) applies.
+        VersionMeta.Rule mixed = new VersionMeta.Rule(
+                Map.of("name", me), Map.of("name", "definitely-not-this-arch"),
+                null, "disallow");
+        assertTrue(PlatformRules.evaluate(List.of(mixed)));
+
+        // Both features matching makes the same rule effective.
+        VersionMeta.Rule both = new VersionMeta.Rule(
+                Map.of("name", me), Map.of("name", PlatformRules.currentArch()),
+                null, "disallow");
+        assertFalse(PlatformRules.evaluate(List.of(both)));
     }
 
     @Test
