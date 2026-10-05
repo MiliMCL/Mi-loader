@@ -308,11 +308,17 @@ tasks.register("releaseArtifacts") {
 fun distDirName(): String =
     "mili-${rootProject.findProperty("miliPlatformVersion")}-mc${rootProject.findProperty("minecraftVersion")}"
 
-// 两种格式共用同一份内容规格
-fun configureDistContents(t: CopySpec) {
-    t.into(distDirName()) {
+// 平台 fat JAR 的产出路径（provider 形式，配置期不要求文件存在）。
+val platformJarFileProvider = layout.buildDirectory.file(
+    "libs/mili-${rootProject.findProperty("miliPlatformVersion")}-mc${rootProject.findProperty("minecraftVersion")}.jar"
+)
+
+// 两种格式共用同一份内容规格。platformJarFile 用 provider 延迟求值 ——
+// 脚本执行期该文件尚不存在，直接 from(File) 会在配置阶段就解析。
+fun configureDistContents(spec: CopySpec) {
+    spec.into(distDirName()) {
         into("core") {
-            from(tasks.named("shadowJar").map { it.archiveFile.get().asFile })
+            from(platformJarFileProvider)
         }
         into("bin") {
             from(layout.projectDirectory.dir("distribution/bin"))
@@ -336,9 +342,7 @@ val distTar = tasks.register<Tar>("distTar") {
     destinationDirectory.set(layout.buildDirectory.dir("distributions"))
     filePermissions { unix("rwxr-xr-x") }
 
-    configureDistContents(from(tasks.named("shadowJar").map { it.archiveFile.get().asFile }).map {
-        listOf(it)
-    }.get())
+    configureDistContents(this)
 }
 
 val distZip = tasks.register<Zip>("distZip") {
@@ -352,9 +356,7 @@ val distZip = tasks.register<Zip>("distZip") {
     )
     destinationDirectory.set(layout.buildDirectory.dir("distributions"))
 
-    configureDistContents(from(tasks.named("shadowJar").map { it.archiveFile.get().asFile }).map {
-        listOf(it)
-    }.get())
+    configureDistContents(this)
 }
 
 tasks.named("build") { dependsOn(distTar) }
