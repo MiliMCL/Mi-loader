@@ -12,8 +12,8 @@ import java.util.Map;
  * 任何第三方依赖都会破坏「下载即运行」的前提（用户手上可能只有 JRE）。
  *
  * <p>支持 RFC 8259 的全部合法 JSON：对象、数组、字符串、数字、布尔、null，
- * 以及 {@code \uXXXX} 转义。数值统一存为 {@link Double}，调用方需要精确
- * 整数时自行转换（Mojang 元数据里的 size/sha1 不会超出 2^53 精度范围）。
+ * 以及反斜杠 u 形式的 Unicode 转义。数值统一存为 {@link Double}，调用方
+ * 需要精确整数时自行转换（Mojang 元数据里的 size/sha1 不会超出 2^53 精度范围）。
  */
 public final class Json {
 

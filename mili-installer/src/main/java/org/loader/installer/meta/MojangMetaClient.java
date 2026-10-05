@@ -143,8 +143,8 @@ public final class MojangMetaClient {
             Map<String, Map<String, Object>> classifiers = new LinkedHashMap<>();
             if (downloads != null) {
                 Map<String, Object> clsNode = Json.obj(downloads, "classifiers");
-                if (clsNode instanceof Map<?, ?> raw) {
-                    for (Map.Entry<?, ?> e : raw.entrySet()) {
+                if (clsNode instanceof Map<?, ?> cls) {
+                    for (Map.Entry<?, ?> e : cls.entrySet()) {
                         if (e.getKey() instanceof String k && e.getValue() instanceof Map<?, ?> v) {
                             classifiers.put(k, (Map<String, Object>) v);
                         }
