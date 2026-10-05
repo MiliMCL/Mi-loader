@@ -313,16 +313,15 @@ val platformJarFileProvider = layout.buildDirectory.file(
     "libs/mili-${rootProject.findProperty("miliPlatformVersion")}-mc${rootProject.findProperty("minecraftVersion")}.jar"
 )
 
-// 两种格式共用同一份内容规格。platformJarFileProvider 用 provider 延迟求值 ——
-// 脚本执行期该文件尚不存在，直接 from(File) 会在配置阶段就解析。
-// 两种格式共用同一份内容规格。platformJarFileProvider 用 provider 延迟求值 ——
-// 脚本执行期该文件尚不存在，直接 from(File) 会在配置阶段就解析。
+// 两种格式共用同一份内容规格。
 //
-// 每个目标都用显式 into(...) 块。裸的 into("x") 之后再调 from(...) 会让后续
-// from 落到兄弟层级，而 from(file){into("README.txt")} 在嵌套 CopySpec 里又会被
-// 当成目录 —— 两种写法都曾产出过错误布局。
+// 布局必须精确为 <root>/{core,bin,mods,README.txt}。踩过的坑：
+//   * 裸 into("mods") 后紧跟 from(...) → 后续 from 落到兄弟层级
+//   * into("README.txt")         → Gradle 视其为目录，产出 README.txt/README.txt
+// 因此每一项都用自己的 into(...) 块，README 也不例外（into 传父目录而非文件名）。
 fun configureDistContents(spec: CopySpec) {
-    spec.into(distDirName()) {
+    val root = distDirName()
+    spec.into(root) {
         into("core") {
             from(platformJarFileProvider)
         }
@@ -332,10 +331,7 @@ fun configureDistContents(spec: CopySpec) {
         into("mods") {
             from(layout.projectDirectory.file("distribution/mods/.keep"))
         }
-        // 用文件重命名而非 into()，避免 README.txt 被当成目录
-        from(layout.projectDirectory.file("distribution/README.txt")) {
-            fileName = "README.txt"
-        }
+        from(layout.projectDirectory.file("distribution/README.txt"))
     }
 }
 
