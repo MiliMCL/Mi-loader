@@ -23,6 +23,10 @@ dependencies {
     implementation(project(":mili-runtime"))
     implementation(project(":mili-minecraft-integration"))
     implementation(project(":mili-abi"))
+    // Installer is bundled INTO the fat JAR: LoaderMain reflectively invokes
+    // org.loader.installer.InstallerMain when no Minecraft is present in the
+    // game dir, so a stock distribution can bootstrap itself on first run.
+    implementation(project(":mili-installer"))
 
     // ASM lets the api-boundary test introspect the loader's compiled classes
     // and flag any accidental reference to runtime-internal packages.
@@ -286,3 +290,72 @@ tasks.register("releaseArtifacts") {
         logger.lifecycle("[release] Manifest : ${File(releaseDir, "release-manifest.json").absolutePath}")
     }
 }
+
+// -----------------------------------------------------------------------------
+// 4. distTar / distZip — 完整分发包（README 中长期缺失的实现）
+//
+// 产出可直接解压运行的目录：
+//   mili-<v>-mc<mc>/
+//     bin/mili-loader(.bat)     启动脚本（首次运行自动安装 Minecraft）
+//     core/mili-<v>-mc<mc>.jar  平台 fat JAR（内含 installer）
+//     mods/                     放 Mod JAR
+//     README.txt                使用说明
+//
+// 关键：Minecraft 本体不在分发包内，由启动脚本在首次运行时从 Mojang
+// 官方 CDN 拉取并校验 SHA-1 —— 既是 EULA 要求，也让分发包保持在 KB 级。
+// -----------------------------------------------------------------------------
+
+fun distDirName(): String =
+    "mili-${rootProject.findProperty("miliPlatformVersion")}-mc${rootProject.findProperty("minecraftVersion")}"
+
+// 两种格式共用同一份内容规格
+fun configureDistContents(t: CopySpec) {
+    t.into(distDirName()) {
+        into("core") {
+            from(tasks.named("shadowJar").map { it.archiveFile.get().asFile })
+        }
+        into("bin") {
+            from(layout.projectDirectory.dir("distribution/bin"))
+        }
+        into("mods")
+        from(layout.projectDirectory.file("distribution/README.txt"))
+        from(layout.projectDirectory.file("distribution/mods/.keep"))
+    }
+}
+
+val distTar = tasks.register<Tar>("distTar") {
+    group = "distribution"
+    description = "Assembles a ready-to-run Mili distribution (tar.gz)"
+    dependsOn(tasks.named("shadowJar"))
+
+    archiveBaseName.set("mili")
+    archiveVersion.set(
+        "${rootProject.findProperty("miliPlatformVersion")}-mc${rootProject.findProperty("minecraftVersion")}"
+    )
+    compression = Compression.GZIP
+    destinationDirectory.set(layout.buildDirectory.dir("distributions"))
+    filePermissions { unix("rwxr-xr-x") }
+
+    configureDistContents(from(tasks.named("shadowJar").map { it.archiveFile.get().asFile }).map {
+        listOf(it)
+    }.get())
+}
+
+val distZip = tasks.register<Zip>("distZip") {
+    group = "distribution"
+    description = "Assembles a ready-to-run Mili distribution (zip)"
+    dependsOn(tasks.named("shadowJar"))
+
+    archiveBaseName.set("mili")
+    archiveVersion.set(
+        "${rootProject.findProperty("miliPlatformVersion")}-mc${rootProject.findProperty("minecraftVersion")}"
+    )
+    destinationDirectory.set(layout.buildDirectory.dir("distributions"))
+
+    configureDistContents(from(tasks.named("shadowJar").map { it.archiveFile.get().asFile }).map {
+        listOf(it)
+    }.get())
+}
+
+tasks.named("build") { dependsOn(distTar) }
+

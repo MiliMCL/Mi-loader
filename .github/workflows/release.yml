@@ -113,13 +113,30 @@ jobs:
       - name: Generate release artifacts (SHA256SUMS + release-manifest.json)
         run: ./gradlew :mili-loader:releaseArtifacts --no-daemon --console=plain --no-configuration-cache
 
+      - name: Build ready-to-run distributions (tar.gz + zip)
+        run: ./gradlew :mili-loader:distTar :mili-loader:distZip --no-daemon --console=plain --no-configuration-cache
+
       - name: Show release artifacts
         run: |
           echo "--- SHA256SUMS ---"
           cat mili-loader/build/release/SHA256SUMS 2>/dev/null
           echo ""
+          echo "--- distributions ---"
+          ls -lh mili-loader/build/distributions/ 2>/dev/null || echo "none"
+          echo ""
           echo "--- release-manifest.json ---"
           cat mili-loader/build/release/release-manifest.json 2>/dev/null
+
+      - name: Stage distributions into release dir
+        run: |
+          mkdir -p mili-loader/build/release
+          cp mili-loader/build/distributions/*.tar.gz mili-loader/build/release/ 2>/dev/null || true
+          cp mili-loader/build/distributions/*.zip mili-loader/build/release/ 2>/dev/null || true
+          # Recompute SHA256SUMS so it covers distributions too
+          cd mili-loader/build/release
+          sha256sum mili-*.jar mili-*.tar.gz mili-*.zip > SHA256SUMS 2>/dev/null || \
+            sha256sum mili-*.jar > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -129,20 +146,34 @@ jobs:
           body: |
             Mili Platform ${{ env.TAG_VERSION }} for Minecraft 26.2 / Java 25.
 
-            MC Build Fingerprint:
+            ## 快速开始
+            下载 `mili-*-mc26.2.tar.gz`（Windows 用 `.zip`），解压后运行：
+            - Linux/macOS: `./bin/mili-loader`
+            - Windows: `bin\mili-loader.bat`
+
+            首次运行会自动从 Mojang 官方 CDN 下载 Minecraft 26.2 并逐个校验
+            SHA-1（约 600MB），完成后游戏自动启动。之后启动不再重复下载。
+
+            分发包中**不包含** Minecraft 本体 —— 既遵守 Mojang 使用条款，
+            也让分发包保持在 KB 级。
+
+            ## MC Build Fingerprint
             - MC version: 26.2
             - MC artifact SHA-256: ${{ steps.mc.outputs.sha || 'N/A' }}
             - Decompiled: ${{ steps.mc.outputs.found == 'true' }}
 
-            Modules:
+            ## Modules
             - mili-abi: stable ABI (zero-dep)
             - mili-runtime: Scope/Scheduler/EventBus/Capability
             - mili-loader: bootstrap + discovery + classloading + lifecycle
             - mili-minecraft-integration: MC 26.2 bridge + reflection tick
+            - mili-installer: official-source fetcher with SHA-1 verification
 
             All Mods must declare the `mili` triple in META-INF/mod.json.
           files: |
             mili-loader/build/release/mili-*.jar
+            mili-loader/build/release/mili-*.tar.gz
+            mili-loader/build/release/mili-*.zip
             mili-loader/build/release/SHA256SUMS
             mili-loader/build/release/release-manifest.json
           fail_on_unmatched_files: false
