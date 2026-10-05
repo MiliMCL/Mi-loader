@@ -1,29 +1,29 @@
 package org.loader.loader.game;
 
+import org.loader.loader.discovery.LibraryResolver;
+import org.loader.loader.classloader.MinecraftClassLoader;
 import org.loader.loader.classloader.ModClassLoaderManager;
 import org.loader.loader.config.LoaderConfig;
 import org.loader.loader.discovery.MinecraftDiscovery;
 import org.loader.loader.hook.EntryPointHook;
-import org.loader.runtime.kernel.Runtime;
 import org.loader.runtime.RuntimeEnvironment;
+import org.loader.runtime.kernel.Runtime;
 
 import java.net.URL;
-import java.net.URLClassLoader;
 import java.nio.file.Path;
 import java.util.List;
 
 /**
- * Mili GameProvider for Minecraft 26.2 Client.
+ * Mili GameProvider for Minecraft 26.2。
  *
- * <p>Launch strategy: <b>in-process</b> {@link URLClassLoader}.
+ * <p><b>启动策略</b>：进程内唯一 {@link MinecraftClassLoader}。
  * <ul>
- *   <li>MC classes + mod classes loaded in same JVM via URLClassLoader</li>
- *   <li>Lifecycle bridged to Mili Runtime via {@link EntryPointHook}</li>
- *   <li>Mods use Mili-native APIs (Scope/Capability/Scheduler/EventBus)</li>
+ *   <li>该 CL 是全平台<b>唯一</b>定义 {@code net.minecraft.*} 的地方</li>
+ *   <li>所有 ModClassLoader 以它为 parent —— MC 类全局同源</li>
+ *   <li>生命周期桥接到 Mili Runtime（见 {@link EntryPointHook}）</li>
  * </ul>
  *
- * <p>Mili is NOT a Fabric port — this provider has no Knot/Mixin/LaunchWrapper concepts.
- * It uses Mili's own Runtime as the mod platform.
+ * <p>Mili 不是 Fabric 移植：无 Knot / Mixin / LaunchWrapper 概念。
  */
 public class MinecraftGameProvider implements GameProvider {
 
@@ -32,11 +32,18 @@ public class MinecraftGameProvider implements GameProvider {
     private List<Path> lastClasspath;
     private RuntimeEnvironment detectedEnvironment;
 
-    @Override
-    public String getGameId() { return "minecraft"; }
+    /** 全局唯一的 Minecraft ClassLoader。 */
+    private MinecraftClassLoader gameClassLoader;
 
     @Override
-    public String getGameName() { return "Minecraft"; }
+    public String getGameId() {
+        return "minecraft";
+    }
+
+    @Override
+    public String getGameName() {
+        return "Minecraft";
+    }
 
     @Override
     public String getRawGameVersion() {
@@ -44,7 +51,9 @@ public class MinecraftGameProvider implements GameProvider {
     }
 
     @Override
-    public String getNormalizedGameVersion() { return getRawGameVersion(); }
+    public String getNormalizedGameVersion() {
+        return getRawGameVersion();
+    }
 
     @Override
     public String getEntrypoint() {
@@ -55,18 +64,33 @@ public class MinecraftGameProvider implements GameProvider {
     }
 
     @Override
-    public Path getLaunchDirectory() { return Path.of("."); }
+    public Path getLaunchDirectory() {
+        return Path.of(".");
+    }
 
     @Override
-    public boolean isObfuscated() { return false; }
+    public boolean isObfuscated() {
+        return false;
+    }
+
+    @Override
+    public RuntimeEnvironment getEnvironment() {
+        return detectedEnvironment != null ? detectedEnvironment : RuntimeEnvironment.CLIENT;
+    }
+
+    /**
+     * 唯一定义 Minecraft 类的 ClassLoader。在 Mod 加载之前必须先建立。
+     */
+    public MinecraftClassLoader gameClassLoader() {
+        return gameClassLoader;
+    }
 
     @Override
     public List<Path> locateGame(Path gameDir) throws GameDiscoveryException {
         LoaderConfig config = LoaderConfig.at(gameDir);
         MinecraftDiscovery discovery = MinecraftDiscovery.scan(config);
         if (!discovery.found()) {
-            throw new GameDiscoveryException(
-                    "Minecraft JAR not found in " + gameDir);
+            throw new GameDiscoveryException("Minecraft JAR not found in " + gameDir);
         }
         gameType = discovery.getGameType();
         detectedVersion = discovery.getVersion();
@@ -75,24 +99,46 @@ public class MinecraftGameProvider implements GameProvider {
                 ? RuntimeEnvironment.CLIENT
                 : RuntimeEnvironment.DEDICATED_SERVER;
 
-        // Validate critical libraries are present
-        List<String> libWarnings = org.loader.loader.discovery.LibraryResolver
-                .validateClasspath(lastClasspath);
-        if (!libWarnings.isEmpty()) {
-            System.err.println("[Mili] Library warnings for Minecraft " + detectedVersion + ":");
-            for (String w : libWarnings) {
-                System.err.println("  WARNING: " + w);
-            }
+        List<String> libWarnings = LibraryResolver.validateClasspath(lastClasspath);
+        for (String w : libWarnings) {
+            System.err.println("[Mili] Library warning: " + w);
         }
-
         return lastClasspath;
     }
 
     /**
-     * Launches Minecraft in-process via URLClassLoader.
-     * <p>
-     * MC runs in the same JVM as the loader. Runtime lifecycle bridging
-     * is handled by EntryPointHook.
+     * 创建 MinecraftClassLoader。必须在任何 Mod ClassLoader 之前调用，
+     * 因为后者以其为 parent。
+     */
+    public MinecraftClassLoader createGameClassLoader(List<Path> gameClasspath)
+            throws GameDiscoveryException {
+        URL[] urls = new URL[gameClasspath.size()];
+        for (int i = 0; i < gameClasspath.size(); i++) {
+            try {
+                urls[i] = gameClasspath.get(i).toUri().toURL();
+            } catch (Exception e) {
+                throw new GameDiscoveryException("无法构造 classpath URL: " + e.getMessage());
+            }
+        }
+        gameClassLoader = new MinecraftClassLoader("minecraft-game", urls,
+                getClass().getClassLoader());
+
+        // 硬校验：主类必须真的能解析，不能只看文件存在
+        String mainClass = getEntrypoint();
+        if (!gameClassLoader.canLoad(mainClass)) {
+            throw new GameDiscoveryException(
+                    "Minecraft 主类无法解析: " + mainClass
+                            + "。请确认 gameDir 中的 Minecraft 完整且版本匹配 ("
+                            + getRawGameVersion() + ")");
+        }
+        return gameClassLoader;
+    }
+
+    /**
+     * 启动 Minecraft。
+     *
+     * <p>此时 Mod 已经加载完毕（{@code classLoaderManager} 已就绪），
+     * MinecraftClassLoader 也已创建。本方法只负责调用游戏 main 并桥接生命周期。
      */
     @Override
     public void launch(Path gameDir,
@@ -100,22 +146,13 @@ public class MinecraftGameProvider implements GameProvider {
                        ModClassLoaderManager classLoaderManager,
                        List<Path> gameClasspath,
                        String[] args) throws Exception {
-        // Build URL array from classpath
-        URL[] urls = new URL[gameClasspath.size()];
-        for (int i = 0; i < gameClasspath.size(); i++) {
-            urls[i] = gameClasspath.get(i).toUri().toURL();
+        if (gameClassLoader == null) {
+            createGameClassLoader(gameClasspath);
         }
 
-        // Use URLClassLoader (no bytecode transformation needed for Mili's clean design)
-        URLClassLoader gameCL = new URLClassLoader(
-                "minecraft-game", urls,
-                MinecraftGameProvider.class.getClassLoader());
-
-        // Install lifecycle hook
+        // 注册为 bootstrap 的外部资源 —— 失败/停止时随之释放
         EntryPointHook hook = new EntryPointHook();
-        hook.install(gameCL, runtime, classLoaderManager, detectedEnvironment);
-
-        // Invoke MC main in a dedicated thread
-        hook.invokeMinecraftMain(gameCL, args != null ? args : new String[0]);
+        hook.install(gameClassLoader, runtime, classLoaderManager, detectedEnvironment);
+        hook.invokeMinecraftMain(gameClassLoader, args != null ? args : new String[0]);
     }
 }

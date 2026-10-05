@@ -44,6 +44,11 @@ public class DevLauncher {
 
     public void start() {
         runtime.start();
+        // 显式走完状态机，确保 Mod 观察到完整的启动序列
+        bootstrap.beginDiscovery();
+        bootstrap.beginPreparing();
+        bootstrap.beginLoading();
+        bootstrap.beginMinecraftBootstrap();
         bootstrap.start();
     }
 
@@ -57,7 +62,13 @@ public class DevLauncher {
             throw new IllegalStateException("Not running");
         }
         for (int i = 0; i < ticks; i++) {
-            bootstrap.tickBridge().onTick();
+            // TickBridge 要求 begin/end 成对推进，单次 tick 是一个执行信封。
+            var contract = bootstrap.tickBridge().beginTick();
+            try {
+                // 这里本应执行本次 tick 的实际工作（阶段推进、任务派发）。
+            } finally {
+                bootstrap.tickBridge().endTick();
+            }
         }
     }
 
