@@ -327,8 +327,10 @@ fun configureDistContents(spec: CopySpec) {
             // 占位文件，否则打包器会丢弃空目录
             from(layout.projectDirectory.file("distribution/mods/.keep"))
         }
-        into("README.txt") {
-            from(layout.projectDirectory.file("distribution/README.txt"))
+        // `into("README.txt")` would make Gradle treat it as a directory;
+        // map the file explicitly instead.
+        from(layout.projectDirectory.file("distribution/README.txt")) {
+            into("README.txt")
         }
     }
 }
