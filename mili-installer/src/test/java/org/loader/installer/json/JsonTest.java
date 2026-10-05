@@ -86,4 +86,21 @@ class JsonTest {
         assertNull(Json.integer(o, "s"));
         assertTrue(Json.obj(o, "s") == null);
     }
+
+    @Test
+    void strOrNumberAcceptsBothEncodings() {
+        // Mojang ships majorVersion as "25" in older manifests and as the
+        // number 25.0 in 26.x. Both must read back as "25".
+        Map<String, Object> stringy = Json.parseObject("{\"v\":\"25\"}");
+        Map<String, Object> numeric = Json.parseObject("{\"v\":25.0}");
+        assertEquals("25", Json.strOrNumber(stringy, "v"));
+        assertEquals("25", Json.strOrNumber(numeric, "v"));
+
+        // Genuinely fractional values keep their decimal form.
+        assertEquals("25.5", Json.strOrNumber(Json.parseObject("{\"v\":25.5}"), "v"));
+
+        // Other types and missing keys stay null.
+        assertNull(Json.strOrNumber(Json.parseObject("{\"v\":true}"), "v"));
+        assertNull(Json.strOrNumber(stringy, "missing"));
+    }
 }

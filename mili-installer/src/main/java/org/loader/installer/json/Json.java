@@ -263,6 +263,28 @@ public final class Json {
         return d == null ? null : Integer.valueOf((int) (double) d);
     }
 
+    /**
+     * 取「字符串或数字」字段并返回字符串形式。
+     *
+     * <p>Mojang 的元数据在同一个字段上混用两种类型 —— 例如
+     * {@code javaVersion.majorVersion} 在旧清单里是 {@code "25"}，在 26.x
+     * 里却是数字 {@code 25.0}。用 {@link #str} 读后者会得到 null，整数形式
+     * 的 {@code .0} 后缀也会被抹掉。
+     */
+    public static String strOrNumber(Object node, String key) {
+        Object v = get(node, key);
+        if (v instanceof String s) {
+            return s;
+        }
+        if (v instanceof Double d) {
+            if (d.isInfinite() || d.isNaN()) {
+                return null;
+            }
+            return d == Math.floor(d) ? Long.toString(d.longValue()) : d.toString();
+        }
+        return null;
+    }
+
     private static Double number(Object node, String key) {
         Object v = get(node, key);
         return v instanceof Double d ? d : null;

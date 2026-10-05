@@ -186,8 +186,41 @@ class MojangMetaClientTest {
     }
 
     @Test
-    void rejectsMetaWithoutDownloads() {
-        assertThrows(IllegalArgumentException.class, () ->
+    void numericMajorVersionIsAccepted() {
+        // The real 26.2 manifest ships majorVersion as the NUMBER 25.0, not
+        // the string "25" older manifests used. Reading it with a
+        // string-only accessor silently yielded null and fell back to "8".
+        VersionMeta meta = MojangMetaClient.parseVersionMeta(Json.parseObject("""
+            {
+              "id": "26.2",
+              "javaVersion": {"component": "java-runtime-epsilon", "majorVersion": 25.0},
+              "downloads": {"client": {"url": "u", "sha1": "s", "size": 1}}
+            }
+            """));
+        assertEquals("25", meta.javaMajorVersion());
+    }
+
+    @Test
+    void stringMajorVersionIsAccepted() {
+        VersionMeta meta = MojangMetaClient.parseVersionMeta(Json.parseObject("""
+            {
+              "id": "26.2",
+              "javaVersion": {"component": "java-runtime-epsilon", "majorVersion": "25"},
+              "downloads": {"client": {"url": "u", "sha1": "s", "size": 1}}
+            }
+            """));
+        assertEquals("25", meta.javaMajorVersion());
+    }
+
+    @Test
+    void missingJavaVersionFallsBackToEight() {
+        VersionMeta meta = MojangMetaClient.parseVersionMeta(Json.parseObject(
+                "{\"id\":\"x\",\"downloads\":{\"client\":{\"url\":\"u\",\"sha1\":\"s\",\"size\":1}}}"));
+        assertEquals("8", meta.javaMajorVersion());
+    }
+
+    @Test
+    void rejectsMetaWithoutDownloads() {        assertThrows(IllegalArgumentException.class, () ->
                 MojangMetaClient.parseVersionMeta(Json.parseObject("{\"id\":\"x\"}")));
     }
 

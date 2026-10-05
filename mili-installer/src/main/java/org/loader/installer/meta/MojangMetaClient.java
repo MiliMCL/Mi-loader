@@ -71,7 +71,9 @@ public final class MojangMetaClient {
         String javaMajor = null;
         Map<String, Object> javaVer = Json.obj(root, "javaVersion");
         if (javaVer != null) {
-            javaMajor = Json.str(javaVer, "majorVersion");
+            // Mojang is inconsistent here: older manifests use "25", 26.x uses
+            // the number 25.0. strOrNumber handles both.
+            javaMajor = Json.strOrNumber(javaVer, "majorVersion");
         }
         if (javaMajor == null) {
             javaMajor = "8";
