@@ -2,6 +2,7 @@ package org.loader.loader;
 
 import org.loader.loader.classloader.ModClassLoaderManager;
 import org.loader.loader.config.LoaderConfig;
+import org.loader.loader.discovery.MinecraftDiscovery;
 import org.loader.loader.discovery.ModDiscovery;
 import org.loader.loader.game.GameProvider;
 import org.loader.runtime.RuntimeEnvironment;
@@ -115,9 +116,13 @@ public class LoaderMain {
      * 平台编译版本一致）；读不到时回退到 26.2 这个当前支持版本。
      */
     private String detectTargetMinecraftVersion() {
-        try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(
-                LoaderMain.class.getProtectionDomain().getCodeSource()
-                        .getLocation().toURI())) {
+        // ZipFile has no URI constructor — go through File.
+        java.io.File self = new java.io.File(LoaderMain.class.getProtectionDomain()
+                .getCodeSource().getLocation().toURI());
+        if (!self.isFile()) {
+            return "26.2";
+        }
+        try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(self)) {
             var entry = zf.getEntry("META-INF/mili/platform.json");
             if (entry != null) {
                 String text;

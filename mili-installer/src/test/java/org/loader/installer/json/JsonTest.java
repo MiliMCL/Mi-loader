@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -25,7 +26,12 @@ class JsonTest {
                 "{\"a\":{\"b\":[1,2,{\"c\":true}]},\"d\":null}");
         List<Object> a = Json.arr(Json.obj(o, "a"), "b");
         assertEquals(3, a.size());
-        assertEquals(Boolean.TRUE, Json.obj(a.get(2), "c").get("c"));
+        // a.get(2) is {"c":true} — a bare boolean, not a String, so the
+        // typed accessor must return null rather than coerce.
+        Map<String, Object> inner = Json.obj(a.get(2), "");
+        assertNotNull(inner);
+        assertEquals(Boolean.TRUE, inner.get("c"));
+        assertNull(Json.str(a.get(2), "c"));
         assertTrue(Json.arr(o, "d").isEmpty());
     }
 

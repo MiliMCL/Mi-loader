@@ -3,6 +3,8 @@ package org.loader.installer.meta;
 import org.junit.jupiter.api.Test;
 import org.loader.installer.json.Json;
 
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -146,11 +148,33 @@ class MojangMetaClientTest {
     }
 
     @Test
-    void osSpecificLibraryIsFilteredOnOtherPlatforms() {
+    void osSpecificLibraryCarriesItsRule() {
         VersionMeta meta = MojangMetaClient.parseVersionMeta(Json.parseObject(SAMPLE));
         VersionMeta.Library jobj = meta.libraries().get(2);
-        boolean isMac = PlatformRules.currentOsName().equals("osx");
-        assertEquals(isMac, jobj.isAllowedOnCurrentPlatform());
+        // The library ships an osx-only rule; parsing must preserve it intact.
+        assertEquals(1, jobj.rules().size());
+        assertEquals("osx", jobj.rules().get(0).os().get("name"));
+        assertEquals("allow", jobj.rules().get(0).action());
+    }
+
+    @Test
+    void nonMatchingRuleFallsThroughToDefault() {
+        // Mojang semantics: rules are scanned in order and the first match
+        // decides; when nothing matches the library is ALLOWED. A rule naming
+        // a foreign OS therefore has no effect regardless of its action —
+        // which is why real manifests pair each platform-specific allow with
+        // disallow entries for every other platform.
+        for (String action : List.of("allow", "disallow")) {
+            assertTrue(PlatformRules.evaluate(List.of(new VersionMeta.Rule(
+                    java.util.Map.of("name", "definitely-not-this-os"),
+                    null, null, action))),
+                    "a non-matching rule must fall through to allow, action=" + action);
+        }
+
+        // Exclusion on this host requires a rule that actually matches it.
+        assertFalse(PlatformRules.evaluate(List.of(new VersionMeta.Rule(
+                java.util.Map.of("name", PlatformRules.currentOsName()),
+                null, null, "disallow"))));
     }
 
     @Test
