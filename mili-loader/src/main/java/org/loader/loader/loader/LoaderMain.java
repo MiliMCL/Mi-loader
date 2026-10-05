@@ -116,25 +116,28 @@ public class LoaderMain {
      * 平台编译版本一致）；读不到时回退到 26.2 这个当前支持版本。
      */
     private String detectTargetMinecraftVersion() {
-        // ZipFile has no URI constructor — go through File.
-        java.io.File self = new java.io.File(LoaderMain.class.getProtectionDomain()
-                .getCodeSource().getLocation().toURI());
-        if (!self.isFile()) {
-            return "26.2";
-        }
-        try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(self)) {
-            var entry = zf.getEntry("META-INF/mili/platform.json");
-            if (entry != null) {
-                String text;
-                try (InputStream in = zf.getInputStream(entry)) {
-                    text = new String(in.readAllBytes(),
-                            java.nio.charset.StandardCharsets.UTF_8);
-                }
-                var matcher = java.util.regex.Pattern
-                        .compile("\"minecraft\"\\s*:\\s*\"([^\"]+)\"")
-                        .matcher(text);
-                if (matcher.find()) {
-                    return matcher.group(1);
+        // ZipFile has no URI constructor — go through File. toURI() can throw
+        // URISyntaxException, so it has to live inside the guarded block.
+        try {
+            java.io.File self = new java.io.File(LoaderMain.class.getProtectionDomain()
+                    .getCodeSource().getLocation().toURI());
+            if (!self.isFile()) {
+                return "26.2";
+            }
+            try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(self)) {
+                var entry = zf.getEntry("META-INF/mili/platform.json");
+                if (entry != null) {
+                    String text;
+                    try (InputStream in = zf.getInputStream(entry)) {
+                        text = new String(in.readAllBytes(),
+                                java.nio.charset.StandardCharsets.UTF_8);
+                    }
+                    var matcher = java.util.regex.Pattern
+                            .compile("\"minecraft\"\\s*:\\s*\"([^\"]+)\"")
+                            .matcher(text);
+                    if (matcher.find()) {
+                        return matcher.group(1);
+                    }
                 }
             }
         } catch (Exception ignored) {
