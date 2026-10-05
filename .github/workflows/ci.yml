@@ -182,7 +182,19 @@ jobs:
         run: |
           ls -lh mili-loader/build/distributions/
           echo "--- tar contents ---"
-          tar tzf mili-loader/build/distributions/*.tar.gz | head -20
+          tar tzf mili-loader/build/distributions/*.tar.gz | sort
+          # Guard the directory layout: everything must sit under the versioned
+          # root, and bin/core/mods must be siblings, not nested.
+          TARBALL=$(ls mili-loader/build/distributions/*.tar.gz)
+          ROOT=$(basename "$TARBALL" .tar.gz)
+          LIST=$(tar tzf "$TARBALL")
+          for p in "$ROOT/bin/mili-loader" "$ROOT/bin/mili-loader.bat" \
+                   "$ROOT/core/mili-0.1.0-mc26.2.jar" "$ROOT/README.txt"; do
+            echo "$LIST" | grep -qx "$p" || { echo "ERROR: missing $p"; exit 1; }
+          done
+          echo "$LIST" | grep -q "^$ROOT/mods/" || \
+            { echo "ERROR: mods/ missing"; exit 1; }
+          echo "distribution layout OK (root=$ROOT)"
 
       - name: Upload distribution
         if: success()

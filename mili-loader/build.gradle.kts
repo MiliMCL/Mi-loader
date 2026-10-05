@@ -313,7 +313,7 @@ val platformJarFileProvider = layout.buildDirectory.file(
     "libs/mili-${rootProject.findProperty("miliPlatformVersion")}-mc${rootProject.findProperty("minecraftVersion")}.jar"
 )
 
-// 两种格式共用同一份内容规格。platformJarFile 用 provider 延迟求值 ——
+// 两种格式共用同一份内容规格。platformJarFileProvider 用 provider 延迟求值 ——
 // 脚本执行期该文件尚不存在，直接 from(File) 会在配置阶段就解析。
 fun configureDistContents(spec: CopySpec) {
     spec.into(distDirName()) {
@@ -323,9 +323,13 @@ fun configureDistContents(spec: CopySpec) {
         into("bin") {
             from(layout.projectDirectory.dir("distribution/bin"))
         }
-        into("mods")
-        from(layout.projectDirectory.file("distribution/README.txt"))
-        from(layout.projectDirectory.file("distribution/mods/.keep"))
+        into("mods") {
+            // 占位文件，否则打包器会丢弃空目录
+            from(layout.projectDirectory.file("distribution/mods/.keep"))
+        }
+        into("README.txt") {
+            from(layout.projectDirectory.file("distribution/README.txt"))
+        }
     }
 }
 
