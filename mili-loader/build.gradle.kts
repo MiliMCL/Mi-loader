@@ -338,6 +338,9 @@ val distTar = tasks.register<Tar>("distTar") {
     archiveVersion.set(
         "${rootProject.findProperty("miliPlatformVersion")}-mc${rootProject.findProperty("minecraftVersion")}"
     )
+    // Gradle defaults GZIP-compressed tars to .tgz; the release notes and
+    // README both say .tar.gz, so pin the full name.
+    archiveExtension.set("tar.gz")
     compression = Compression.GZIP
     destinationDirectory.set(layout.buildDirectory.dir("distributions"))
     filePermissions { unix("rwxr-xr-x") }
