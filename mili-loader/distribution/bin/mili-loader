@@ -6,8 +6,9 @@
 #
 # 用法:
 #   ./bin/mili-loader                启动游戏
-#   ./bin/mili-loader --dry-run      只检查环境，不启动
-#   ./bin/mili-loader --server       以服务端模式启动
+#   ./bin/mili-loader --mili-mods D  指定 Mod 目录
+#
+# 客户端/服务端由平台按 JAR 内容自动判定，无需 --server 开关。
 
 set -euo pipefail
 
@@ -57,7 +58,12 @@ fi
 
 mkdir -p "$GAME_DIR" "$MODS_DIR"
 
-# --dry-run 等参数原样透传给加载器
+# 传给加载器的额外参数原样透传。
+#
+# 注意：加载器只认 <gameDir>（第 1 个位置参数）和 --mili-mods，其余参数
+# 会转发给 Minecraft。--dry-run / --skip-assets / --server 属于安装器
+# （org.loader.installer.InstallerMain），写在这里会被 Minecraft 的
+# joptsimple 以 UnrecognizedOptionException 拒绝启动。
 #
 # --mili-mods 必须显式给出：Mod 放在分发根的 mods/，而 gameDir 是 game/，
 # 少了它加载器会去扫 game/mods/（不存在），结果是零个 Mod 且无任何报错。

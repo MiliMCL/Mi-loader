@@ -2,6 +2,7 @@ package org.loader.runtime.minecraft.block;
 
 import org.loader.api.registry.BlockSpec;
 import org.loader.runtime.minecraft.BootstrapGate;
+import org.loader.runtime.minecraft.RegistrationPhase;
 import org.loader.runtime.minecraft.reflect.BridgeMismatchException;
 import org.loader.runtime.minecraft.reflect.Reflect;
 
@@ -193,7 +194,24 @@ public final class BlockRegistrar {
      * @return 数值 ID；查询失败返回 {@code -1}
      */
     public int numericIdOf(String path) {
-        Object block = lookup(path);
+        Object block;
+        // lookup() 会触碰 BuiltInRegistries.BLOCK —— 游戏尚未 bootstrap 时，
+        // 首次访问该类会触发 <clinit>，其中的 registerDefaulted 调
+        // Bootstrap.checkBootstrapCalled 抛 IllegalArgumentException，
+        // 被 JVM 包装成 ExceptionInInitializerError（继承 Error，
+        // **不是** RuntimeException）。
+        //
+        // 这里必须一并兜住 Error：读数值ID 是纯只读的增强动作
+        // （拿不到就返回 -1，句柄照样有效），绝不该让调用方的
+        // 一次查询变成致命错误。
+        try {
+            block = lookup(path);
+        } catch (RuntimeException | Error notQueryableYet) {
+            LOG.log(java.util.logging.Level.FINE,
+                    "Block registry not queryable yet for " + modId + ":" + path,
+                    notQueryableYet);
+            return -1;
+        }
         if (block == null) {
             return -1;
         }
@@ -202,7 +220,7 @@ public final class BlockRegistrar {
                     .getMethod("getId", Object.class)
                     .invoke(blockRegistry(), block);
             return id instanceof Number n ? n.intValue() : -1;
-        } catch (ReflectiveOperationException | RuntimeException e) {
+        } catch (ReflectiveOperationException | RuntimeException | Error e) {
             LOG.log(java.util.logging.Level.WARNING,
                     "Cannot read numeric id for block " + modId + ":" + path, e);
             return -1;
@@ -219,6 +237,20 @@ public final class BlockRegistrar {
      * <p>泛型在运行期被擦除成 {@code Registry}，直接用即可。
      */
     private static Object blockRegistry() {
+        // 【关键】触碰 BuiltInRegistries 前必须先置Bootstrap.isBootstrapped。
+        //
+        // 直接读静态字段会触发 <clinit>，而 26.2 的 <clinit> 要求该标志为 true，
+        // 否则抛 "Not bootstrapped"；更麻烦的是 **类初始化失败不可重试** ——
+        // JVM 会把该类永久标记为 Erroneous，之后任何访问都是
+        // NoClassDefFoundError，而不是重新尝试初始化。
+        //
+        // 于是「谁先碰到注册表类」就成了全局时序问题：若Mod 在 initialize()
+        // 里做了一次只读查询(findBlock)，它就抢在平台开窗之前毒化了这个类，
+        // 平台随后开窗必然失败，而这个错误完全指不到「某个 Mod 早先查了一下」。
+        //
+        // ensureRegistriesReadable() 固化了唯一安全的顺序：先置标志，再触碰。
+        RegistrationPhase.ensureRegistriesReadable();
+
         Object registries = Reflect.staticField(BUILTIN_REGISTRIES_CLASS, "BLOCK");
         if (registries == null) {
             throw new BridgeMismatchException(
@@ -242,6 +274,9 @@ public final class BlockRegistrar {
         Object identifier = identifierClass
                 .getMethod("fromNamespaceAndPath", String.class, String.class)
                 .invoke(null, parts[0], parts[1]);
+        // 【同样要保护】读Registries.BLOCK 也会触发 Registries 类的 <clinit>。
+        // 它与 BuiltInRegistries 是两个独立的类，各自的初始化失败都不可重试。
+        RegistrationPhase.ensureRegistriesReadable();
         Object blockRegistryKey = Reflect.staticField(REGISTRIES_CLASS, "BLOCK");
         return resourceKeyClass
                 .getMethod("create", resourceKeyClass, identifierClass)

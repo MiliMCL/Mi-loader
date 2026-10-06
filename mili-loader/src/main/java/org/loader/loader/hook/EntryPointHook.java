@@ -1,5 +1,6 @@
 package org.loader.loader.hook;
 
+import org.loader.loader.classloader.ModClassLoader;
 import org.loader.loader.classloader.ModClassLoaderManager;
 import org.loader.runtime.RuntimeEnvironment;
 import org.loader.runtime.kernel.Runtime;
@@ -7,7 +8,9 @@ import org.loader.runtime.kernel.Scope;
 import org.loader.runtime.minecraft.BootstrapState;
 import org.loader.runtime.minecraft.MinecraftBootstrap;
 import org.loader.runtime.minecraft.MinecraftEventBridge;
+import org.loader.runtime.minecraft.resource.ModResourceInjectionScheduler;
 import org.loader.runtime.tick.TickContract;
+import org.loader.loader.PlatformLog;
 
 import java.lang.reflect.Method;
 import java.util.concurrent.CountDownLatch;
@@ -40,6 +43,26 @@ public class EntryPointHook {
     private volatile boolean installed = false;
     private volatile RuntimeEnvironment environment;
     private volatile boolean ownsRuntime = false;
+
+    /**
+     * 各 Mod 声明的方块路径（modId → paths），由 {@code LoaderMain} 在
+     * 调用 Mod 入口后填入。用于创建创造模式标签。
+     *
+     * <p>26.2 的 {@code CreativeModeTabs} 全是硬编码 {@code accept(...)} 列表，
+     * 物品注册本身不会让Mod 物品出现在创造栏 —— 必须由平台显式塞进某个标签。
+     * 搜索页会自动聚合所有标签，所以进了任一标签就能被搜到。
+     */
+    private volatile java.util.Map<String, java.util.List<String>> declaredBlocks =
+            org.loader.loader.LoaderMain.declaredBlocksSnapshot();
+
+    /**
+     * 设置各 Mod 声明的方块清单。必须在游戏启动前调用。
+     *
+     * @param byMod modId → 该 Mod 声明的方块路径（相对其命名空间）
+     */
+    public void declaredBlocks(java.util.Map<String, java.util.List<String>> byMod) {
+        this.declaredBlocks = byMod == null ? java.util.Map.of() : java.util.Map.copyOf(byMod);
+    }
 
     /**
      * 安装 Hook。
@@ -121,6 +144,22 @@ public class EntryPointHook {
         // → RUNNING（必须在调用游戏 main 之前，Mod 才能在启动期看到 RUNNING）
         mcBootstrap.start();
 
+        // 启动 Mod 资源注入。
+        //
+        // Mod 的方块/物品能注册，但模型与贴图在 JAR 的 assets/ 下，
+        // 而游戏只从自己的资源包体系读这些目录 —— 不注入就是
+        // "Missing model for variant: 'Block{...}'"。
+        //
+        // 本方法只登记 JAR 并起一个守护线程；真正的注入在线程里等
+        // Minecraft 实例就绪后才发生 —— 此刻游戏 main 还没被调用，
+        // Minecraft 对象尚不存在。
+        //
+        // 【不要改回 TickBridge.onTick】它在生产路径上无人驱动
+        // （ReflectiveMinecraftTickSource 没有任何调用方），
+        // 且 activeContract 为 null 时会静默 return —— 上一版就是这么
+        // 静默失效的。详见 ModResourceInjectionScheduler 的类注释。
+        scheduleResourceInjection();
+
         Throwable launchFailure = null;
         try {
             runMinecraftMain(mcClassLoader, entrypoint, args);
@@ -130,6 +169,54 @@ public class EntryPointHook {
         } finally {
             shutdownBootstrap(mcBootstrap, launchFailure);
         }
+    }
+
+    /**
+     * 登记各 Mod 的 JAR 并把资源注入排到第一个 tick。
+     *
+     * <p>失败<b>不阻断启动</b>：资源缺失的表现是「模型没贴图」，
+     * 游戏本身完全可玩。这与 {@link #runModRegistrations()} 的策略
+     * 刻意不同 —— 那里失败意味着 Mod 内容根本不在游戏里，
+     * 属于「静默缺失」，必须炸出来。
+     */
+    private void scheduleResourceInjection() {
+        try {
+            ModClassLoaderManager mgr = classLoaderManager.get();
+            if (mgr == null) {
+                return;
+            }
+            int registered = 0;
+            for (ModClassLoader mcl : mgr.all()) {
+                for (java.nio.file.Path source : mcl.modSources()) {
+                    if (source != null && source.toString().endsWith(".jar")) {
+                        ModResourceInjectionScheduler.register(
+                                mcl.modId(), source, declaredBlocksOf(mcl.modId()));
+                        registered++;
+                        break; // 每个 Mod 只取第一个 JAR
+                    }
+                }
+            }
+            if (registered > 0) {
+                ModResourceInjectionScheduler.start();
+                PlatformLog.info("Mod resources armed for injection: "
+                        + registered + " mod(s)");
+            }
+        } catch (RuntimeException e) {
+            PlatformLog.warn("提示: 无法安排 Mod 资源注入（不影响游戏启动，"
+                    + "但 Mod 的模型与贴图会缺失）: " + e);
+        }
+    }
+
+    /**
+     * 某 Mod 声明的方块路径；未声明过则返回空列表。
+     *
+     * <p>26.2 的 {@code CreativeModeTabs} 全部是硬编码 {@code accept(...)} 列表，
+     * 物品注册本身<b>不会</b>让 Mod 物品出现在创造栏 —— 平台必须显式塞进
+     * 某个标签。搜索页会自动聚合所有标签，所以进了任一标签就能被搜到。
+     */
+    private java.util.List<String> declaredBlocksOf(String modId) {
+        java.util.List<String> paths = declaredBlocks.get(modId);
+        return paths == null ? java.util.List.of() : paths;
     }
 
     /**
@@ -146,8 +233,16 @@ public class EntryPointHook {
     private void runModRegistrations() {
         int pending = org.loader.runtime.minecraft.RegistrationPhase.pendingCount();
         try {
+            // 创造栏标签必须在【窗口关闭之前】注册。
+            //
+            // 原因：26.2 的 BuiltInRegistries.bootStrap() 末尾会 freeze() 全部注册表，
+            // 而 CREATIVE_MODE_TAB 也在其中；bootStrap() 正是 closeRegistryWindow()
+            // 调用的东西。上一版把标签注册排在游戏启动之后，那时注册表已冻结，
+            // 注册必然失败（表现为"创造栏里什么都没有"且无明显报错）。
+            registerCreativeTabs();
+
             org.loader.runtime.minecraft.BootstrapGate.ensureBootstrapped();
-            System.out.println("[Mili] Mod registrations applied ("
+            PlatformLog.info("Mod registrations applied ("
                     + pending + " pending before bootstrap)");
         } catch (Throwable t) {
             Throwable cause = t.getCause() != null ? t.getCause() : t;
@@ -158,6 +253,39 @@ public class EntryPointHook {
                             + "\n  Starting anyway would give the player a game that is"
                             + " silently missing mod content."
                             + "\n  Real cause: " + cause, cause);
+        }
+    }
+
+    /**
+     * 为每个 Mod 创建创造模式标签，并填入它声明的方块。
+     *
+     * <p><b>按 mod id 自动分发</b>：标签 id 直接取 modId（小写化），
+     * 标题用 {@code itemGroup.<modId>.<modId>} 交给 lang 翻译 ——
+     * 零配置，Mod 只要有 id 就有自己的标签。
+     *
+     * <p>失败只记警告：创造栏是便利功能，缺了方块仍可用 {@code /give} 获得。
+     */
+    private void registerCreativeTabs() {
+        java.util.Map<String, java.util.List<String>> blocks = declaredBlocks;
+        if (blocks.isEmpty()) {
+            return;
+        }
+        int created = 0;
+        for (java.util.Map.Entry<String, java.util.List<String>> e : blocks.entrySet()) {
+            java.util.List<String> paths = e.getValue();
+            if (paths == null || paths.isEmpty()) {
+                continue;
+            }
+            try {
+                org.loader.runtime.minecraft.resource.ModCreativeTabs
+                        .registerTab(e.getKey(), paths);
+                created++;
+            } catch (RuntimeException ex) {
+                PlatformLog.warn("创造栏标签创建失败: " + e.getKey() + "（方块仍可用 /give 获得）", ex);
+            }
+        }
+        if (created > 0) {
+            PlatformLog.info("Creative tabs created for " + created + " mod(s)");
         }
     }
 

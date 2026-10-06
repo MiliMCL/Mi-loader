@@ -27,6 +27,8 @@ import java.util.Optional;
  * <p>本类把每一句契约都接到真实的 Minecraft 注册表上：
  * <ul>
  *   <li>{@link #block} → {@link BlockRegistrar#register} → 真正的 {@code Block} 实例</li>
+ *   <li>{@link #item} → {@code ItemRegistrar#register} → 真正的 {@code Item} 实例
+ *       （{@code spec.blockItem()} 有值时注册为 {@code BlockItem}）</li>
  *   <li>{@link #findBlock} → {@code Registry.getValue(ResourceKey)} 回读同一个实例</li>
  *   <li>{@link #isOpen} → {@link RegistrationPhase#isWindowOpen()}，即 26.2 真实的可写状态</li>
  * </ul>
@@ -52,6 +54,8 @@ public final class ApiMinecraftRegistry implements MinecraftRegistry {
 
     private final String modId;
     private final BlockRegistrar registrar;
+    /**物品注册端点。与 {@link #registrar} 同样在注册窗口打开时才真正写入。 */
+    private final org.loader.runtime.minecraft.item.ItemRegistrar itemRegistrar;
 
     /** 已声明的方块：path → 句柄。按声明顺序保留，便于诊断。 */
     private final Map<String, BlockHandle> declaredBlocks = new LinkedHashMap<>();
@@ -97,6 +101,12 @@ public final class ApiMinecraftRegistry implements MinecraftRegistry {
     public ApiMinecraftRegistry(String modId, BlockRegistrar registrar) {
         this.modId = Objects.requireNonNull(modId, "modId");
         this.registrar = Objects.requireNonNull(registrar, "registrar");
+        this.itemRegistrar = new org.loader.runtime.minecraft.item.ItemRegistrar(modId);
+    }
+
+    /** 物品注册端点，供诊断与测试断言使用。 */
+    public org.loader.runtime.minecraft.item.ItemRegistrar itemRegistrar() {
+        return itemRegistrar;
     }
 
     public String modId() {
@@ -149,14 +159,21 @@ public final class ApiMinecraftRegistry implements MinecraftRegistry {
             throw new IllegalStateException(
                     "Mod '" + modId + "' already registered item '" + path + "'.");
         }
-        // 走到这里说明物品反射路径存在，但本类尚未接通其注册流程。
-        // 明确说清楚是哪一环没做，不让调用方误以为是自己写错了。
-        throw new UnsupportedOperationException(
-                "Item registration is declared by the ABI contract but the binding to"
-                        + " Minecraft 26.2's item registry is not implemented yet."
-                        + "\n  Mod '" + modId + "' asked for '" + path + "'."
-                        + "\n  Use registry().block(...) meanwhile — block registration is"
-                        + " fully functional end to end.");
+
+        // 与 block() 同构：句柄代表「意图」，真正的注册动作排队到
+        // 注册窗口打开时统一执行（见类注释的时机说明）。
+        org.loader.api.registry.ItemHandle handle =
+                org.loader.api.registry.ItemHandle.create(modId, path, -1, spec);
+        declaredItems.put(path, handle);
+
+        try {
+            RegistrationPhase.defer(() -> itemRegistrar.register(spec));
+        } catch (RuntimeException e) {
+            // 排队失败就别留下一个永远不会被注册的句柄。
+            declaredItems.remove(path);
+            throw e;
+        }
+        return handle;
     }
 
     @Override
@@ -184,9 +201,26 @@ public final class ApiMinecraftRegistry implements MinecraftRegistry {
         int numeric;
         try {
             numeric = registrar.numericIdOf(key);
-        } catch (RuntimeException notQueryableYet) {
+        } catch (RuntimeException | Error notQueryableYet) {
             // 游戏侧还问不了（未 bootstrap / 无游戏 ClassLoader）。如实返回
             // 句柄本身，numericId 保持 -1 直到真正落地。
+            //
+            // 【为什么要catch Error 而不是只 catch RuntimeException】
+            // 这不是防御过度的洁癖，而是一个真实发生过的崩溃：
+            //   Mod 在 initialize() 里调 findBlock 打印注册清单
+            //   -> registrar.numericIdOf -> BuiltInRegistries.BLOCK
+            //   -> 首次触发 BuiltInRegistries.<clinit>
+            //   -> registerDefaulted 调 Bootstrap.checkBootstrapCalled
+            //   -> 游戏尚未 bootstrap，抛 IllegalArgumentException
+            //   -> 类初始化失败被 JVM 包装成【ExceptionInInitializerError】
+            //
+            // ExceptionInInitializerError 继承 LinkageError → Error，
+            // **不是** RuntimeException。原来的 catch (RuntimeException)
+            // 形同虚设，一个纯只读的查询把整个 Mod 初始化炸掉了。
+            //
+            // 语义上也应该是这样：契约问的是「这个方块注册了吗」，
+            // 答案已经确定为「注册了」。游戏侧还没到能回答的时候，
+            // 不该让这次询问变成致命错误。
             return Optional.of(handle);
         }
         return numeric >= 0
@@ -196,7 +230,28 @@ public final class ApiMinecraftRegistry implements MinecraftRegistry {
 
     @Override
     public Optional<org.loader.api.registry.ItemHandle> findItem(String path) {
-        return Optional.ofNullable(declaredItems.get(normalizePath(path)));
+        String key = normalizePath(path);
+        org.loader.api.registry.ItemHandle handle = declaredItems.get(key);
+        if (handle == null) {
+            return Optional.empty();
+        }
+        // 与 findBlock 同构：已落地就补上真实数值 ID，游戏类还问不了
+        // （未 bootstrap / 无游戏 ClassLoader）就如实返回句柄本身。
+        if (handle.numericId() >= 0) {
+            return Optional.of(handle);
+        }
+        int numeric;
+        try {
+            numeric = itemRegistrar.numericIdOf(key);
+        } catch (RuntimeException | Error notQueryableYet) {
+            // 见 findBlock 的同处注释：ExceptionInInitializerError 是
+            // Error 而非 RuntimeException，只 catch RuntimeException 会漏。
+            return Optional.of(handle);
+        }
+        return numeric >= 0
+                ? Optional.of(org.loader.api.registry.ItemHandle.create(
+                        modId, key, numeric, handle.spec()))
+                : Optional.of(handle);
     }
 
     @Override
@@ -238,12 +293,15 @@ public final class ApiMinecraftRegistry implements MinecraftRegistry {
     public String diagnostics() {
         List<String> lines = new ArrayList<>();
         lines.add("ApiMinecraftRegistry[" + modId
-                + ", declared=" + declaredBlocks.size()
-                + ", landed=" + registrar.registeredCount()
+                + ", blocks=" + declaredBlocks.size() + "/" + registrar.registeredCount()
+                + ", items=" + declaredItems.size() + "/" + itemRegistrar.registeredCount()
                 + ", windowOpen=" + RegistrationPhase.isWindowOpen()
                 + ", pending=" + RegistrationPhase.pendingCount() + "]");
         for (Map.Entry<String, BlockHandle> e : declaredBlocks.entrySet()) {
             lines.add("  block " + e.getKey() + " -> " + e.getValue());
+        }
+        for (Map.Entry<String, org.loader.api.registry.ItemHandle> e : declaredItems.entrySet()) {
+            lines.add("  item  " + e.getKey() + " -> " + e.getValue());
         }
         return String.join("\n", lines);
     }

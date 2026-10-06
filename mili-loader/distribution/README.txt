@@ -8,10 +8,21 @@ Mili Platform — Minecraft 26.2 Mod 加载器
 2. 运行启动脚本：
      Linux / macOS:  ./bin/mili-loader
      Windows:        bin\mili-loader.bat
-3. 首次运行会自动从 Mojang 官方源下载 Minecraft 26.2 并校验（约 600MB，
+3. Windows 版首次运行会问你两件事，问一次就记住了：
+     * 游戏名        —— 游戏内显示的名字，同时用于派生离线 UUID
+     * 访问令牌      —— 只有联机正版服务器/Realms 才需要，直接回车跳过即
+                     以离线模式运行
+   回答结果保存在 bin\mili-loader.cfg，之后每次启动不再询问。
+4. 首次运行会自动从 Mojang 官方源下载 Minecraft 26.2 并校验（约 600MB，
    请耐心等待）。下载完成后游戏会自动启动。
 
 之后每次运行直接进入游戏，不再重复下载。
+
+不需要手动传任何参数。Minecraft 版本由脚本从平台 JAR 内
+META-INF/mili/platform.json 读取（读不到时退回解析 JAR 文件名里的
+-mcX.Y），因此永远与平台版本一致。
+
+如需改游戏名或清除保存的令牌，删除 bin\mili-loader.cfg 后重跑即可。
 
 目录结构
 --------
@@ -66,10 +77,33 @@ Mojang 官方 CDN 下载并逐个校验 SHA-1。这样做有两个原因：
 常用参数
 --------
 
-    --mili-mods <dir>   指定 Mod 目录（分发包默认已指向 <dist>/mods，一般无需手动传）
-    --dry-run        只查询元数据并打印所需体积，不下载
-    --skip-assets    跳过资源下载（约省 480MB，但进世界会缺资源）
-    --server         以服务端模式启动
+平台启动脚本（bin\mili-loader）只识别两个参数：
+
+    <gameDir>            第 1 个位置参数，游戏数据目录；缺省为当前目录
+    --mili-mods <dir>    Mod 目录；缺省为 <gameDir>/mods
+
+除这两个以外的参数会原样转发给 Minecraft。因此不要给启动脚本传
+--dry-run / --skip-assets / --server —— 它们属于下面的安装器，传给
+Minecraft 会被 joptsimple 以 UnrecognizedOptionException 拒绝启动。
+
+只想预装游戏、不启动客户端时，直接调安装器（注意是连字符 --game-dir）：
+
+    java -cp core/mili-*.jar org.loader.installer.InstallerMain \
+         --game-dir game --version 26.2 [--dry-run] [--skip-assets]
+
+服务端/客户端由平台根据 JAR 内容自动判定（检测到客户端入口走客户端，
+否则走服务端），无需命令行开关。
+
+账号
+----
+
+平台自身不做任何认证，也不会伪造凭据。脚本默认以离线模式启动：按你的
+游戏名派生一个离线 UUID（与原版 OfflinePlayer:<名字> 方案一致），
+不传 --accessToken。此时无法联机正版服务器，也无法使用 Realms。
+
+要联机，把 accessToken 填进 bin\mili-loader.cfg 的 accessToken 一行，
+启动脚本会原样传给 Minecraft。日志里出现 401 / Realms 认证失败属于
+凭据无效的正常反馈，不影响离线游玩。
 
 故障排查
 --------
@@ -85,7 +119,12 @@ Mod 必须放在分发包的 `mods/` 目录（不是 `game/mods/`）。
 平台 JAR 与 bin/ 下的启动脚本版本不匹配。重新解压一份完整的分发包。
 
 **提示找不到 Minecraft**
-运行 `./bin/mili-loader --dry-run` 检查网络能否访问 Mojang CDN。
+先看启动脚本打印的 `[Mili] MC version:` 那一行是否正确；不对说明平台
+JAR 读取出了问题，重新解压一份完整的分发包。若版本正确，则是网络问题，
+用安装器单独探测（注意 --dry-run 属于安装器，不属于启动脚本）：
+
+    java -cp core/mili-*.jar org.loader.installer.InstallerMain \
+         --game-dir game --version 26.2 --dry-run
 
 **提示 Java 版本过低**
 Minecraft 26.2 需要 Java 25。设置 JAVA_HOME 指向 JDK 25 后重试。

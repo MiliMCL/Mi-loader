@@ -341,7 +341,11 @@ fun configureDistContents(spec: CopySpec) {
             from(platformJarFileProvider)
         }
         into("bin") {
-            from(layout.projectDirectory.dir("distribution/bin"))
+            from(layout.projectDirectory.dir("distribution/bin")) {
+                // 排除开发者本机生成的配置：其中可能含 accessToken 明文，
+                // 绝不能随分发包发给用户。用户首次运行会自行生成。
+                exclude("mili-loader.cfg")
+            }
         }
         into("mods") {
             from(layout.projectDirectory.file("distribution/mods/.keep"))
@@ -398,6 +402,10 @@ tasks.named("build") { dependsOn(distTar) }
 //   1. 纯 ASCII（无 BOM）—— cmd 不需要猜代码页
 //   2. CRLF 行尾，且不允许出现裸 LF
 //   3. REM 注释行内不出现字面百分号
+//
+// 另加一条凭据泄漏防护：bat 首次运行会在 bin/ 下生成 mili-loader.cfg，
+// 其中含 accessToken 明文。打包时必须排除它，否则开发者本机的凭据会
+// 随分发包发给所有用户。
 val launcherScripts = tasks.register("launcherScriptCheck") {
     group = "verification"
     description = "校验 bin/ 启动脚本为纯 ASCII + CRLF，且 REM 注释不含字面百分号"
@@ -463,14 +471,23 @@ val launcherScripts = tasks.register("launcherScriptCheck") {
             }
         }
 
+        // 规则 4：打包时必须排除本机生成的配置文件（内含 accessToken 明文）
+        val cfgName = "mili-loader.cfg"
+        if (layout.projectDirectory.file("distribution/bin/$cfgName").asFile.exists()) {
+            problems += "distribution/bin/$cfgName 存在。" +
+                "这是启动脚本首次运行时生成的本机配置（含 accessToken 明文），" +
+                "不应留在仓库里。请删除它，并确认 .gitignore 与 distTar/distZip 的 " +
+                "exclude('$cfgName') 都已就位"
+        }
+
         if (problems.isNotEmpty()) {
             throw GradleException(
-                "启动脚本编码校验失败:\n" + problems.joinToString("\n") { "  - $it" } +
-                    "\n\n修复方式：用纯 ASCII 内容 + CRLF 行尾重写该文件。" +
+                "启动脚本校验失败:\n" + problems.joinToString("\n") { "  - $it" } +
+                    "\n\n编码类问题修复方式：用纯 ASCII 内容 + CRLF 行尾重写该文件，" +
                     "详见 mili-loader/distribution/bin/mili-loader.bat 顶部说明。"
             )
         }
-        logger.lifecycle("启动脚本编码校验通过（纯 ASCII + CRLF）")
+        logger.lifecycle("启动脚本校验通过（纯 ASCII + CRLF + 无凭据文件）")
     }
 }
 

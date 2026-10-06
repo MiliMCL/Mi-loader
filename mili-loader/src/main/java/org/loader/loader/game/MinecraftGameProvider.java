@@ -8,6 +8,7 @@ import org.loader.loader.discovery.MinecraftDiscovery;
 import org.loader.loader.hook.EntryPointHook;
 import org.loader.runtime.RuntimeEnvironment;
 import org.loader.runtime.kernel.Runtime;
+import org.loader.loader.PlatformLog;
 
 import java.net.URL;
 import java.nio.file.Path;
@@ -101,7 +102,7 @@ public class MinecraftGameProvider implements GameProvider {
 
         List<String> libWarnings = LibraryResolver.validateClasspath(lastClasspath);
         for (String w : libWarnings) {
-            System.err.println("[Mili] Library warning: " + w);
+            PlatformLog.warn("Library warning: " + w);
         }
         return lastClasspath;
     }
@@ -169,6 +170,15 @@ public class MinecraftGameProvider implements GameProvider {
         if (gameClassLoader == null) {
             createGameClassLoader(gameClasspath);
         }
+
+        // 开启文件日志：此后所有 [Mili] 诊断都会进 logs/latest.log。
+        //
+        // 【为什么必须开】平台此前全靠 System.out，输出只在控制台。
+        // 于是排查时「latest.log 里零条 [Mili]」被误读成「代码没执行」，
+        // 连续两轮把诊断方向带偏 —— 日志源缺失本身就是一种故障。
+        // 此时游戏 main 尚未调用，但 log4j 已随游戏类加载器就绪，
+        // Logger.getLogger() 会自行初始化并挂上文件 appender。
+        PlatformLog.enableFileLogging();
 
         // 注册为 bootstrap 的外部资源 —— 失败/停止时随之释放
         EntryPointHook hook = new EntryPointHook();

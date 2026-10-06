@@ -196,7 +196,6 @@ private static final String[] SUB_BOOTSTRAPS = {
         if (!state.flagSet.compareAndSet(false, true)) {
             return; // 已置位，幂等
         }
-
         // 唯一一处写 Minecraft 私有字段的地方。必要性见类注释：BuiltInRegistries
         // 的类初始化硬性要求这个标志，而 bootstrap() 一旦发现它为 true 就整段 return。
         try {
@@ -216,13 +215,49 @@ private static final String[] SUB_BOOTSTRAPS = {
 
         // 触碰 BuiltInRegistries 以完成类初始化。此时它只建出空注册表 ——
         // 原版内容要等 bootStrap() 里的 createContents() 才填。这正是 Mod 的空隙。
+        //
+        // 【顺序不可换】必须先置 isBootstrapped 再触碰本类。反过来会失败，
+        // 而失败会把 BuiltInRegistries 永久标记为 Erroneous（见 ensureRegistriesReadable）。
         try {
             Reflect.staticField(BUILTIN, "BLOCK");
-        } catch (RuntimeException e) {
+        } catch (RuntimeException | Error e) {
             throw new BridgeMismatchException(
                     "BuiltInRegistries failed to initialise even after the bootstrap flag"
                             + " was set. Real cause: " + e.getCause(), e);
         }
+    }
+
+    /**
+     * 确保 {@code BuiltInRegistries} 的类初始化<b>已经成功完成</b>，
+     * 使后续只读查询（{@code getValue} / {@code getId}）可以安全执行。
+     *
+     * <h2>为什么这个方法是必需的</h2>
+     *
+     * <p>26.2 里 {@code BuiltInRegistries.<clinit>} 会调
+     * {@code Bootstrap.checkBootstrapCalled()}，要求
+     * {@code isBootstrapped == true}。若在置位之前有人先碰到这个类，
+     * 类初始化会失败，而 <b>JVM 对失败过的类初始化不会重试</b> ——
+     * 该类被永久标记为 {@code Erroneous}，此后任何访问都直接抛
+     * {@code NoClassDefFoundError: Could not initialize class ...}。
+     *
+     * <p>这个坑真实发生过：Mod 在 {@code initialize()} 里调
+     * {@code registry().findBlock(...)} 打印注册清单（纯只读意图），
+     * 恰好成了第一个触碰者 → 毒化；Mod 因为被 catch 住而"成功"跑完，
+     * 但平台随后 {@code openRegistryWindow()} 再碰同一个类时直接炸掉，
+     * 报「refusing to start Minecraft without it」，错误完全指不到真正原因。
+     *
+     * <p>因此规矩是：<b>任何要触碰注册表类的地方，都必须先经由本方法</b>，
+     * 由它保证「先置标志、再触碰」这个唯一安全的顺序。只读查询也不例外 ——
+     * "我只是看一眼"照样会触发类初始化。
+     *
+     * <p>幂等：重复调用只在首次执行实际动作。
+     *
+     * @throws BridgeMismatchException 无法置位标志（游戏版本变更导致字段改名）
+     */
+    public static void ensureRegistriesReadable() {
+        // openRegistryWindow 内部已完成「置标志 + 触碰注册表类」，
+        // 且这两步顺序正确、对重复调用幂等 —— 直接复用，不必重复实现。
+        openRegistryWindow();
     }
 
     /**
@@ -294,8 +329,24 @@ private static final String[] SUB_BOOTSTRAPS = {
     private static List<Object> drainUnregisteredBlocks() {
         List<Object> orphans = new ArrayList<>();
         try {
+            // 【不要在这里调 ensureRegistriesReadable()】
+            // 本方法由 closeRegistryWindow() 在【窗口已关闭之后】调用，
+            // 而 ensureRegistriesReadable() 内部走 openRegistryWindow()，
+            // 遇到 windowClosed=true 会直接抛
+            // "The registration window is already closed"。
+            //
+            // 上一版把它当成"幂等二次保险"加在这里，结果每次关窗都必然抛错 ——
+            // 而且它屏蔽掉了本方法真正要报告的内容（未注册的方块）。
+            //
+            // 此刻注册表类必然已初始化完毕（窗口能开就说明标志已置、
+            // BuiltInRegistries 已被触碰过），直接读即可。
             Object registry = Reflect.staticField(BUILTIN, "BLOCK");
-            Field field = registry.getClass().getDeclaredField(
+            // 【必须沿类继承链查找】字段声明在父类 MappedRegistry 里
+            // （26.2 实测第 66 行），而 BuiltInRegistries.BLOCK 的运行时类
+            // 是它的子类 DefaultedMappedRegistry。Class.getDeclaredField
+            // 只看类自身、不看父类 —— 上一版直接对 registry.getClass() 调用，
+            // 于是抛 NoSuchFieldException，并把"字段在父类"误报成"字段改名了"。
+            Field field = findFieldInHierarchy(registry.getClass(),
                     "unregisteredIntrusiveHolders");
             field.setAccessible(true);
             Object map = field.get(registry);
@@ -316,6 +367,27 @@ private static final String[] SUB_BOOTSTRAPS = {
                             + " Minecraft's own freeze() check will report the problem", e);
         }
         return orphans;
+    }
+
+    /**
+     * 沿继承链查找字段。
+     *
+     * <p>{@link Class#getDeclaredField} 只在类自身声明的字段里找，不含父类。
+     * 游戏的注册表实现普遍是多层继承
+     * （{@code DefaultedMappedRegistry} → {@code MappedRegistry}），
+     * 数据字段通常声明在基类 —— 只查自身必然 {@code NoSuchFieldException}。
+     */
+    private static Field findFieldInHierarchy(Class<?> type, String name)
+            throws NoSuchFieldException {
+        for (Class<?> c = type; c != null; c = c.getSuperclass()) {
+            try {
+                return c.getDeclaredField(name);
+            } catch (NoSuchFieldException e) {
+                // 继续往父类找
+            }
+        }
+        throw new NoSuchFieldException(
+                name + " not found in " + type.getName() + " or any superclass");
     }
 
     /** 把未注册的方块渲染成可读清单。 */

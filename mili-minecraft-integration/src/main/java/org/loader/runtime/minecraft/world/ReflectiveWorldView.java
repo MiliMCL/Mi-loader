@@ -5,6 +5,7 @@ import org.loader.api.world.BlockHandle;
 import org.loader.api.world.BlockPos;
 import org.loader.api.world.Direction;
 import org.loader.api.world.WorldView;
+import org.loader.runtime.minecraft.RegistrationPhase;
 import org.loader.runtime.minecraft.reflect.BridgeMismatchException;
 import org.loader.runtime.minecraft.reflect.Reflect;
 
@@ -236,6 +237,10 @@ public final class ReflectiveWorldView implements WorldView {
             return hit;
         }
         try {
+            // 先走安全路径再触碰注册表类：Mod 在 initialize() 里调世界查询
+            // 同样会触发 BuiltInRegistries 的类初始化，而失败后不可重试。
+            // 详见 RegistrationPhase.ensureRegistriesReadable()。
+            RegistrationPhase.ensureRegistriesReadable();
             Object registry = Reflect.staticField(BUILTIN_REGISTRIES, "BLOCK");
             // 26.2 的 Registry.getKey(T) 直接返回 Identifier，
             // 不是旧版本的 ResourceKey —— 这一点逐条 javap 核验过。
@@ -309,6 +314,7 @@ public final class ReflectiveWorldView implements WorldView {
 
     /** modId:path → 游戏 {@code Block} 实例；未注册返回 null。 */
     private Object resolveBlock(BlockHandle handle) throws ReflectiveOperationException {
+        RegistrationPhase.ensureRegistriesReadable();
         Object registry = Reflect.staticField(BUILTIN_REGISTRIES, "BLOCK");
         Object identifier = identifier(handle.modId(), handle.path());
         Object key = Reflect.gameClass(RESOURCE_KEY)

@@ -181,7 +181,7 @@ public class LoaderMain {
         }
 
         String version = detectTargetMinecraftVersion();
-        System.out.println("[Mili] 未在 " + gameDir + " 找到 Minecraft，开始自动安装 " + version);
+        PlatformLog.info("未在 " + gameDir + " 找到 Minecraft，开始自动安装 " + version);
 
         try {
             Class<?> installer = Class.forName("org.loader.installer.InstallerMain");
@@ -190,13 +190,13 @@ public class LoaderMain {
                     "--game-dir", gameDir.toString(),
                     "--version", version
             });
-            System.out.println("[Mili] Minecraft 安装完成，继续启动");
+            PlatformLog.info("Minecraft 安装完成，继续启动");
         } catch (ClassNotFoundException e) {
-            System.err.println("[Mili] 提示: 分发包中缺少 mili-installer，"
+            PlatformLog.warn("提示: 分发包中缺少 mili-installer，"
                     + "请手动提供 Minecraft 安装到 " + gameDir);
         } catch (Exception e) {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
-            System.err.println("[Mili] 自动安装失败: " + cause.getMessage());
+            PlatformLog.warn("自动安装失败: " + cause.getMessage());
         }
     }
 
@@ -278,7 +278,14 @@ public class LoaderMain {
         // ── 8. 调用 Mod 入口 ─────────────────────────────────────────────
         invokeModEntrypoints();
 
-        System.out.println("[Mili] ClassLoader 拓扑:\n" + classLoaderManager.diagnostics());
+        // 快照方块清单：创造栏标签在 EntryPointHook 里创建，而 Hook 拿不到
+        // 本实例（中间隔着 GameProvider 接口），走静态快照是最小改动。
+        lastDeclaredBlocks = Map.copyOf(declaredBlocksByMod);
+        if (!lastDeclaredBlocks.isEmpty()) {
+            PlatformLog.info("Declared blocks: " + lastDeclaredBlocks);
+        }
+
+        PlatformLog.info("ClassLoader 拓扑:\n" + classLoaderManager.diagnostics());
 
         // ── 9. 启动 Minecraft ────────────────────────────────────────────
         try {
@@ -307,25 +314,25 @@ public class LoaderMain {
             jarCount = -1;
         }
 
-        System.out.println("[Mili] Mod 目录: " + modsDir
+        PlatformLog.info("Mod 目录: " + modsDir
                 + "  (JAR/ZIP=" + (jarCount < 0 ? "?" : jarCount)
                 + ", 识别=" + mods.size() + ")");
         for (ModManifest m : mods) {
-            System.out.println("[Mili]   发现 Mod: " + m.id() + " v" + m.version());
+            PlatformLog.info("  发现 Mod: " + m.id() + " v" + m.version());
         }
 
         // 目录根本不存在 —— 分发包布局下最常见的失效：Mod 在<dist>/mods，
         // 而 gameDir 是 <dist>/game。不显式报出来，玩家只会看到
         // 「游戏正常启动了，但什么都没有」。
         if (!dirExists) {
-            System.err.println("[Mili] 警告: Mod 目录不存在: " + modsDir
+            PlatformLog.warn("警告: Mod 目录不存在: " + modsDir
                     + "\n  这会让所有 Mod 被静默跳过（游戏仍会正常启动）。"
                     + "\n  分发包布局下 Mod 应放在 <dist>/mods，启动脚本需传 --mili-mods <dir>。");
             return;
         }
 
         if (jarCount > 0 && mods.isEmpty()) {
-            System.err.println("[Mili] 警告: " + modsDir + " 里有 " + jarCount
+            PlatformLog.warn("警告: " + modsDir + " 里有 " + jarCount
                     + " 个 JAR，但一个 Mod 都没被识别。"
                     + "\n  Mod JAR 必须包含 META-INF/mod.json 或 mod.json，"
                     + "且 mod.json 里的 id / entrypoint 必填项不能为空。");
@@ -397,7 +404,12 @@ public class LoaderMain {
                 ((org.loader.api.Mod) instance).initialize(apiCtx);
 
                 modContexts.put(mod.id(), runtimeCtx);
-                System.out.println("[Mili] Mod initialized: " + mod.id() + " -> " + entrypoint);
+
+                // 记下该 Mod 声明的方块路径 —— 创造栏标签需要它，
+                // 且这是唯一能拿到确切清单的时刻（见字段注释）。
+                collectDeclaredBlocks(mod.id(), apiCtx);
+
+                PlatformLog.info("Mod initialized: " + mod.id() + " -> " + entrypoint);
 
             } catch (ModLoadError e) {
                 throw e;
@@ -426,6 +438,63 @@ public class LoaderMain {
 
     /** 已装配的 runtime ModContext，供关闭阶段与诊断使用。 */
     private final Map<String, ModContext> modContexts = new LinkedHashMap<>();
+
+    /**
+     * 每个 Mod 声明的方块路径（相对其命名空间），供创造栏标签使用。
+     *
+     * <p><b>为什么在这里采集</b>：这是唯一能拿到确切清单的时刻 ——
+     * {@code Mod.initialize()} 刚返回，Mod 声明过的方块都在
+     * {@code ApiMinecraftRegistry} 里。事后反查游戏方块注册表做不到这一点，
+     * 因为那里同时装着全部原版方块，无法区分来源。
+     */
+    private final Map<String, List<String>> declaredBlocksByMod = new LinkedHashMap<>();
+
+    /**
+     * 上一轮启动中各 Mod 声明的方块路径。
+     *
+     * <p><b>为什么用静态</b>：创造栏标签在 {@code EntryPointHook} 里创建，
+     * 而 Hook 与 {@code LoaderMain} 之间隔着 {@code GameProvider} 接口 ——
+     * 把清单塞进接口参数会波及所有实现类。走静态是最小改动，
+     * 且生命周期一致（都在同一次启动内）。
+     */
+    private static volatile Map<String, List<String>> lastDeclaredBlocks = Map.of();
+
+    /** 本次启动中各 Mod 声明的方块路径（modId → 相对命名空间的路径）。 */
+    public static Map<String, List<String>> declaredBlocksSnapshot() {
+        return lastDeclaredBlocks;
+    }
+
+    /** 某Mod 声明的方块路径；未声明过则返回空列表。 */
+    public List<String> declaredBlocksOf(String modId) {
+        List<String> paths = declaredBlocksByMod.get(modId);
+        return paths == null ? List.of() : List.copyOf(paths);
+    }
+
+    /**
+     * 从契约上下文里取出该 Mod 声明的方块路径。
+     *
+     * <p>失败只记日志：清单只用于创造栏标签，缺了不影响方块本身可用。
+     */
+    private void collectDeclaredBlocks(String modId, org.loader.api.ModContext apiCtx) {
+        try {
+            org.loader.api.registry.MinecraftRegistry reg = apiCtx.registry();
+            if (reg == null) {
+                return;
+            }
+            List<String> paths = new ArrayList<>();
+            for (org.loader.api.world.BlockHandle handle : reg.blocks()) {
+                if (modId.equals(handle.modId())) {
+                    paths.add(handle.path());
+                }
+            }
+            if (!paths.isEmpty()) {
+                declaredBlocksByMod.put(modId, paths);
+            }
+        } catch (RuntimeException e) {
+            PlatformLog.warn("提示: 无法记录 " + modId
+                    + " 的方块清单（创造栏将为空）: " + e);
+        }
+    }
 
     /**
      * 逆序释放全部资源。单个失败不阻断其余清理。
