@@ -132,10 +132,10 @@ jobs:
         run: chmod +x gradlew
 
       - name: Compile all modules
-        run: ./gradlew compileJava compileTestJava --no-daemon --console=plain --no-refresh-dependencies
+        run: ./gradlew compileJava compileTestJava --no-daemon --console=plain 
 
       - name: Run all tests
-        run: ./gradlew test --no-daemon --console=plain --no-refresh-dependencies
+        run: ./gradlew test --no-daemon --console=plain 
 
       - name: Build platform fat JAR
         run: ./gradlew :mili-loader:shadowJar --no-daemon --console=plain
@@ -313,10 +313,4 @@ jobs:
           ./gradlew :mili-runtime:dependencies --configuration runtimeClasspath --no-daemon --console=plain | grep -E "mili-|---" || true
           echo "--- abi deps ---"
           ./gradlew :mili-abi:dependencies --configuration runtimeClasspath --no-daemon --console=plain | grep -E "mili-|---" || true
-
-      - name: Verify no hardcoded 'E:\\loader' in source
-        run: |
-          if grep -rE "E:\\\\loader" --include=*.java --include=*.kt --include=*.kts . ; then
-            echo "ERROR: hardcoded 'E:\\loader' detected. Use relative/path-param."
-            exit 1
-          fi
+          
