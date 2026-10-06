@@ -75,12 +75,19 @@ public class LoaderMain {
     /**
      * 启动参数里解析出来的、属于<b>平台</b>（而非 Minecraft）的选项。
      *
+     * <p><b>为什么是包级可见而不是 private</b>：{@code parseArgs} 是平台
+     * 启动路径上唯一决定「Minecraft 拿到什么参数」的地方，而参数拆分一旦
+     * 出错，症状出现在很远处（Minecraft 找不到资源、静默不认得某个选项）。
+     * {@code LaunchArgPassthroughTest} 需要直接断言拆分结果，因此
+     * record 与 parseArgs 都放开到包级 —— 仍是包内可见，外部 API 不变。
+     *
      * @param gameDir    Minecraft 所在目录（{@code <dist>/game}）
      * @param modsDir    Mod 所在目录（{@code <dist>/mods}）；未显式指定时
      *                   回退到 {@code gameDir/mods}
-     * @param mcArgs     转发给 Minecraft main 的参数（已剔除平台选项）
+     * @param mcArgs     转发给 Minecraft main 的参数（已剔除平台选项，
+     *                   并按需补上 {@code --gameDir}）
      */
-    private record LaunchOptions(Path gameDir, Path modsDir, String[] mcArgs) {
+    record LaunchOptions(Path gameDir, Path modsDir, String[] mcArgs) {
     }
 
     /**
