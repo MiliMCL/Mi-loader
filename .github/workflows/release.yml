@@ -2,7 +2,8 @@ name: Mili Platform Release
 
 on:
   push:
-    tags: ['v*']
+    # 监听所有 tag，不强制 v 前缀。约定：tag 就是纯版本号，如 0.1.0
+    tags: ['*']
   workflow_dispatch:
 
 jobs:
@@ -15,16 +16,19 @@ jobs:
       - name: Derive version from tag
         id: ver
         run: |
+          # tag 本身就是版本号，不绑 v 前缀。
+          # 若有人还是习惯推 v0.1.0，这里做一次兼容剥离。
           TAG="${GITHUB_REF_NAME#v}"
           echo "TAG_VERSION=$TAG"   >> $GITHUB_ENV
           echo "version=$TAG"       >> $GITHUB_OUTPUT
           echo "Tag: ${GITHUB_REF_NAME} -> version $TAG"
 
-      - name: Verify tag matches minecraft version in gradle.properties
+      - name: Verify tag matches miliPlatformVersion in gradle.properties
         run: |
-          PROP=$(grep '^miliPlatformVersion=' gradle.properties | cut -d= -f2)
+          PROP=$(grep '^miliPlatformVersion=' gradle.properties | cut -d= -f2 | tr -d '[:space:]')
           if [ "$PROP" != "$TAG_VERSION" ]; then
-            echo "Tag v${TAG_VERSION} != miliPlatformVersion=${PROP}"
+            echo "ERROR: tag '${GITHUB_REF_NAME}' (版本 $TAG_VERSION) != miliPlatformVersion=$PROP"
+            echo "请把 gradle.properties 的 miliPlatformVersion 改成 $TAG_VERSION，或改用正确的 tag 重新推送。"
             exit 1
           fi
           echo "Tag matches gradle.properties (${PROP})"
@@ -124,8 +128,6 @@ jobs:
 
             ## MC Build Fingerprint
             - MC version: 26.2
-            - MC artifact SHA-256: ${{ steps.mc.outputs.sha || 'N/A' }}
-            - Decompiled: ${{ steps.mc.outputs.found == 'true' }}
 
             ## Modules
             - mili-abi: stable ABI (zero-dep)
