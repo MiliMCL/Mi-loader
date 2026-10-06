@@ -20,7 +20,10 @@ import org.loader.api.transform.callback.ExecutionContext;
  * <pre>
  *   LDC  owner        // 目标类内部名
  *   LDC  methodName   // 目标方法名
- *   INVOKESTATIC InjectionContextFactory.forMethod(String,String)LInjectionContext;
+ *   ALOAD 0           // 宿主实例（静态方法 / 构造器为 ACONST_NULL）
+ *   INVOKESTATIC InjectionContextFactory.forMethodWithTarget
+ *       (Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;)
+ *       LInjectionContext;
  *   INVOKESTATIC ModCallbacks.onTick(LInjectionContext;)V
  * </pre>
  *
@@ -57,50 +60,40 @@ public final class InjectionContextFactory {
      */
     public interface Provider {
         /**
-         * 产出一个上下文。
+         * 产出一个携带实例与取消能力的上下文 —— <b>完整形态</b>。
          *
-         * @param className  目标类内部名（斜杠分隔）
-         * @param methodName 目标方法名
-         */
-        InjectionContext create(String className, String methodName);
-
-        /**
-         * 产出一个携带实例与取消能力的上下文。
-         *
-         * <p>默认实现退化为两参形式（丢失 target 与取消能力）——
-         * 仅为兼容既有 Provider 实现而存在；平台自身装配的实现
-         * 必须覆写它，否则 cancellable 注入的 {@code cancel()}
-         * 会抛 IllegalStateException。
+         * <h2>为什么抽象方法是四参而非二参</h2>
+         * 取消能力由生成字节码按注入点合法性选择工厂
+         * （{@link #forCancellableMethod}）：若允许实现者只提供
+         * 二参形态（丢失 target 与取消能力），漏装的完整能力会让
+         * cancellable 注入在运行期抛 {@code IllegalStateException} ——
+         * 且只在玩家真的触发取消那一刻才暴露。四参抽象把
+         * 「装配者必须提供完整形态」变成<b>编译期强制</b>。
          *
          * @param target      宿主实例（静态方法 / 构造器为 null）
          * @param cancellable 是否允许 {@code cancel()}
          */
-        default InjectionContext create(String className, String methodName,
-                                        Object target, boolean cancellable) {
-            return create(className, methodName);
+        InjectionContext create(String className, String methodName,
+                                Object target, boolean cancellable);
+
+        /**
+         * 产出一个无实例、不可取消的上下文。
+         *
+         * <p>便捷形式：委托给完整形态（{@code target = null}、
+         * {@code cancellable = false}）—— 与完整形态同源，
+         * 不存在第二套语义。
+         */
+        default InjectionContext create(String className, String methodName) {
+            return create(className, methodName, null, false);
         }
     }
 
     /**
-     * 无 tick 上下文的默认提供器。
+     * 脱离 tick 的默认提供器 —— 完整形态。
      *
      * <p>{@code tickId = -1} 而非 0：{@link InjectionContext#inTick()}
      * 以 {@code tickId >= 0} 判定，-1 表示「不在 tick 内」。
-     * 用 0 会让 Mod 在游戏启动前就误以为自己处于第0 个 tick。
-     */
-    private static final Provider DETACHED = (className, methodName) ->
-            new InjectionContext(
-                    className,
-                    methodName,
-                    null,
-                    -1L,
-                    null,
-                    ExecutionContext.single(),
-                    null,
-                    Thread.currentThread());
-
-    /**
-     * 脱离 tick 的默认提供器 —— 完整形态。
+     * 用 0 会让 Mod 在游戏启动前就误以为自己处于第 0 个 tick。
      *
      * <p>实例上下文与取消能力在平台未装配时同样可用：
      * {@code target()} 如实返回宿主实例，{@code cancel()} 生效。

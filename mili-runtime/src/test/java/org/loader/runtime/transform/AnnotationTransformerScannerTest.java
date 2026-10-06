@@ -355,7 +355,7 @@ class AnnotationTransformerScannerTest {
      * {@link ValidHooks#onEnter} 接收一个 {@code InjectionContext}，
      * 而注入生成的是 {@code INVOKESTATIC onEnter(ctx)}。
      * {@code ctx} 在字节码里并不存在 —— 引擎必须调用
-     * {@code InjectionContextFactory.forMethod} 现造一个。
+     * {@code InjectionContextFactory.forMethodWithTarget} 现造一个。
      *
      * <p>曾经的 bug：{@code pushCallback} 无条件发出
      * {@code INVOKESTATIC <描述符>}而从不压参数。产出的是栈下溢的字节码，

@@ -134,6 +134,8 @@ public final class MiliMapping {
                 MiliSymbol.SERVER_TICK_CHILDREN,
                 MiliSymbol.CLIENT_LEVEL_TICK,
                 MiliSymbol.CLIENT_TICK,
+                MiliSymbol.CLIENT_BRAND,
+                MiliSymbol.TITLE_SCREEN_INIT,
                 MiliSymbol.CLIENT_MAIN,
                 MiliSymbol.SERVER_MAIN}) {
             // 符号名取类的 toString()：它包含完整坐标，便于排查时对照

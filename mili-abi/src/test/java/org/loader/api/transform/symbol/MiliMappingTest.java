@@ -54,10 +54,35 @@ class MiliMappingTest {
     void entryCountMatchesSymbolTable() {
         // 少一条意味着某个符号没进映射表 —— 那个符号对应的转换器
         // 在「按名解析」时会被判为未知符号。
-        assertEquals(5, MiliMapping.entries().size(),
-                "映射表应覆盖 MiliSymbol 的全部 5 个符号"
+        assertEquals(8, MiliMapping.entries().size(),
+                "映射表应覆盖 MiliSymbol 的全部 8 个符号"
                         + "（SERVER_TICK / SERVER_TICK_CHILDREN / "
-                        + "CLIENT_LEVEL_TICK / CLIENT_MAIN / SERVER_MAIN）");
+                        + "CLIENT_LEVEL_TICK / CLIENT_TICK / CLIENT_BRAND / "
+                        + "TITLE_SCREEN_INIT / CLIENT_MAIN / SERVER_MAIN）");
+    }
+
+    @Test
+    @DisplayName("MiliSymbol 声明的每个符号常量都在映射表中")
+    void everySymbolConstantIsMapped() {
+        // 数量断言只防「条目总数对不上」；这条断言防的是方向性错误
+        // —— 往 MiliSymbol 加了新常量却忘了同步 MiliMapping。
+        // 那种漏网的症状是：解析该符号时直接抛 UnknownSymbolException，
+        // 而其他符号全部正常 —— 极难一眼看出是映射表漏了。
+        // 逐常量断言让 CI 精确指出是哪一个符号没进表。
+        TargetMethod[] symbols = {
+                MiliSymbol.SERVER_TICK,
+                MiliSymbol.SERVER_TICK_CHILDREN,
+                MiliSymbol.CLIENT_LEVEL_TICK,
+                MiliSymbol.CLIENT_TICK,
+                MiliSymbol.CLIENT_BRAND,
+                MiliSymbol.TITLE_SCREEN_INIT,
+                MiliSymbol.CLIENT_MAIN,
+                MiliSymbol.SERVER_MAIN};
+        for (TargetMethod symbol : symbols) {
+            TargetMethod resolved = MiliMapping.resolveMethod(symbol.toString());
+            assertEquals(symbol, resolved,
+                    "符号必须在映射表中且解析回自身: " + symbol);
+        }
     }
 
     @Test

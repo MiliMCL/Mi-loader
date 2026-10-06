@@ -77,6 +77,8 @@ public final class AnnotationTransformerScanner {
             "minecraft.server.tick_children", MiliSymbol.SERVER_TICK_CHILDREN,
             "minecraft.client.level_tick", MiliSymbol.CLIENT_LEVEL_TICK,
             "minecraft.client.tick", MiliSymbol.CLIENT_TICK,
+            "minecraft.client.brand", MiliSymbol.CLIENT_BRAND,
+            "minecraft.client.title_screen_init", MiliSymbol.TITLE_SCREEN_INIT,
             "minecraft.client.main", MiliSymbol.CLIENT_MAIN,
             "minecraft.server.main", MiliSymbol.SERVER_MAIN);
 
