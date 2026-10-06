@@ -125,14 +125,17 @@ class MinecraftClassLoaderCodeSourceTest {
     }
 
     private static byte[] serverClassBytes() {
-        ClassWriter cw = new ClassWriter(0);
+        // COMPUTE_FRAMES 会重算 maxStack/maxLocals —— 手写 maxLocals 时
+        // 注意实例方法 tickServer(BooleanSupplier) 是 this + 1 参 = 2 槽，
+        // 写 1 会得到 ClassFormatError: Arguments can't fit into locals。
+        ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
         cw.visit(Opcodes.V25, Opcodes.ACC_PUBLIC | Opcodes.ACC_SUPER,
                 TARGET_SLASH, null, "java/lang/Object", null);
         MethodVisitor mv = cw.visitMethod(Opcodes.ACC_PUBLIC, "tickServer",
                 "(Ljava/util/function/BooleanSupplier;)V", null, null);
         mv.visitCode();
         mv.visitInsn(Opcodes.RETURN);
-        mv.visitMaxs(0, 1);
+        mv.visitMaxs(0, 2);
         mv.visitEnd();
         cw.visitEnd();
         return cw.toByteArray();
