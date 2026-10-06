@@ -436,10 +436,17 @@ val launcherScripts = tasks.register("launcherScriptCheck") {
             }
 
             // 规则 2：行尾必须是 CRLF，不允许裸 LF
-            val bareLf = bytes.withIndex().count { (i, b) ->
-                b == 0x0A.toByte() && (i == 0 || bytes[i - 1] != 0x0D.toByte())
+            //
+            // 注意不要用 bytes.windowed(2)：windowed 是 CharSequence 的扩展
+            // 函数，ByteArray 上不存在，用它会让整个 build 脚本编译失败
+            // （连带 compileJava / verifyMinecraftArtifact 等所有任务一起挂）。
+            // 这里直接按下标遍历，避免依赖任何集合扩展。
+            var bareLf = 0
+            var crlf = 0
+            for (i in bytes.indices) {
+                if (bytes[i] != 0x0A.toByte()) continue
+                if (i > 0 && bytes[i - 1] == 0x0D.toByte()) crlf++ else bareLf++
             }
-            val crlf = bytes.windowed(2).count { it[0] == 0x0D.toByte() && it[1] == 0x0A.toByte() }
             if (bareLf > 0) {
                 problems += "${f.asFile.name}: 含 $bareLf 个裸 LF（CRLF 共 $crlf 个）。" +
                     "cmd.exe 要求 CRLF 行尾，否则命令边界解析错乱"
