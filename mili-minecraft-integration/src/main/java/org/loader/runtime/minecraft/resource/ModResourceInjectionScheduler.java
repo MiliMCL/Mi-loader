@@ -150,9 +150,21 @@ public final class ModResourceInjectionScheduler {
     /**
      * Minecraft 客户端是否已构造完成。
      *
-     * <p>判据：{@code resourcePackRepository} 字段已赋值（非 null）。
-     * 它是 {@code final} 且在构造中后段初始化，因此一旦非 null 就说明
-     * 客户端已走过资源管理器构建那一段 —— 那正是我们能安全注入的时机。
+     * <p><b>判据是 {@code gui != null}，不是 {@code resourcePackRepository != null}</b>。
+     *
+     * <p>原因（用户实测 13:57那次）：以 repository 为判据时，注入在 14:10:58
+     * 成功拿到了 repository，于是调用 {@code reloadResourcePacks()}，结果：
+     * <pre>
+     *   NullPointerException: Cannot invoke "net.minecraft.client.Gui.overlay()"
+     *   because "this.gui" is null
+     *     at Minecraft.reloadResourcePacks(Minecraft.java:1079)
+     * </pre>
+     * <p>{@code reloadResourcePacks} 内部第一件事就是读 {@code this.gui.overlay()}，
+     * 而 {@code gui} 在构造器第 634 行才赋值 —— 晚于 {@code resourcePackRepository}
+     * （第 434 行）。所以 repository 就绪时，gui 还没建好。
+     *
+     * <p>{@code gui} 是"客户端能安全重载资源"这条链路上最后一个被赋值的字段，
+     * 拿它当判据才能保证 {@code reloadResourcePacks()} 不踩空。
      */
     private static boolean clientFullyConstructed() {
         Object mc = currentMinecraft();
@@ -162,20 +174,20 @@ public final class ModResourceInjectionScheduler {
         try {
             Class<?> minecraftClass =
                     Reflect.gameClass("net.minecraft.client.Minecraft");
-            java.lang.reflect.Field repo = null;
-            for (Class<?> c = minecraftClass; c != null && repo == null; c = c.getSuperclass()) {
+            java.lang.reflect.Field gui = null;
+            for (Class<?> c = minecraftClass; c != null && gui == null; c = c.getSuperclass()) {
                 for (java.lang.reflect.Field f : c.getDeclaredFields()) {
-                    if (f.getName().equals("resourcePackRepository")) {
-                        repo = f;
+                    if (f.getName().equals("gui")) {
+                        gui = f;
                         break;
                     }
                 }
             }
-            if (repo == null) {
+            if (gui == null) {
                 return false;
             }
-            repo.setAccessible(true);
-            return repo.get(mc) != null;
+            gui.setAccessible(true);
+            return gui.get(mc) != null;
         } catch (ReflectiveOperationException | RuntimeException e) {
             return false;
         }

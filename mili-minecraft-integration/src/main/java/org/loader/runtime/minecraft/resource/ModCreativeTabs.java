@@ -201,20 +201,27 @@ public final class ModCreativeTabs {
             throw new BridgeMismatchException(
                     "BuiltInRegistries.CREATIVE_MODE_TAB is null — version mismatch?");
         }
-        Object registryKey = Reflect.staticField(
-                "net.minecraft.core.registries.Registries", "CREATIVE_MODE_TAB");
-        if (registryKey == null) {
-            throw new BridgeMismatchException(
-                    "Registries.CREATIVE_MODE_TAB is null — version mismatch?");
-        }
+        // 【key 要用注册表自己的 key 工厂，不能用 Registries.CREATIVE_MODE_TAB】
+        //
+        // 26.2 里ResourceKey.create 是静态工厂：
+        //   ResourceKey.create(registry.key(), location)
+        // 而 Registries.CREATIVE_MODE_TAB 是 **ResourceKey<Registry<CreativeModeTab>>**
+        // —— 它是"注册表的 key"，不是"key 的工厂"。
+        //
+        // 【register 是【静态】方法】误当实例方法调用会报
+        //   IllegalArgumentException: wrong number of arguments: 2 expected: 3
+        // 真实签名（Registry 接口第 134 行）：
+        //   static <V,T extends V> T register(Registry<V>, ResourceKey<V>, T)
+        // 静态方法必须以 null 为接收者调用。
         Object id = idClass.getMethod("fromNamespaceAndPath", String.class, String.class)
                 .invoke(null, sanitize(modId), tabId);
+        Object registryKeyObj = registryClass.getMethod("key").invoke(tabRegistry);
         Object key = keyClass.getMethod("create", keyClass, idClass)
-                .invoke(null, registryKey, id);
+                .invoke(null, registryKeyObj, id);
 
         Method register = registryClass.getMethod("register",
                 registryClass, keyClass, Object.class);
-        return register.invoke(tabRegistry, key, tab);
+        return register.invoke(null, tabRegistry, key, tab);
     }
 
     /** 把任意字符串规整成合法的资源路径段。 */
@@ -284,15 +291,16 @@ public final class ModCreativeTabs {
         if (itemRegistry == null) {
             return null;
         }
-        Object registryKey = Reflect.staticField(
-                "net.minecraft.core.registries.Registries", "ITEM");
-        if (registryKey == null) {
-            return null;
-        }
+        // key 用【注册表自己的 key 工厂】生成：
+        //   ResourceKey.create(registry.key(), id)
+        // 不能用 Registries.ITEM —— 那是 ResourceKey<Registry<Item>>，
+        // 把它当"key 的第一参数"传给create 会在运行期抛异常/返回错键。
+        // 同 registerIntoRegistry 里的修正。
         Object id = idClass.getMethod("fromNamespaceAndPath", String.class, String.class)
                 .invoke(null, modId, path);
+        Object registryKeyObj = registryClass.getMethod("key").invoke(itemRegistry);
         Object key = keyClass.getMethod("create", keyClass, idClass)
-                .invoke(null, registryKey, id);
+                .invoke(null, registryKeyObj, id);
         return registryClass.getMethod("getValue", keyClass).invoke(itemRegistry, key);
     }
 

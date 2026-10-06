@@ -305,43 +305,113 @@ public final class ModResourcePacks {
 
     private static Object newLocationInfo(Class<?> locationClass, String modId, Path jar)
             throws ReflectiveOperationException {
-        // PackLocationInfo 在 26.2 是 record，构造器参数需查。
-        // 用 getDeclaredConstructors：record 的构造器虽是 public，
-        // 但用 getDeclared* + setAccessible 更稳，且能匹配到非 public 变体。
+        // 26.2 真实定义（已查反编译源码第 18 行）：
+        //   record PackLocationInfo(String id, Component title, PackSource source,
+        //                          Optional<KnownPack> knownPackInfo)
+        //
+        // 上一版只匹配 (String, String) 与 (String, String, x) 两种形态，
+        // 于是全部落空并抛 "no (String, String[, PackSource]) constructor"。
+        // 第二参是**显示标题 Component**，不是 String。
+        //
+        // 这里不再按位置猜参数，而是【按类型逐个填】：
+        // String → id，Component → 可翻译标题，其余给"安全的缺省值"。
         for (java.lang.reflect.Constructor<?> c : locationClass.getDeclaredConstructors()) {
             Class<?>[] p = c.getParameterTypes();
-            if (p.length == 2 && p[0] == String.class && p[1] == String.class) {
-                c.setAccessible(true);
-                return c.newInstance(idOf(modId), jar.getFileName().toString());
+            if (p.length == 0) {
+                continue;
             }
-            if (p.length == 3 && p[0] == String.class && p[1] == String.class) {
+            Object[] args = new Object[p.length];
+            boolean fillable = true;
+            for (int i = 0; i < p.length; i++) {
+                Class<?> t = p[i];
+                if (t == String.class) {
+                    args[i] = (i == 0) ? idOf(modId) : jar.getFileName().toString();
+                } else if (isComponentType(t)) {
+                    args[i] = translatableOrLiteral("resourcePack." + idOf(modId) + ".name");
+                } else if (t == Optional.class) {
+                    args[i] = Optional.empty();
+                } else if (t.isEnum()) {
+                    args[i] = firstEnumConstant(t);
+                } else if (t == boolean.class) {
+                    args[i] = Boolean.FALSE;
+                } else {
+                    // 未知类型：无法安全构造，放弃这个构造器
+                    fillable = false;
+                    break;
+                }
+            }
+            if (fillable) {
                 c.setAccessible(true);
-                return c.newInstance(idOf(modId), jar.getFileName().toString(), null);
+                return c.newInstance(args);
             }
         }
         throw new BridgeMismatchException(
-                "PackLocationInfo has no (String, String[, PackSource]) constructor."
+                "PackLocationInfo has no constructor whose parameters this binding"
+                        + " knows how to fill."
                         + "\n  Real constructors: " + java.util.Arrays.toString(
                         locationClass.getDeclaredConstructors()));
     }
 
+    /** 是否是 Component 类型（含其实现类）。 */
+    private static boolean isComponentType(Class<?> type) {
+        try {
+            return Reflect.gameClass("net.minecraft.network.chat.Component")
+                    .isAssignableFrom(type);
+        } catch (RuntimeException e) {
+            return "net.minecraft.network.chat.Component".equals(type.getName());
+        }
+    }
+
+    /** {@code Component.literal(String)} —— 拿不到就返回 null 由调用方兜底。 */
+    private static Object translatableOrLiteral(String text) {
+        try {
+            Class<?> component = Reflect.gameClass("net.minecraft.network.chat.Component");
+            return component.getMethod("literal", String.class).invoke(null, text);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            return null;
+        }
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static Object firstEnumConstant(Class<?> enumClass) {
+        Object[] cs = enumClass.getEnumConstants();
+        return cs != null && cs.length > 0 ? cs[0] : null;
+    }
+
     private static Object newSelectionConfig(Class<?> selectionClass)
             throws ReflectiveOperationException {
+        // 26.2 真实定义（已查反编译源码第 8 行）：
+        //   record PackSelectionConfig(boolean required, Pack.Position defaultPosition,
+        //                              boolean fixedPosition)
+        // 上一版按 1~2 参匹配，全部落空。
         for (java.lang.reflect.Constructor<?> c : selectionClass.getDeclaredConstructors()) {
             Class<?>[] p = c.getParameterTypes();
-            // 26.2: PackSelectionConfig(boolean required, Pack.Position position)
-            if (p.length == 2 && p[0] == boolean.class && p[1].isEnum()) {
-                c.setAccessible(true);
-                Object top = enumConstant(p[1], "TOP");
-                return c.newInstance(false, top);
+            if (p.length == 0) {
+                continue;
             }
-            if (p.length == 1 && p[0] == boolean.class) {
+            Object[] args = new Object[p.length];
+            boolean fillable = true;
+            for (int i = 0; i < p.length; i++) {
+                Class<?> t = p[i];
+                if (t == boolean.class) {
+                    // required 与 fixedPosition 都给 false：
+                    // 前者让该包"可选"，后者允许玩家在界面里移动它
+                    args[i] = Boolean.FALSE;
+                } else if (t.isEnum()) {
+                    args[i] = enumConstant(t, "TOP");
+                } else {
+                    fillable = false;
+                    break;
+                }
+            }
+            if (fillable) {
                 c.setAccessible(true);
-                return c.newInstance(false);
+                return c.newInstance(args);
             }
         }
         throw new BridgeMismatchException(
-                "PackSelectionConfig has no recognised constructor. Real: "
+                "PackSelectionConfig has no constructor whose parameters this binding"
+                        + " knows how to fill. Real: "
                         + java.util.Arrays.toString(selectionClass.getDeclaredConstructors()));
     }
 
