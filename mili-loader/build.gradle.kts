@@ -498,7 +498,11 @@ tasks.named("build") { dependsOn(launcherScripts) }
 // 设计文档），实现以本处为准。两处逻辑故意保持独立、互不复用：
 // CI 里还有一份纯 shell 实现，两套独立实现必须同时通过才算干净。
 
-val distributionBoundaryCheck by tasks.registering {
+// 用 register("name") { } 而非 `by tasks.registering`：
+// 后者在 Gradle 9.6 已废弃（CI 用9.7.1 会打 deprecation 警告）。
+// 注意不要用 `by tasks.register(...)` 的委托形式 —— 那个的 getValue 也已废弃，
+// 正确写法是让 register() 直接返回值。
+val distributionBoundaryCheck = tasks.register("distributionBoundaryCheck") {
     group = "verification"
     description = "扫描分发产物，确保不包含任何 Minecraft 类、源码或数据（Mojang 分发边界红线）"
 
@@ -558,7 +562,7 @@ val distributionBoundaryCheck by tasks.registering {
         // ── 1. 检查 fat JAR 内部条目 ───────────────────────────────────────
         if (fatJar.exists()) {
             logger.lifecycle("[Boundary] 扫描平台 JAR: ${fatJar.name}")
-            java.util.zip.ZipFile(fatJar).use { zf ->
+            ZipFile(fatJar).use { zf ->
                 val entries = zf.entries()
                 var entryCount = 0
                 while (entries.hasMoreElements()) {

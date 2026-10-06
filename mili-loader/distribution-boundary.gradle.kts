@@ -6,7 +6,7 @@ import java.util.zip.ZipFile
  * ============================================================================
  *
  * 校验任务的<b>实现已内联</b>进 build.gradle.kts 的
- * `val distributionBoundaryCheck by tasks.registering { ... }`。
+ * `val distributionBoundaryCheck = tasks.register("distributionBoundaryCheck") { ... }`。
  * 保留本文件仅作为规则的设计文档。
  *
  * 为什么不继续用脚本文件引入：原来靠
