@@ -129,15 +129,16 @@ public final class ModCreativeTabs {
                     .invoke(builder, newIconSupplier(modId, blockIds.get(0)));
 
             // displayItems：把所有方块物品加进这个标签
+            //
+            // 【同 icon，必须用 Proxy 而非 lambda】
+            // DisplayItemsGenerator 是双参函数式接口，形参类型是
+            // (ItemDisplayParameters, Output)。传 BiConsumer<Object,Object>
+            // 会在 invoke 时抛 IllegalArgumentException: argument type mismatch
+            // —— javac 按声明类型检查，lambda 实现类与期望的接口类型不匹配。
             builderClass.getMethod("displayItems",
                             Reflect.gameClass(
                                     "net.minecraft.world.item.CreativeModeTab$DisplayItemsGenerator"))
-                    .invoke(builder, (java.util.function.BiConsumer<Object, Object>)
-                            (parameters, output) -> {
-                                for (String path : blockIds) {
-                                    addBlockItem(modId, path, output);
-                                }
-                            });
+                    .invoke(builder, newDisplayItemsGenerator(modId, blockIds));
 
             Object tab = builderClass.getMethod("build").invoke(builder);
             return registerIntoRegistry(modId, tabId, tab);
@@ -237,18 +238,22 @@ public final class ModCreativeTabs {
             if (item == null) {
                 return;
             }
-            Object stack = newItemStack(item);
-            if (stack == null) {
-                return;
-            }
+            Class<?> outputIface = Reflect.gameClass(
+                    "net.minecraft.world.item.CreativeModeTab$Output");
             Class<?> visibilityClass = Reflect.gameClass(
                     "net.minecraft.world.item.CreativeModeTab$TabVisibility");
-            // Output.accept(ItemStack, TabVisibility)
-            output.getClass()
-                    .getMethod("accept",
-                            Reflect.gameClass("net.minecraft.world.item.ItemStack"),
-                            visibilityClass)
-                    .invoke(output, stack, enumOf(visibilityClass, "PARENT_AND_SEARCH_TABS"));
+
+            // 【在接口上取方法，而不是实现类】
+            // output 的运行时类是游戏为lambda 生成的合成类，
+            // 对它 getMethod("accept", ...) 虽然能拿到，但合成类的可见性
+            // 不受我们控制；接口上的方法签名是稳定的定义。
+            // 另用 Output.accept(ItemLike, TabVisibility) 重载 ——
+            // 它内部自己 new ItemStack，省一层手工构造。
+            Method accept = outputIface.getMethod("accept",
+                    Reflect.gameClass("net.minecraft.world.item.ItemLike"),
+                    visibilityClass);
+            accept.invoke(output, item,
+                    enumOf(visibilityClass, "PARENT_AND_SEARCH_TABS"));
         } catch (ReflectiveOperationException | RuntimeException e) {
             LOG.log(Level.FINE, "Cannot add " + modId + ":" + path
                     + " to creative tab", e);
@@ -289,6 +294,30 @@ public final class ModCreativeTabs {
         Object key = keyClass.getMethod("create", keyClass, idClass)
                 .invoke(null, registryKey, id);
         return registryClass.getMethod("getValue", keyClass).invoke(itemRegistry, key);
+    }
+
+    /** 造出实现游戏 {@code DisplayItemsGenerator} 的代理。 */
+    private static Object newDisplayItemsGenerator(String modId,
+                                                   java.util.List<String> blockIds) {
+        Class<?> genClass = Reflect.gameClass(
+                "net.minecraft.world.item.CreativeModeTab$DisplayItemsGenerator");
+        return java.lang.reflect.Proxy.newProxyInstance(
+                Reflect.gameClassLoader(),
+                new Class<?>[]{genClass},
+                (proxy, method, args) -> {
+                    if ("accept".equals(method.getName()) && args != null && args.length == 2) {
+                        for (String path : blockIds) {
+                            addBlockItem(modId, path, args[1]);
+                        }
+                        return null;
+                    }
+                    return switch (method.getName()) {
+                        case "toString" -> "MiliCreativeTabItems(" + modId + ")";
+                        case "hashCode" -> System.identityHashCode(proxy);
+                        case "equals" -> proxy == (args != null ? args[0] : null);
+                        default -> null;
+                    };
+                });
     }
 
     /** 造出实现游戏 {@code Supplier} 的代理对象。 */

@@ -162,13 +162,20 @@ public final class ModResourcePacks {
      * 给 {@code PackRepository} 追加一个 {@code RepositorySource}。
      *
      * <p>{@code PackRepository} 没有公开的 addSource，只有构造器接受
-     * 变长 {@code RepositorySource}。这里反射取出其内部的 sources 集合并
-     * 追加。
+     * 变长 {@code RepositorySource}。
      *
-     * <p><b>字段类型是 {@code Set<RepositorySource>} 而非 List</b>
-     * （已查反编译源码第 36 行：{@code private final Set<RepositorySource> sources;}）。
-     * 上一版按 List 找字段，结果永远返回 null，报的还是
-     * 「has no 'sources' field」——把类型不匹配说成了字段不存在。
+     * <p><b>关键：那个集合是不可变的，且字段是 final</b>。
+     * 26.2 构造器里是：
+     * <pre>
+     *   this.sources = ImmutableSet.copyOf((Object[]) sources);
+     * </pre>
+     * 所以 {@code add()} 必然抛 {@code UnsupportedOperationException}
+     * （Guava 的 ImmutableCollection.add 直接 throw），
+     * 而字段又是 {@code final}，不能改内容。
+     *
+     * <p><b>正确做法</b>：造一个「原有全部 + 新的」的可变 Set，
+     * 再用 {@code Field.set} 整个替换掉final 字段。
+     * 这样不必与不可变集合较劲，也不依赖任何未公开的写入口。
      */
     private static void addRepositorySource(Object repository, String modId, Path modJar)
             throws ReflectiveOperationException {
@@ -178,32 +185,27 @@ public final class ModResourcePacks {
         java.lang.reflect.Field sourcesField = findSourcesField(repository.getClass());
         if (sourcesField == null) {
             throw new BridgeMismatchException(
-                    "PackRepository has no mutable 'sources' collection."
+                    "PackRepository has no 'sources' collection field."
                             + "\n  Looked for a field named 'sources' of type List or Set;"
                             + " real fields: " + describeFields(repository.getClass())
                             + "\n  This is a binding-layer bug, not a mod bug.");
         }
         sourcesField.setAccessible(true);
-        Object value = sourcesField.get(repository);
+        Object original = sourcesField.get(repository);
 
-        // 26.2 是 Set（构造器用 Stream.of(sources).collect(...) 收集）
-        if (value instanceof java.util.Set<?> set) {
-            @SuppressWarnings("unchecked")
-            java.util.Set<Object> mutable = (java.util.Set<Object>) set;
-            mutable.add(source);
-            LOG.fine("Appended RepositorySource for " + modId
-                    + " to existing PackRepository.sources (Set)");
-        } else if (value instanceof List<?> list) {
-            @SuppressWarnings("unchecked")
-            List<Object> mutable = (List<Object>) list;
-            mutable.add(source);
-            LOG.fine("Appended RepositorySource for " + modId
-                    + " to existing PackRepository.sources (List)");
-        } else {
-            throw new BridgeMismatchException(
-                    "PackRepository.sources is " + (value == null ? "null" : value.getClass())
-                            + " — expected a List or Set. The binding layer needs updating.");
+        // 造新集合：原有全部 + 新的
+        java.util.Set<Object> merged = new java.util.LinkedHashSet<>();
+        if (original instanceof java.util.Collection<?> coll) {
+            merged.addAll(coll);
         }
+        merged.add(source);
+
+        // 整体替换 final 字段。final 只约束「正常赋值」，反射写入仍可生效
+        // —— 这是 Java 反射的既定行为，也是此路可行的原因。
+        sourcesField.set(repository, merged);
+        LOG.info("Added RepositorySource for '" + modId
+                + "' to PackRepository (replaced final field, "
+                + (original == null ? 0 : merged.size() - 1) + " existing source(s))");
     }
 
     /** 列出实际字段名与类型，用于诊断信息。 */
