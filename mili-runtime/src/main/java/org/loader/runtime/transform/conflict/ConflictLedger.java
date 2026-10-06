@@ -151,7 +151,8 @@ public final class ConflictLedger {
                  BEFORE_FIELD_SET -> true;
             case HEAD, RETURN,
                  REDIRECT, REPLACE_FIELD_ACCESS,
-                 MODIFY_ARG, MODIFY_RETURN, OVERWRITE -> false;
+                 MODIFY_ARG, MODIFY_RETURN, MODIFY_CONSTANT,
+                 OVERWRITE -> false;
         };
     }
 

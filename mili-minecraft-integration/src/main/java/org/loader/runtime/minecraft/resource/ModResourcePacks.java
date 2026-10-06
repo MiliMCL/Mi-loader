@@ -49,7 +49,7 @@ import java.util.zip.ZipFile;
  *       PackResources openFull(PackLocationInfo, Pack$Metadata);
  *   }
  *   class Pack {
- *       Pack(PackLocationInfo, ResourcesSupplier, PackType, PackSelectionConfig);
+ *       Pack(PackLocationInfo, ResourcesSupplier, Metadata, PackSelectionConfig);
  *   }
  *   interface PackResources {                       ← 13 个方法必须实现
  *       PackLocationInfo location();
@@ -121,7 +121,18 @@ public final class ModResourcePacks {
             // 让游戏重新加载资源：PackRepository 变更后必须显式 reload，
             // 否则新资源包不会进入 ReloadableResourceManager。
             reloadResources(minecraft);
-            LOG.info("Injected resources for mod '" + modId + "' from " + modJar.getFileName());
+
+            // 【如实报告，不做过度承诺】
+            // 上面两步只保证"源已注册"和"已请求重载"，
+            // 并不保证包真的被打开 —— 那要等游戏在 reload 里
+            // discoverAvailable → rebuildSelected → openAllSelected 走完。
+            // 上一版在这里打 "Injected resources ..." 让人以为成功了，
+            // 而实际上 newPack 可能返回 null（连一个包都没产出）。
+            // 真正的判据是下一次 loadPacks 里打出 "produced 1 pack"。
+            LOG.info("Registered resource source for mod '" + modId
+                    + "' and requested a resource reload. Confirm it took effect by"
+                    + " looking for \"loadPacks produced 1 pack for '" + modId + "'\""
+                    + " and the ABSENCE of any Missing model warnings.");
         } catch (ReflectiveOperationException | RuntimeException e) {
             // 资源注入失败不该阻止游戏启动 —— 游戏能跑，只是 Mod 缺贴图。
             //
@@ -259,6 +270,14 @@ public final class ModResourcePacks {
                         Object pack = newPack(modId, modJar);
                         if (pack != null) {
                             consumer.accept(pack);
+                            LOG.info("loadPacks produced 1 pack for '" + modId + "'");
+                        } else {
+                            // 绝不能静默：newPack 失败时若什么都不做，
+                            // 现象是"资源源已注册但资源永远不加载"，
+                            // 从日志上看不出任何异常。
+                            LOG.severe("loadPacks produced NO pack for '" + modId
+                                    + "' — this mod's resources will NOT be visible."
+                                    + " See the exception above for the real cause.");
                         }
                         return null;
                     }
@@ -267,40 +286,97 @@ public final class ModResourcePacks {
     }
 
     /**
-     * 构造 {@code Pack}：优先走游戏自己的
-     * {@code Pack.readMetaAndCreate(...)}，让它解析 pack.mcmeta；
-     * 解析失败时退回到直接构造一个最小可用包。
+     * 构造 {@code Pack}。
+     *
+     * <p><b>26.2 真实构造器</b>（已查反编译源码第 45 行）：
+     * <pre>
+     *   public Pack(PackLocationInfo location,
+     *               ResourcesSupplier resources,
+     *               Metadata metadata,          ← 不是 PackType！
+     *               PackSelectionConfig selectionConfig)
+     * </pre>
+     *
+     * <p>上一版把第 3 参填成了 {@code PackType}，于是
+     * {@code getDeclaredConstructor} 抛 NoSuchMethodException → 被 catch吞掉 →
+     * {@code loadPacks} 收到 null 而什么都不产出。日志里"3 existing source(s)"
+     * 正是在说"源加进去了，但一个包都没产出"。
+     *
+     * <p>两个必须同时满足的条件（否则包形同虚设）：
+     * <ol>
+     *   <li><b>selectionConfig.required = true</b> ——
+     *       {@code rebuildSelected} 只把 {@code isRequired()} 的包放进 selected，
+     *       而 {@code openAllSelected()} 只遍历 selected。required=false 的包
+     *       即使被 {@code discoverAvailable} 发现，也<b>永远不会被打开</b>；</li>
+     *   <li><b>metadata 非 null</b> —— {@code open()} 走
+     *       {@code openFull(location, metadata)}，且 {@code getCompatibility()}
+     *       读 {@code metadata.compatibility()}；null 会直接 NPE。</li>
+     * </ol>
      */
     private static Object newPack(String modId, Path modJar) {
         try {
             Class<?> packClass = Reflect.gameClass(REPO + "Pack");
             Class<?> supplierIface = Reflect.gameClass(REPO + "Pack$ResourcesSupplier");
-            Class<?> packTypeClass = Reflect.gameClass(PACKS + "PackType");
             Class<?> selectionClass = Reflect.gameClass(PACKS + "PackSelectionConfig");
             Class<?> locationClass = Reflect.gameClass(PACKS + "PackLocationInfo");
+            Class<?> metadataClass = Reflect.gameClass(REPO + "Pack$Metadata");
 
             Object supplier = newResourcesSupplier(supplierIface, modId, modJar);
-            Object clientResources = packTypeClass.getField("CLIENT_RESOURCES").get(null);
-
             Object location = newLocationInfo(locationClass, modId, modJar);
-
-            // PackSelectionConfig 是 record，构造器签名需现场查
+            Object metadata = newPackMetadata(metadataClass, modId);
             Object selection = newSelectionConfig(selectionClass);
 
-            // 用 getDeclaredConstructor + setAccessible：Pack 的 4 参构造器
-            // 不是 public（字节码里它是包级/受保护的），getConstructor 会
-            // 抛 NoSuchMethodException 而那与「版本不匹配」无关，容易误导。
             java.lang.reflect.Constructor<?> ctor =
                     packClass.getDeclaredConstructor(locationClass, supplierIface,
-                            packTypeClass, selectionClass);
+                            metadataClass, selectionClass);
             ctor.setAccessible(true);
-            return ctor.newInstance(location, supplier, clientResources, selection);
+            Object pack = ctor.newInstance(location, supplier, metadata, selection);
+            LOG.info("Built resource pack '" + idOf(modId) + "' (required=true)");
+            return pack;
         } catch (ReflectiveOperationException | RuntimeException e) {
             LOG.log(Level.WARNING,
                     "Cannot build resource Pack for mod '" + modId
-                            + "'. Its models/textures will be missing.", e);
+                            + "'. Its models/textures will be missing."
+                            + "\n  Real constructor: " + describePackConstructor(), e);
             return null;
         }
+    }
+
+    /** 把 Pack 真实构造器打进日志，避免下次再靠猜。 */
+    private static String describePackConstructor() {
+        try {
+            return java.util.Arrays.toString(Reflect.gameClass(REPO + "Pack")
+                    .getDeclaredConstructors());
+        } catch (RuntimeException e) {
+            return "<unavailable>";
+        }
+    }
+
+    /**
+     * 构造 {@code Pack.Metadata}。
+     *
+     * <p>真实定义（第 159 行）：
+     * {@code record Metadata(Component description, PackCompatibility compatibility,
+     * FeatureFlagSet requestedFeatures, List<String> overlays)}
+     *
+     * <p>compatibility 取枚举常量 {@code COMPATIBLE}（Mod 资源不需要版本协商），
+     * requestedFeatures 取 {@code FeatureFlagSet.of()}（不请求任何特性旗标）。
+     */
+    private static Object newPackMetadata(Class<?> metadataClass, String modId)
+            throws ReflectiveOperationException {
+        Class<?> componentClass = Reflect.gameClass("net.minecraft.network.chat.Component");
+        Class<?> compatibilityClass =
+                Reflect.gameClass(REPO + "PackCompatibility");
+        Class<?> flagSetClass = Reflect.gameClass("net.minecraft.world.flag.FeatureFlagSet");
+
+        Object description = componentClass.getMethod("translatable", String.class)
+                .invoke(null, "resourcePack." + idOf(modId) + ".name");
+        Object compatibility = compatibilityClass.getField("COMPATIBLE").get(null);
+        Object flags = flagSetClass.getMethod("of").invoke(null);
+
+        java.lang.reflect.Constructor<?> ctor = metadataClass.getDeclaredConstructor(
+                componentClass, compatibilityClass, flagSetClass, java.util.List.class);
+        ctor.setAccessible(true);
+        return ctor.newInstance(description, compatibility, flags, java.util.List.of());
     }
 
     private static Object newLocationInfo(Class<?> locationClass, String modId, Path jar)
@@ -394,9 +470,20 @@ public final class ModResourcePacks {
             for (int i = 0; i < p.length; i++) {
                 Class<?> t = p[i];
                 if (t == boolean.class) {
-                    // required 与 fixedPosition 都给 false：
-                    // 前者让该包"可选"，后者允许玩家在界面里移动它
-                    args[i] = Boolean.FALSE;
+                    // 【required 必须是 true —— 这是最致命的一处】
+                    //
+                    // PackRepository.rebuildSelected（第 96 行）：
+                    //   if (!pack.isRequired() || selectedAndPresent.contains(pack)) continue;
+                    // 只有 required 的包才会被自动插入 selected；
+                    // 而 openAllSelected() 只遍历 selected。
+                    //
+                    // 也就是说：required=false 的包即使被 discoverAvailable 发现、
+                    // 即使文件都在，也<b>永远不会被打开</b> —— 游戏完全看不到它。
+                    // 这类"资源全对但就是不生效"的静默失败，极难从日志发现。
+                    //
+                    // 第二个 boolean 是 fixedPosition（界面里是否锁定位置），
+                    // 那个保持 false 无妨。
+                    args[i] = Boolean.TRUE;
                 } else if (t.isEnum()) {
                     args[i] = enumConstant(t, "TOP");
                 } else {

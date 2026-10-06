@@ -900,3 +900,76 @@ if (Arrays.equals(current, original)) {
 （`generatedBytecodeReferencesCallbackOwner`），
 且修复需要新增「回调 id →实际回调」的分发表，
 属于独立的一次重构。已记为待办。
+
+## 10. 第三阶段交付：回调能力扩充
+
+本节记录四项回调能力的最终语义：**可取消注入**、**MODIFY_CONSTANT**、
+**实例上下文**与**实参捕获**。前三者的实现细节见 `InjectionMethodVisitor`
+的 Javadoc；这里只写实参捕获 —— 它是唯一改变了「回调签名语言」的能力。
+
+### 10.1 实参捕获（typed positional capture）
+
+回调签名从「`()` 或 `(ctx)`」扩展为：
+
+```
+[ InjectionContext ] + 目标实参前缀
+```
+
+例如目标 `tickServer(BooleanSupplier)` 的全部合法回调形态：
+
+| 回调签名 | 语义 |
+|---|---|
+| `()V` | 无参 |
+| `(InjectionContext)` | 上下文 |
+| `(BooleanSupplier)` | 捕获第 0 个实参 |
+| `(ctx, BooleanSupplier)` | 上下文 + 捕获 |
+
+**规则（扫描器 `validateArgCapture` 与引擎 `emitCapturedArguments`
+双重强制）：**
+
+1. **仅 HEAD / RETURN / MODIFY_RETURN 允许捕获**。只有锚定宿主方法
+   本身的注入点对「宿主局部变量槽里的实参」有定义良好的读取时机；
+   调用点类注入锚定方法体内的调用，宿主实参与栈上暂存的调用实参
+   混在一起，参数序号有歧义 —— 直接拒绝而非定义一套优先级。
+2. **按位严格相等（描述符比较）**：`int ≠ java.lang.Integer`（禁装箱）、
+   禁子类。捕获的实现是从宿主局部变量槽发射 `xLOAD` —— 槽里是什么就
+   加载什么，没有转换的插入点；允许子类就意味着引入隐式
+   `checkcast`（Mixin 泛型擦除的坑）或运行期 CCE 指向 Minecraft。
+3. **必须构成前缀**：从第 0 个实参起连续声明。捕获参数的槽位由
+   声明位置决定，前缀规则让「签名即文档」成立 —— 读者能从
+   `(ctx, int x)` 直接看出 `x` 是目标第 1 个实参。
+
+**无注解属性是刻意的**：捕获完全由回调签名推断。未来扩展捕获能力
+（如命名捕获、绑定捕获）时新增注解属性即为非破坏性 ABI 变更；
+反过来，若一开始就用属性声明捕获个数，签名就成了摆设。
+
+**槽位计算**（`InjectionMethodVisitor.emitCapturedArguments`）：
+实例方法 `this` 占槽 0，static 从 0 开始；`long`/`double` 占双槽，
+第 i 个实参的槽位 = 基础偏移 + 前面所有实参的 `Type#getSize()` 之和。
+宽类型在中间（如 `mix(int, long, double, String)` 的 `double` 在槽 3）
+是「每参数 +1」算法必然算错的位置 —— 测试
+`wideTypesAdvanceDoubleSlots` 专守此处。
+
+**读取语义（文档化）**：捕获读取的是**触发时刻**局部变量槽的当前值。
+
+- `HEAD` —— 方法体尚未执行，即**入口值**；
+- `RETURN` / `MODIFY_RETURN` —— 方法体已执行；若方法体重写过参数槽
+  （`a = a + 1`），读到的是**重写后的当前值**。参数槽不会被 javac
+  复用给其他局部变量（参数作用域是整个方法体），因此该值总是良定义的。
+
+测试 `slotMutationSemantics` 用 `bump(int a) { a = a + 1; return a; }`
+同时锁定两个语义：HEAD 捕获到 5（入口值），RETURN 捕获到 6（当前值）。
+
+**加载期报错形态**：类型不匹配的错误信息包含捕获位序号、期望与实际
+描述符、目标方法坐标与「禁装箱/子类/前缀」规则说明 —— 由扫描器在
+反射阶段抛出，绝不推迟到 `VerifyError` 指向 Minecraft。引擎对绕过
+扫描器的编程式路径（直接构造 `MethodInjection`）做同样的逐位校验。
+
+### 10.2 第三阶段交付清单
+
+| 能力 | ABI | 引擎 | 测试 |
+|---|---|---|---|
+| 可取消注入（HEAD / BEFORE_INVOKE） | `MiliInject#cancellable`、`InjectionContext#cancel` | `emitCancellableCallback`、`emitCancellableBeforeInvoke` | `CancellableAndConstantTest` |
+| MODIFY_CONSTANT | `MiliInject#constant` | `visitLdcInsn` / `matchConstant` | 同上 |
+| 实例上下文（`ctx.target()`） | `InjectionContext#target` | `emitContextArgument`（三参工厂） | 同上 |
+| 实参捕获 | `MiliInject` Javadoc（签名语言） | `emitCapturedArguments` | `ArgCaptureTest` |

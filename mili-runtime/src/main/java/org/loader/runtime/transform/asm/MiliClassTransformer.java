@@ -66,8 +66,36 @@ public final class MiliClassTransformer extends ClassVisitor {
             String replacementDescriptor,
             boolean replacementStatic,
             String transformerId,
-            int priority
+            int priority,
+            /** 是否生成取消分支（仅 HEAD / BEFORE_INVOKE 合法，注册期校验）。 */
+            boolean cancellable,
+            /** MODIFY_CONSTANT 要匹配的常量值（字符串形式，按回调返回类型解析）。 */
+            String constant
     ) {
+
+        /**
+         * 兼容构造器 —— 12 参形式，等价于不可取消、无常量修改。
+         *
+         * <p>保留它是因为 {@code MethodInjection} 在测试与平台转换器中
+         * 有大量既有构造点；新代码应使用 14 参规范构造器。
+         */
+        public MethodInjection(
+                TargetMethod target,
+                TargetField field,
+                InjectionPoint point,
+                String callbackDescriptor,
+                TargetInvocation invocation,
+                int argIndex,
+                String replacementOwner,
+                String replacementName,
+                String replacementDescriptor,
+                boolean replacementStatic,
+                String transformerId,
+                int priority) {
+            this(target, field, point, callbackDescriptor, invocation, argIndex,
+                    replacementOwner, replacementName, replacementDescriptor,
+                    replacementStatic, transformerId, priority, false, null);
+        }
 
         /**
          * REDIRECT 的替换目标是否为静态方法。

@@ -104,6 +104,59 @@ public final class MiliSymbol {
             "tick",
             "(Ljava/util/function/BooleanSupplier;)V");
 
+    /**
+     * 客户端主循环 tick —— 与世界是否加载无关，每客户端 tick 一次。
+     *
+     * <p>坐标经 26.2 反编译源核实：
+     * <pre>
+     * net.minecraft.client.Minecraft#tick()V
+     * </pre>
+     *
+     * <p>与 {@link #CLIENT_LEVEL_TICK} 的分工：后者只在世界存在时走，
+     * 适合世界相关逻辑；本符号是按键轮询、全局 UI 状态这类
+     * 「无论在不在游戏里都要跑」的逻辑的锚点。
+     */
+    public static final TargetMethod CLIENT_TICK = TargetMethod.of(
+            "net/minecraft/client/Minecraft",
+            "tick",
+            "()V");
+
+    // ── 客户端标识与主界面 ─────────────────────────────────────────────────
+
+    /**
+     * 客户端品牌查询 —— F3 调试屏与服务器握手所用的 mod 名称来源。
+     *
+     * <p>坐标经 26.2 反编译源核实：
+     * <pre>
+     * net.minecraft.client.ClientBrandRetriever#getClientModName()Ljava/lang/String;
+     * </pre>
+     *
+     * <p>原版实现恒返回 {@code "vanilla"}，因此 F3 显示「原版客户端」。
+     * 平台转换器（{@code MiliClientBrandTransformer}）用 MODIFY_RETURN
+     * 把返回值替换为 {@code "Mili-loader"} —— 这同时修正了 F3 显示与
+     * {@code ModCheck} 的 modded 判定（服务端握手品牌也随之一致）。
+     */
+    public static final TargetMethod CLIENT_BRAND = TargetMethod.of(
+            "net/minecraft/client/ClientBrandRetriever",
+            "getClientModName",
+            "()Ljava/lang/String;");
+
+    /**
+     * 主界面初始化 —— 向主菜单注入「Mods」按钮的锚点。
+     *
+     * <p>坐标经 26.2 反编译源核实：
+     * <pre>
+     * net.minecraft.client.gui.screens.TitleScreen#init()V
+     * </pre>
+     *
+     * <p>HEAD 注入一个静态回调，由分发器反射在当前 TitleScreen 上添加
+     * 按钮；点击后用原版 {@code AlertScreen} 展示已加载的 mod 列表。
+     */
+    public static final TargetMethod TITLE_SCREEN_INIT = TargetMethod.of(
+            "net/minecraft/client/gui/screens/TitleScreen",
+            "init",
+            "()V");
+
     // ── 引导 ───────────────────────────────────────────────────────────────
 
     /**
@@ -140,6 +193,8 @@ public final class MiliSymbol {
      * 而不是让引擎抛「目标不存在」。
      */
     public static boolean isClientOnly(TargetMethod symbol) {
-        return CLIENT_LEVEL_TICK.equals(symbol) || CLIENT_MAIN.equals(symbol);
+        return CLIENT_LEVEL_TICK.equals(symbol) || CLIENT_MAIN.equals(symbol)
+                || CLIENT_TICK.equals(symbol)
+                || CLIENT_BRAND.equals(symbol) || TITLE_SCREEN_INIT.equals(symbol);
     }
 }

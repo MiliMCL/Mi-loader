@@ -30,7 +30,19 @@ public final class InjectionContext {
     private final ExecutionContext executionContext;
     private final Object runtime;
     private final Thread executingThread;
+    /**
+     * 被注入方法的宿主实例（{@code this}）。
+     *
+     * <p>静态方法上为 {@code null}。类型是 {@code Object} —— ABI 不能
+     * 出现任何 Minecraft 类坐标，Mod 侧自行处理（反射或 instanceof）。
+     */
+    private final Object target;
+    /** 是否允许 {@link #cancel()}；由引擎按注入点合法性装配。 */
+    private final boolean cancellable;
+    /** 取消标志 —— 仅在 {@link #cancellable} 时有意义。 */
+    private volatile boolean cancelled;
 
+    /** 兼容构造器：无实例上下文、不可取消。 */
     public InjectionContext(
             String className,
             String methodName,
@@ -40,6 +52,21 @@ public final class InjectionContext {
             ExecutionContext executionContext,
             Object runtime,
             Thread executingThread) {
+        this(className, methodName, modId, tickId, tickContract,
+                executionContext, runtime, executingThread, null, false);
+    }
+
+    public InjectionContext(
+            String className,
+            String methodName,
+            String modId,
+            long tickId,
+            Object tickContract,
+            ExecutionContext executionContext,
+            Object runtime,
+            Thread executingThread,
+            Object target,
+            boolean cancellable) {
         this.className = className;
         this.methodName = methodName;
         this.modId = modId;
@@ -53,6 +80,8 @@ public final class InjectionContext {
                 ? executionContext : ExecutionContext.single();
         this.runtime = runtime;
         this.executingThread = executingThread;
+        this.target = target;
+        this.cancellable = cancellable;
     }
 
     /** 被注入的方法所属类（点分名，供人类阅读）。 */
@@ -122,6 +151,45 @@ public final class InjectionContext {
     /** 执行该回调的线程 —— 应当恒为 Minecraft 主线程。 */
     public Thread executingThread() {
         return executingThread;
+    }
+
+    /**
+     * 被注入方法的宿主实例（等价于目标方法里的 {@code this}）。
+     *
+     * <p>目标方法是静态方法时返回 {@code null}。构造器（{@code <init>}）
+     * 上的注入也返回 {@code null} —— JVM 禁止把未初始化的 {@code this}
+     * 传给外部方法，引擎不会冒险生成那种字节码。
+     */
+    public Object target() {
+        return target;
+    }
+
+    /**
+     * 取消目标方法的后续执行。
+     *
+     * <h2>语义边界</h2>
+     * 取消只在引擎为其生成了取消分支的注入点上有效：
+     * {@code HEAD}（方法立即返回）与 {@code BEFORE_INVOKE}（跳过被锚定的调用）。
+     * 在不可取消的上下文上调用本方法会抛
+     * {@link IllegalStateException} —— 静默无效会让 Mod 以为拦截成功，
+     * 这是最危险的失效形态。
+     *
+     * <p>重复调用与「取消后继续改状态」都不报错：取消是幂等的标志位。
+     */
+    public void cancel() {
+        if (!cancellable) {
+            throw new IllegalStateException(
+                    "此 InjectionContext 不可取消 —— 只有在 @MiliInject("
+                            + "cancellable = true) 且注入点为 HEAD/BEFORE_INVOKE 时"
+                            + "cancel() 才有效。静默忽略取消请求会让 Mod 误判"
+                            + "拦截已成功。");
+        }
+        cancelled = true;
+    }
+
+    /** 引擎生成的取消分支读取此标志；Mod 侧一般无需调用。 */
+    public boolean isCancelled() {
+        return cancelled;
     }
 
     @Override

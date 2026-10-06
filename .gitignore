@@ -23,3 +23,4 @@ dist-out
 # 启动脚本的本机配置：内含 username 与 accessToken 明文，
 # 属于每个用户自己的凭据，既不该提交也不该随分发包分发。
 mili-loader/distribution/bin/mili-loader.cfg
+.workbuddy

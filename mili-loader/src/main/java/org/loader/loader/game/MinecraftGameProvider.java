@@ -1,17 +1,29 @@
 package org.loader.loader.game;
 
+import org.loader.api.VersionInfo;
+import org.loader.api.transform.TransformationEnvironment;
+import org.loader.api.transform.symbol.MiliSymbol;
 import org.loader.loader.discovery.LibraryResolver;
 import org.loader.loader.classloader.MinecraftClassLoader;
+import org.loader.loader.classloader.ModClassLoader;
 import org.loader.loader.classloader.ModClassLoaderManager;
 import org.loader.loader.config.LoaderConfig;
 import org.loader.loader.discovery.MinecraftDiscovery;
 import org.loader.loader.hook.EntryPointHook;
+import org.loader.loader.transform.ClassTransformInterceptor;
 import org.loader.runtime.RuntimeEnvironment;
 import org.loader.runtime.kernel.Runtime;
+import org.loader.runtime.minecraft.client.TitleScreenDispatch;
+import org.loader.runtime.minecraft.transform.MiliClientBrandTransformer;
+import org.loader.runtime.minecraft.transform.MiliTickTransformer;
+import org.loader.runtime.minecraft.transform.MiliTitleScreenTransformer;
+import org.loader.runtime.transform.engine.TransformerPipeline;
+import org.loader.runtime.transform.engine.TransformerRegistry;
 import org.loader.loader.PlatformLog;
 
 import java.net.URL;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -180,9 +192,126 @@ public class MinecraftGameProvider implements GameProvider {
         // Logger.getLogger() 会自行初始化并挂上文件 appender。
         PlatformLog.enableFileLogging();
 
+        // ── 装配字节码转换管线（必须在任何 Minecraft 类被加载之前） ──────
+        //
+        // 【根因记录】此前生产启动路径从未装配 TransformerPipeline /
+        // ClassTransformInterceptor —— 它们只存在于测试里。于是
+        // MinecraftClassLoader 以纯 URLClassLoader 运行，全部平台
+        // 转换器（tick 接线、品牌替换、主界面注入）在生产中一次都没
+        // 执行过，且日志无任何报错：又一次静默失效。
+        //
+        // 表现就是用户报告的两个症状：
+        //   1. F3 显示原版客户端（ClientBrandRetriever 未被替换）；
+        //   2. 主界面没有 mod 列表入口（TitleScreen#init 未被注入）。
+        //
+        // 时机：canLoad() 在 createGameClassLoader 里已定义过入口类
+        //（不在转换目标内，无碍）；此后所有 net.minecraft.* 类都必须
+        // 在拦截器就位后才加载 —— registerCreativeTabs 等 Mod 注册
+        // 动作发生在 hook.invokeMinecraftMain 内部，晚于本调用。
+        installTransformPipeline(gameClassLoader);
+
+        // 主界面 mod 列表的数据源 —— 必须在主界面显示之前设置
+        armModListProvider(classLoaderManager);
+
+        // 客户端服务装配（屏幕 / 按键）—— 必须在任何 Mod 代码运行前。
+        // 服务端环境不装配：两个服务的 register 保持显式不可用，
+        // 在服务器上调 open()/register() 会得到清晰报错而非静默无效。
+        if (detectedEnvironment == RuntimeEnvironment.CLIENT) {
+            org.loader.runtime.minecraft.client.screen.ScreenServiceBridge.install();
+            org.loader.runtime.minecraft.client.input.KeyBindingServiceBridge.install();
+        }
+
+        // 配置服务 —— 无 MC 依赖，客户端与服务端都可用。
+        org.loader.api.config.ConfigService.registerProvider(
+                new org.loader.runtime.config.PropertiesConfigStore());
+
+        // F3 第一行的 launchedVersion 来自该系统属性；未设置时原样
+        // 显示 "null"。仅在外部启动器未提供时补上，不覆盖外部值。
+        if (System.getProperty("minecraft.launcher.brand") == null) {
+            System.setProperty("minecraft.launcher.brand", "Mili-loader");
+        }
+
         // 注册为 bootstrap 的外部资源 —— 失败/停止时随之释放
         EntryPointHook hook = new EntryPointHook();
         hook.install(gameClassLoader, runtime, classLoaderManager, detectedEnvironment);
         hook.invokeMinecraftMain(gameClassLoader, args != null ? args : new String[0]);
+    }
+
+    /**
+     * 构建转换注册表与流水线，并安装到游戏 ClassLoader 的拦截器上。
+     *
+     * <p>平台自身的转换器全部在此登记（modId = null，CORE 阶段）。
+     * 精确索引只登记转换器实际目标的类 —— 其余约一万个 Minecraft 类
+     * 在热路径上零开销直接放行。
+     */
+    private void installTransformPipeline(MinecraftClassLoader gameClassLoader) {
+        TransformerRegistry registry =
+                new TransformerRegistry(MiliSymbol.MINECRAFT_VERSION);
+        registry.register(new MiliTickTransformer(), null);
+        registry.register(new MiliClientBrandTransformer(), null);
+        registry.register(new MiliTitleScreenTransformer(), null);
+        // 客户端专属：按键轮询挂在 Minecraft#tick 上（与 world 无关）。
+        if (detectedEnvironment == RuntimeEnvironment.CLIENT) {
+            registry.register(new org.loader.runtime.minecraft.transform.MiliClientTickTransformer(),
+                    null);
+            registry.indexClass(MiliSymbol.CLIENT_TICK.owner());
+        }
+        registry.indexClass(MiliSymbol.SERVER_TICK.owner());
+        registry.indexClass(MiliSymbol.CLIENT_BRAND.owner());
+        registry.indexClass(MiliSymbol.TITLE_SCREEN_INIT.owner());
+        registry.seal();
+
+        TransformerPipeline pipeline = TransformerPipeline.builder()
+                .registry(registry)
+                .verifyEnabled(true)   // 生产保持验证：VerifyError 前置为启动报错
+                .build();
+
+        TransformationEnvironment env = new TransformationEnvironment(
+                gameClassLoader,
+                detectedVersion,
+                toEnvironmentValue(detectedEnvironment),
+                VersionInfo.PLATFORM_ID);
+
+        gameClassLoader.setInterceptor(
+                new ClassTransformInterceptor(pipeline, env, null));
+
+        PlatformLog.info("[Mili] Transform pipeline installed: "
+                + registry.diagnostics());
+    }
+
+    private static TransformationEnvironment.RuntimeEnvironmentValue toEnvironmentValue(
+            RuntimeEnvironment env) {
+        if (env == RuntimeEnvironment.CLIENT) {
+            return TransformationEnvironment.RuntimeEnvironmentValue.CLIENT;
+        }
+        if (env == RuntimeEnvironment.DEDICATED_SERVER) {
+            return TransformationEnvironment.RuntimeEnvironmentValue.DEDICATED_SERVER;
+        }
+        return TransformationEnvironment.RuntimeEnvironmentValue.UNKNOWN;
+    }
+
+    /**
+     * 为主界面 Mods 按钮提供 mod 列表（modId + 首个 JAR 文件名）。
+     * 列表在按钮被点击时才读取 —— 此处只装配数据源。
+     */
+    private void armModListProvider(ModClassLoaderManager classLoaderManager) {
+        TitleScreenDispatch.setModListProvider(() -> {
+            List<String> lines = new ArrayList<>();
+            try {
+                for (ModClassLoader mcl : classLoaderManager.all()) {
+                    String source = "";
+                    for (Path p : mcl.modSources()) {
+                        if (p != null && p.toString().endsWith(".jar")) {
+                            source = " (" + p.getFileName() + ")";
+                            break;
+                        }
+                    }
+                    lines.add(mcl.modId() + source);
+                }
+            } catch (Throwable t) {
+                PlatformLog.warn("[Mili] 读取 mod 列表失败: " + t);
+            }
+            return lines;
+        });
     }
 }

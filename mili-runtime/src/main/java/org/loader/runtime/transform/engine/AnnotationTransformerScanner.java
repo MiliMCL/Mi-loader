@@ -12,6 +12,7 @@ import org.loader.api.transform.symbol.MiliSymbol;
 import org.loader.api.transform.target.TargetInvocation;
 import org.loader.api.transform.target.TargetMethod;
 import org.loader.runtime.transform.asm.MiliClassTransformer;
+import org.objectweb.asm.Type;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -75,6 +76,7 @@ public final class AnnotationTransformerScanner {
             "minecraft.server.tick", MiliSymbol.SERVER_TICK,
             "minecraft.server.tick_children", MiliSymbol.SERVER_TICK_CHILDREN,
             "minecraft.client.level_tick", MiliSymbol.CLIENT_LEVEL_TICK,
+            "minecraft.client.tick", MiliSymbol.CLIENT_TICK,
             "minecraft.client.main", MiliSymbol.CLIENT_MAIN,
             "minecraft.server.main", MiliSymbol.SERVER_MAIN);
 
@@ -228,7 +230,9 @@ public final class AnnotationTransformerScanner {
             int argIndex,
             String callbackDescriptor,
             int priority,
-            boolean propagateException
+            boolean propagateException,
+            boolean cancellable,
+            String constant
     ) {
 
         /** 转成 ASM 层需要的注入描述。 */
@@ -246,7 +250,9 @@ public final class AnnotationTransformerScanner {
                     callbackDescriptor,
                     true,           // 声明式回调一律要求 static
                     transformerId + "#" + method.getName(),
-                    priority != Integer.MIN_VALUE ? priority : defPriority);
+                    priority != Integer.MIN_VALUE ? priority : defPriority,
+                    cancellable,
+                    constant);
         }
 
         private static String internalName(Class<?> type) {
@@ -360,26 +366,33 @@ public final class AnnotationTransformerScanner {
                     null, null);
         }
 
-        // ── 参数形态 ──────────────────────────────────────────────
+        // ── 参数形态：[InjectionContext] + 目标实参前缀捕获 ────────
+        //
+        // 回调签名由两种成分按固定顺序构成：
+        //   1. 至多一个 InjectionContext（执行上下文，可选）；
+        //   2. 零个或多个「实参捕获」参数 —— 必须与目标方法的实参
+        //      从第 0 位起逐位严格相等（构成前缀）。
+        //
+        // 例如目标 tickServer(BooleanSupplier) 的合法回调形态：
+        //   ()V   (ctx)   (BooleanSupplier)   (ctx, BooleanSupplier)
+        //
+        // 捕获由签名推断，没有注解属性 —— 这是对 ABI 稳定的刻意选择：
+        // 未来扩展捕获能力（如命名捕获）时新增注解属性即非破坏性变更。
+        InjectionPoint point = inject.at();
         Class<?>[] params = method.getParameterTypes();
-        if (params.length > 1) {
-            throw new TransformationException(
-                    where + " 的参数个数非法（" + params.length + " 个）。\n"
-                            + "只允许 0 个参数，或恰好 1 个 InjectionContext。",
-                    null, null);
+
+        int captureStart = 0;
+        if (params.length > 0 && params[0].equals(InjectionContext.class)) {
+            captureStart = 1;
         }
-        if (params.length == 1 && !params[0].equals(InjectionContext.class)) {
-            throw new TransformationException(
-                    where + " 的唯一参数类型必须是 InjectionContext，实际为 "
-                            + params[0].getName() + "。\n"
-                            + "这样平台才能在调用时提供执行上下文"
-                            + "（当前 tick、执行单元等）。",
-                    null, null);
+        int captureCount = params.length - captureStart;
+        if (captureCount > 0) {
+            validateArgCapture(where, point, params, captureStart, captureCount,
+                    defaultTarget);
         }
 
         // ── 返回类型 ──────────────────────────────────────────────
         Class<?> returnType = method.getReturnType();
-        InjectionPoint point = inject.at();
 
         if (point == InjectionPoint.MODIFY_RETURN) {
             // MODIFY_RETURN 必须产出值：void 回调会让栈上没有返回值，
@@ -398,13 +411,62 @@ public final class AnnotationTransformerScanner {
                                 + "修改实参必须返回替换后的值。",
                         null, null);
             }
-        } else if (returnType != void.class) {
+        } else if (point != InjectionPoint.MODIFY_CONSTANT && returnType != void.class) {
             // 其余注入点插入的是「执行一个副作用」的回调，
             // 返回值会让栈失衡（多出一个值无处消费）。
+            // MODIFY_CONSTANT 例外：它必须返回替换后的常量值（上文已校验类型）。
             throw new TransformationException(
                     where + " 在 " + point + " 注入点必须返回 void，实际为 "
                             + returnType.getSimpleName() + "。\n"
-                            + "只有 MODIFY_RETURN / MODIFY_ARG 允许非 void 返回值。",
+                            + "只有 MODIFY_RETURN / MODIFY_ARG / MODIFY_CONSTANT 允许非 void 返回值。",
+                    null, null);
+        }
+
+        // ── 可取消性与常量修改的前置校验 ─────────────────────────
+        boolean cancellable = inject.cancellable();
+        String constant = inject.constant();
+
+        if (cancellable
+                && point != InjectionPoint.HEAD
+                && point != InjectionPoint.BEFORE_INVOKE) {
+            throw new TransformationException(
+                    where + " 声明 cancellable = true，但 " + point
+                            + " 不支持取消。\n"
+                            + "只有 HEAD（取消整个方法）与 BEFORE_INVOKE（跳过被锚定调用）"
+                            + "有可定义的取消语义；其余注入点声明取消会在生成期"
+                            + "产生无法定义的字节码。",
+                    null, null);
+        }
+
+        if (point == InjectionPoint.MODIFY_CONSTANT) {
+            if (constant.isBlank()) {
+                throw new TransformationException(
+                        where + " 使用 MODIFY_CONSTANT 但未声明 constant。\n"
+                                + "未声明常量的常量修改会匹配零个 LDC，"
+                                + "即「加载成功但永不生效」。",
+                        null, null);
+            }
+            if (returnType == void.class) {
+                throw new TransformationException(
+                        where + " 使用 MODIFY_CONSTANT 但返回 void。\n"
+                                + "常量替换必须产出新值。",
+                        null, null);
+            }
+            if (returnType != int.class && returnType != long.class
+                    && returnType != float.class && returnType != double.class
+                    && returnType != boolean.class
+                    && returnType != String.class) {
+                throw new TransformationException(
+                        where + " 的 MODIFY_CONSTANT 回调返回类型非法: "
+                                + returnType.getName() + "。\n"
+                                + "仅支持 int/long/float/double/boolean/String。",
+                        null, null);
+            }
+        } else if (!constant.isBlank()) {
+            throw new TransformationException(
+                    where + " 声明了 constant 但注入点是 " + point + "。\n"
+                            + "constant 仅在 MODIFY_CONSTANT 下有效 ——"
+                            + "声明在别处只会让人误以为它起作用。",
                     null, null);
         }
 
@@ -462,7 +524,97 @@ public final class AnnotationTransformerScanner {
 
         return new CallbackSpec(method, point, methodTarget, field, invocation,
                 inject.argIndex(), callbackDescriptor,
-                inject.priority(), inject.propagateException());
+                inject.priority(), inject.propagateException(),
+                cancellable, constant.isBlank() ? null : constant);
+    }
+
+    /**
+     * 实参捕获是否被该注入点支持。
+     *
+     * <p>只有锚定<b>宿主方法本身</b>的注入点（{@code HEAD} /
+     * {@code RETURN} / {@code MODIFY_RETURN}）才允许捕获 —— 它们的
+     * 触发时机对「宿主局部变量槽里的实参」有定义良好的读取语义。
+     *
+     * <p>调用点类注入（{@code BEFORE_INVOKE} 等）锚定的是方法体内的
+     * 某次调用：触发时宿主实参躺在局部变量槽里、被锚定调用的实参
+     * 躺在操作数栈上，两者的「参数序号」会撞车 —— 与其让
+     * {@code (int a)} 到底捕获哪个产生歧义，不如直接拒绝。
+     */
+    private static boolean allowsArgCapture(InjectionPoint point) {
+        return point == InjectionPoint.HEAD
+                || point == InjectionPoint.RETURN
+                || point == InjectionPoint.MODIFY_RETURN;
+    }
+
+    /**
+     * 校验回调声明的实参捕获参数。
+     *
+     * <h2>按位严格相等，为什么连子类都不允许</h2>
+     * 捕获的实现是「从宿主方法的局部变量槽发射 {@code xLOAD}」——
+     * 槽里是什么就加载什么，没有任何转换。若允许子类
+     * （目标声明 {@code Entity}、回调写 {@code LivingEntity}），
+     * 加载出的值类型仍是 {@code Entity}，调用回调时
+     * {@code checkcast} 由谁插入？插入则是隐式行为（Mixin 的泛型擦除
+     * 就是这个坑）；不插入则运行期 {@code ClassCastException} 指向
+     * Minecraft 调用点。因此规则只有一条：<b>描述符逐位相等</b>，
+     * 装箱（{@code int} vs {@code Integer}）与子类统统拒绝。
+     *
+     * <h2>为什么必须是前缀</h2>
+     * 捕获参数的槽位由<b>声明位置</b>决定（第 i 个捕获参数 = 目标
+     * 第 i 个实参）。允许跳位（只声明第 2 个实参）会让回调签名失去
+     * 自解释性 —— 读者无法从签名看出 {@code (int x)} 捕获的是谁。
+     * 前缀规则让「签名即文档」成立。
+     */
+    private static void validateArgCapture(
+            String where, InjectionPoint point, Class<?>[] params,
+            int captureStart, int captureCount, TargetMethod target) {
+
+        if (!allowsArgCapture(point)) {
+            throw new TransformationException(
+                    where + " 声明了 " + captureCount + " 个实参捕获参数，"
+                            + "但注入点 " + point + " 不支持捕获。\n"
+                            + "只有 HEAD / RETURN / MODIFY_RETURN 锚定宿主方法本身，"
+                            + "对「宿主局部变量槽里的实参」有定义良好的读取时机；\n"
+                            + "调用点类注入锚定的是方法体内的调用，宿主实参"
+                            + "与栈上暂存的调用实参混在一起，参数序号有歧义。",
+                    null, null);
+        }
+
+        Type[] targetArgTypes = Type.getArgumentTypes(target.descriptor());
+
+        if (captureCount > targetArgTypes.length) {
+            throw new TransformationException(
+                    where + " 声明了 " + captureCount + " 个捕获参数，"
+                            + "但目标方法只有 " + targetArgTypes.length + " 个实参。\n"
+                            + "  目标方法: " + target,
+                    null, null);
+        }
+
+        for (int i = 0; i < captureCount; i++) {
+            Class<?> declared = params[captureStart + i];
+            if (declared.equals(InjectionContext.class)) {
+                throw new TransformationException(
+                        where + " 的第 " + (captureStart + i + 1)
+                                + " 个参数是 InjectionContext，但它只能作为第一个参数。\n"
+                                + "捕获参数必须从目标方法的第 0 个实参开始连续声明。",
+                        null, null);
+            }
+            String declaredDesc = typeDescriptor(declared);
+            String expectedDesc = targetArgTypes[i].getDescriptor();
+            if (!declaredDesc.equals(expectedDesc)) {
+                throw new TransformationException(
+                        where + " 的捕获参数 #" + (i + 1)
+                                + "（回调第 " + (captureStart + i + 1) + " 个参数）"
+                                + "与目标方法实参不匹配。\n"
+                                + "  期望（目标第 " + i + " 个实参）: " + expectedDesc + "\n"
+                                + "  实际声明: " + declaredDesc
+                                + "（" + declared.getName() + "）\n"
+                                + "  目标方法: " + target + "\n"
+                                + "捕获按位严格相等：不允许装箱（int ≠ java.lang.Integer）、"
+                                + "不允许子类，且必须从第 0 个实参起连续声明（前缀）。",
+                        null, null);
+            }
+        }
     }
 
     /**

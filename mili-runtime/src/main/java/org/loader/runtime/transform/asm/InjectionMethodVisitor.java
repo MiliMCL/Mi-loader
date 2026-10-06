@@ -1,6 +1,7 @@
 package org.loader.runtime.transform.asm;
 
 import org.loader.api.transform.InjectionPoint;
+import org.objectweb.asm.Label;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
@@ -37,6 +38,8 @@ final class InjectionMethodVisitor extends AdviceAdapter {
     private final String owner;
     private final String methodName;
     private final String methodDescriptor;
+    /** 宿主方法的 access 标志 —— 判断静态性与是否能传 {@code this}。 */
+    private final int methodAccess;
     private final List<MiliClassTransformer.MethodInjection> injections;
     private final List<MiliClassTransformer.AppliedInjection> applied;
 
@@ -73,8 +76,34 @@ final class InjectionMethodVisitor extends AdviceAdapter {
         this.owner = owner;
         this.methodName = name;
         this.methodDescriptor = descriptor;
+        this.methodAccess = access;
         this.injections = injections;
         this.applied = applied;
+
+        // 可取消性在注册期就该拦下；这里再防御一次 —— 直接构造
+        // MethodInjection（绕过扫描器）的调用方不受扫描器校验保护。
+        // 实参捕获的支持范围同理。
+        for (MiliClassTransformer.MethodInjection injection : injections) {
+            if (injection.cancellable()
+                    && injection.point() != InjectionPoint.HEAD
+                    && injection.point() != InjectionPoint.BEFORE_INVOKE) {
+                throw new org.loader.api.transform.TransformationException(
+                        "可取消注入仅支持 HEAD / BEFORE_INVOKE，实际: "
+                                + injection.point() + " by " + injection.transformerId(),
+                        injection.transformerId(), null);
+            }
+            if (captureArgCount(injection.effectiveCallbackDescriptor()) > 0
+                    && !supportsArgCapture(injection.point())) {
+                throw new org.loader.api.transform.TransformationException(
+                        "实参捕获仅支持 HEAD / RETURN / MODIFY_RETURN，实际: "
+                                + injection.point() + " by " + injection.transformerId()
+                                + "\n  回调描述符: "
+                                + injection.effectiveCallbackDescriptor()
+                                + "\n  调用点类注入锚定方法体内的调用，宿主实参"
+                                + "与栈上暂存的调用实参混在一起，参数序号有歧义。",
+                        injection.transformerId(), null);
+            }
+        }
     }
 
     /**
@@ -133,11 +162,73 @@ final class InjectionMethodVisitor extends AdviceAdapter {
     /**
      * 方法入口注入。
      *
-     * <p>当前注入的回调都是无参 {@code ()V}，因此不需要搬运栈或局部变量。
+     * <p>可取消形式：回调返回后检查 {@code isCancelled()}，取消则以
+     * 默认值立即返回 —— 方法体的其余部分不执行。分支结构保证了
+     * 可达性：{@code IFEQ} 直接跳到「取消路径返回之后的正常入口」，
+     * 原方法体不会变成不可达代码。
      */
     private void emitHead(MiliClassTransformer.MethodInjection injection) {
+        if (injection.cancellable()) {
+            Type returnType = Type.getReturnType(methodDescriptor);
+            emitCancellableCallback(injection);
+            org.objectweb.asm.Label continueLabel = new org.objectweb.asm.Label();
+            visitJumpInsn(Opcodes.IFEQ, continueLabel);
+            pushDefaultValue(returnType);
+            visitInsn(returnType.getSort() == Type.VOID
+                    ? Opcodes.RETURN : properReturnOpcode(returnType));
+            visitLabel(continueLabel);
+            record(injection, "HEAD(cancellable)");
+        } else {
+            pushCallback(injection);
+            record(injection, "HEAD");
+        }
+    }
+
+    /** 按返回类型选择正确的返回指令。 */
+    private static int properReturnOpcode(Type returnType) {
+        return switch (returnType.getSort()) {
+            case Type.BOOLEAN, Type.CHAR, Type.BYTE, Type.SHORT, Type.INT -> Opcodes.IRETURN;
+            case Type.LONG -> Opcodes.LRETURN;
+            case Type.FLOAT -> Opcodes.FRETURN;
+            case Type.DOUBLE -> Opcodes.DRETURN;
+            default -> Opcodes.ARETURN;
+        };
+    }
+
+    /**
+     * 按返回类型压入默认值（取消路径的返回值）。
+     *
+     * <p>与 JVM 语义一致：引用 → {@code null}，数值/布尔 → {@code 0}，
+     * long/float/double → 对应零常量。void 不压任何东西。
+     */
+    private void pushDefaultValue(Type returnType) {
+        switch (returnType.getSort()) {
+            case Type.VOID -> { }
+            case Type.BOOLEAN, Type.CHAR, Type.BYTE, Type.SHORT, Type.INT ->
+                    visitInsn(Opcodes.ICONST_0);
+            case Type.LONG -> visitInsn(Opcodes.LCONST_0);
+            case Type.FLOAT -> visitInsn(Opcodes.FCONST_0);
+            case Type.DOUBLE -> visitInsn(Opcodes.DCONST_0);
+            default -> visitInsn(Opcodes.ACONST_NULL);
+        }
+    }
+
+    /**
+     * 发出一个可取消回调：创建上下文（存入局部变量）→ 调用回调
+     * → 加载上下文 → 读取取消标志。
+     *
+     * <p>栈效果：回调为 void（注册期已强制），栈高度不变；
+     * 结束后栈顶是 {@code int} 型取消标志，调用方必须立即消费。
+     */
+    private void emitCancellableCallback(MiliClassTransformer.MethodInjection injection) {
+        Type ctxType = CONTEXT_TYPE;
+        int slot = newLocal(ctxType);
         pushCallback(injection);
-        record(injection, "HEAD");
+        storeLocal(slot, ctxType);
+        loadLocal(slot, ctxType);
+        super.visitMethodInsn(Opcodes.INVOKEVIRTUAL,
+                Type.getInternalName(org.loader.api.transform.callback.InjectionContext.class),
+                "isCancelled", "()Z", false);
     }
 
     /**
@@ -227,15 +318,25 @@ final class InjectionMethodVisitor extends AdviceAdapter {
 
         int myOrdinal = nextOrdinal(callOwner, callName, callDescriptor);
 
-        // ── 1. BEFORE_INVOKE ────────────────────────────────────────
-        // 此时实参在栈上、调用尚未发生。回调为 ()V，栈高度不变。
+        // ── 1. 普通与非普通 BEFORE_INVOKE 分桶 ─────────────────────
+        java.util.List<MiliClassTransformer.MethodInjection> beforeCancellable =
+                new java.util.ArrayList<>();
+        java.util.List<MiliClassTransformer.MethodInjection> beforePlain =
+                new java.util.ArrayList<>();
         for (MiliClassTransformer.MethodInjection injection : injections) {
-            if (injection.point() == InjectionPoint.BEFORE_INVOKE
-                    && matches(injection, callOwner, callName, callDescriptor,
+            if (injection.point() != InjectionPoint.BEFORE_INVOKE
+                    || !matches(injection, callOwner, callName, callDescriptor,
                             opcode, myOrdinal)) {
-                pushCallback(injection);
-                record(injection, "BEFORE_INVOKE");
+                continue;
             }
+            (injection.cancellable() ? beforeCancellable : beforePlain)
+                    .add(injection);
+        }
+
+        // 普通 BEFORE：实参仍在栈上、调用尚未发生，回调 ()V 栈高不变。
+        for (MiliClassTransformer.MethodInjection injection : beforePlain) {
+            pushCallback(injection);
+            record(injection, "BEFORE_INVOKE");
         }
 
         // ── 2. REDIRECT 决策（先算出最终形式，不立即发出） ──────────
@@ -285,30 +386,54 @@ final class InjectionMethodVisitor extends AdviceAdapter {
             finalDescriptor = callDescriptor;
         }
 
-        // ── 3. MODIFY_ARG（必须在调用发出之前） ─────────────────────
-        for (MiliClassTransformer.MethodInjection injection : injections) {
-            if (injection.point() != InjectionPoint.MODIFY_ARG) {
-                continue;
+        // ── 3. 可取消 BEFORE_INVOKE：暂存实参 → 回调 → 取消判定 ────
+        if (!beforeCancellable.isEmpty()) {
+            // 与 MODIFY_ARG 互斥：两者都要「暂存全部实参再重放」，
+            // 叠放会双重暂存，生成结构合法但语义错误的字节码。
+            for (MiliClassTransformer.MethodInjection injection : injections) {
+                if (injection.point() == InjectionPoint.MODIFY_ARG
+                        && matches(injection, callOwner, callName, callDescriptor,
+                                opcode, myOrdinal)) {
+                    throw new org.loader.api.transform.TransformationException(
+                            "同一调用点不能同时声明可取消 BEFORE_INVOKE 与 MODIFY_ARG"
+                                    + "（双重暂存会生成语义错误的字节码）: "
+                                    + finalOwner + "#" + finalName,
+                            injection.transformerId(), null);
+                }
             }
-            if (!matches(injection, callOwner, callName, callDescriptor,
-                    opcode, myOrdinal)) {
-                continue;
+            emitCancellableBeforeInvoke(beforeCancellable, redirect,
+                    finalOpcode, finalOwner, finalName,
+                    finalDescriptor, isInterface);
+        } else {
+            // ── 3'. MODIFY_ARG（必须在调用发出之前） ────────────────
+            for (MiliClassTransformer.MethodInjection injection : injections) {
+                if (injection.point() != InjectionPoint.MODIFY_ARG) {
+                    continue;
+                }
+                if (!matches(injection, callOwner, callName, callDescriptor,
+                        opcode, myOrdinal)) {
+                    continue;
+                }
+                modifyArgument(injection, finalDescriptor);
+                record(injection, "MODIFY_ARG idx=" + injection.argIndex()
+                        + " of " + finalOwner + "#" + finalName + finalDescriptor);
             }
-            modifyArgument(injection, finalDescriptor);
-            record(injection, "MODIFY_ARG idx=" + injection.argIndex()
-                    + " of " + finalOwner + "#" + finalName + finalDescriptor);
-        }
 
-        // ── 4. 发出调用 ─────────────────────────────────────────────
-        super.visitMethodInsn(finalOpcode, finalOwner, finalName,
-                finalDescriptor, isInterface);
+            // ── 4. 发出调用 ─────────────────────────────────────────
+            super.visitMethodInsn(finalOpcode, finalOwner, finalName,
+                    finalDescriptor, isInterface);
 
-        if (redirect != null) {
-            record(redirect, "REDIRECT " + callOwner + "#" + callName + callDescriptor
-                    + " -> " + finalOwner + "#" + finalName + finalDescriptor);
+            if (redirect != null) {
+                record(redirect, "REDIRECT " + callOwner + "#" + callName
+                        + callDescriptor + " -> " + finalOwner + "#"
+                        + finalName + finalDescriptor);
+            }
         }
 
         // ── 5. AFTER_INVOKE ────────────────────────────────────────
+        // 取消路径同样会走到这里：栈顶是被跳过调用的默认返回值。
+        // 这是刻意的语义 —— 「调用没有发生」本身就是 AFTER 段需要
+        // 能感知的事实，而栈平衡不允许我们跳过后又凭空造值。
         for (MiliClassTransformer.MethodInjection injection : injections) {
             if (injection.point() != InjectionPoint.AFTER_INVOKE) {
                 continue;
@@ -327,6 +452,86 @@ final class InjectionMethodVisitor extends AdviceAdapter {
                 loadLocal(slot, retType);
             }
             record(injection, "AFTER_INVOKE " + finalOwner + "#" + finalName);
+        }
+    }
+
+    /**
+     * 可取消 {@code BEFORE_INVOKE} 的完整指令结构。
+     *
+     * <pre>
+     *   倒序暂存全部实参（含接收者）
+     *   cb1: 创建可取消 ctx → 调用 → 读 isCancelled；IFNE → cancelled
+     *   cb2: （同上，链式）
+     *   未取消：重放实参 → 发出（可能已被 REDIRECT 的）调用 → GOTO after
+     *   cancelled:
+     *     压入被跳过调用的默认返回值
+     *   after:
+     *     （AFTER_INVOKE 由此后的公共代码处理）
+     * </pre>
+     *
+     * <h2>为什么与 MODIFY_ARG 互斥</h2>
+     * 两者都要做「暂存全部实参再重放」。叠放会双重暂存：
+     * 第一轮重放后栈上已是回调产物，第二轮暂存到的是错误数据 ——
+     * 生成的字节码结构合法（栈深平衡），语义完全错误。
+     * 与其生成静默损坏的代码，不如在生成期拒绝组合。
+     *
+     * <h2>取消后的 AFTER_INVOKE</h2>
+     * 取消时压入的是默认返回值而非真实结果。AFTER 段的处理程序
+     * 无法区分两者 —— 这是文档化语义：取消即「假装调用以默认值完成」。
+     */
+    private void emitCancellableBeforeInvoke(
+            java.util.List<MiliClassTransformer.MethodInjection> cancellable,
+            MiliClassTransformer.MethodInjection redirect,
+            int finalOpcode, String finalOwner,
+            String finalName, String finalDescriptor, boolean isInterface) {
+
+        Type[] argTypes = Type.getArgumentTypes(finalDescriptor);
+        boolean instanceCall = finalOpcode != Opcodes.INVOKESTATIC;
+
+        // ── 1. 倒序暂存：先实参，最后接收者 ─────────────────────────
+        int[] argSlots = new int[argTypes.length];
+        for (int i = argTypes.length - 1; i >= 0; i--) {
+            argSlots[i] = newLocal(argTypes[i]);
+            storeLocal(argSlots[i], argTypes[i]);
+        }
+        int recvSlot = -1;
+        if (instanceCall) {
+            recvSlot = newLocal(Type.getType(Object.class));
+            storeLocal(recvSlot, Type.getType(Object.class));
+        }
+
+        // ── 2. 链式可取消回调 ────────────────────────────────────────
+        // 每个回调结束后立即读取其取消标志：任一回调取消即短路。
+        Label cancelledLabel = new Label();
+        Label afterLabel = new Label();
+        for (MiliClassTransformer.MethodInjection injection : cancellable) {
+            emitCancellableCallback(injection);
+            visitJumpInsn(Opcodes.IFNE, cancelledLabel);
+        }
+
+        // ── 3. 未取消：重放并发出调用 ────────────────────────────────
+        if (instanceCall) {
+            loadLocal(recvSlot, Type.getType(Object.class));
+        }
+        for (int i = 0; i < argTypes.length; i++) {
+            loadLocal(argSlots[i], argTypes[i]);
+        }
+        super.visitMethodInsn(finalOpcode, finalOwner, finalName,
+                finalDescriptor, isInterface);
+        if (redirect != null) {
+            record(redirect, "REDIRECT (cancellable) " + finalOwner
+                    + "#" + finalName + finalDescriptor);
+        }
+        visitJumpInsn(Opcodes.GOTO, afterLabel);
+
+        // ── 4. 取消路径：默认返回值 ──────────────────────────────────
+        visitLabel(cancelledLabel);
+        pushDefaultValue(Type.getReturnType(finalDescriptor));
+        visitLabel(afterLabel);
+
+        for (MiliClassTransformer.MethodInjection injection : cancellable) {
+            record(injection, "BEFORE_INVOKE(cancellable) " + finalOwner
+                    + "#" + finalName);
         }
     }
 
@@ -367,6 +572,20 @@ final class InjectionMethodVisitor extends AdviceAdapter {
             throw org.loader.api.transform.TransformationTargetNotFoundException.forCallSite(
                     owner, methodName, methodDescriptor,
                     injection.invocation(), injection.transformerId());
+        }
+        // MODIFY_CONSTANT 的锚点是方法体内的常量 —— 与调用点同类：
+        // 常量不存在时匹配永远失败且无任何痕迹，必须在生成期报错。
+        for (MiliClassTransformer.MethodInjection injection : injections) {
+            if (injection.point() == InjectionPoint.MODIFY_CONSTANT
+                    && injection.constant() != null
+                    && !matched.contains(injection)) {
+                throw new org.loader.api.transform.TransformationException(
+                        "MODIFY_CONSTANT 声明的常量 \"" + injection.constant()
+                                + "\" 在方法 " + owner + "#" + methodName
+                                + methodDescriptor + " 中不存在。\n"
+                                + "  与其静默不生效，不如加载期失败 —— 症状写明原因。",
+                        injection.transformerId(), null);
+            }
         }
         super.visitMaxs(maxStack, maxLocals);
     }
@@ -464,6 +683,111 @@ final class InjectionMethodVisitor extends AdviceAdapter {
                 pushCallback(injection);
             }
             record(injection, "AFTER_FIELD_ACCESS");
+        }
+    }
+
+    // ── MODIFY_CONSTANT ──────────────────────────────────────────────
+
+    /**
+     * 常量替换 —— 与 {@code Mixin}@ModifyConstant 同语义。
+     *
+     * <p>匹配规则：按回调返回类型解析声明的常量字符串，
+     * 只替换<b>同类型且等值</b>的 {@code LDC}；方法体内所有匹配处
+     * 都会被替换。类字面量（{@code Type}/{@code Handle}）不参与匹配。
+     *
+     * <p>栈效果：原 LDC 压入一个 {@code T}，回调也返回一个 {@code T}
+     * —— 替换前后栈高度与类型完全一致，无需额外平衡。
+     */
+    @Override
+    public void visitLdcInsn(Object value) {
+        MiliClassTransformer.MethodInjection patch = matchConstant(value);
+        if (patch == null) {
+            super.visitLdcInsn(value);
+            return;
+        }
+        pushCallback(patch);
+        record(patch, "MODIFY_CONSTANT " + patch.constant());
+    }
+
+    /** 找到与该 LDC 值匹配的 MODIFY_CONSTANT 注入；无则 null。 */
+    private MiliClassTransformer.MethodInjection matchConstant(Object value) {
+        if (!(value instanceof Integer || value instanceof Long
+                || value instanceof Float || value instanceof Double
+                || value instanceof String)) {
+            return null;    // 类字面量 / MethodType 等不参与匹配
+        }
+        MiliClassTransformer.MethodInjection found = null;
+        for (MiliClassTransformer.MethodInjection injection : injections) {
+            if (injection.point() != InjectionPoint.MODIFY_CONSTANT) {
+                continue;
+            }
+            Object expected = parseConstant(injection);
+            if (expected == null) {
+                continue;
+            }
+            boolean hit;
+            if (expected instanceof Boolean) {
+                // 布尔常量在字节码里是 Integer 1/0
+                hit = value instanceof Integer i
+                        && (expected.equals(Boolean.TRUE) ? i == 1 : i == 0);
+            } else {
+                hit = expected.equals(value);
+            }
+            if (!hit) {
+                continue;
+            }
+            if (found != null) {
+                // 两个 MODIFY_CONSTANT 命中同一常量：链式替换的先后顺序
+                // 取决于列表序 —— 那是加载顺序依赖，绝不允许。
+                throw new org.loader.api.transform.TransformationConflictException(
+                        owner, methodName,
+                        java.util.List.of(found.transformerId(),
+                                injection.transformerId()),
+                        "同一常量 \"" + injection.constant() + "\" 被多次 MODIFY_CONSTANT");
+            }
+            found = injection;
+        }
+        return found;
+    }
+
+    /**
+     * 按回调返回类型解析声明的常量。
+     *
+     * <p>解析失败抛 {@code TransformationException} —— 声明的常量
+     * 「1,000」解析不出 int，若静默跳过就是又一次永不生效。
+     */
+    private Object parseConstant(MiliClassTransformer.MethodInjection injection) {
+        String raw = injection.constant();
+        if (raw == null || raw.isBlank()) {
+            throw new org.loader.api.transform.TransformationException(
+                    "MODIFY_CONSTANT 未声明 constant 值: " + injection.transformerId(),
+                    injection.transformerId(), null);
+        }
+        Type ret = Type.getReturnType(injection.effectiveCallbackDescriptor());
+        try {
+            return switch (ret.getSort()) {
+                case Type.INT -> Integer.parseInt(raw);
+                case Type.LONG -> Long.parseLong(raw);
+                case Type.FLOAT -> Float.parseFloat(raw);
+                case Type.DOUBLE -> Double.parseDouble(raw);
+                case Type.BOOLEAN -> Boolean.parseBoolean(raw);
+                default -> {
+                    if (Type.getReturnType(injection.effectiveCallbackDescriptor())
+                            .getDescriptor().equals("Ljava/lang/String;")) {
+                        yield raw;
+                    }
+                    throw new org.loader.api.transform.TransformationException(
+                            "MODIFY_CONSTANT 的回调返回类型必须是 int/long/float/"
+                                    + "double/boolean/String，实际为 " + ret.getClassName()
+                                    + ": " + injection.transformerId(),
+                            injection.transformerId(), null);
+                }
+            };
+        } catch (NumberFormatException e) {
+            throw new org.loader.api.transform.TransformationException(
+                    "MODIFY_CONSTANT 声明的常量 \"" + raw + "\" 无法按回调返回类型 "
+                            + ret.getClassName() + " 解析: " + injection.transformerId(),
+                    injection.transformerId(), null);
         }
     }
 
@@ -770,6 +1094,20 @@ final class InjectionMethodVisitor extends AdviceAdapter {
     /**
      * 为回调调用压入实参。
      *
+     * <h2>两种参数成分</h2>
+     * 回调签名的参数按固定顺序由两种成分构成：
+     * <ol>
+     *   <li><b>{@link org.loader.api.transform.callback.InjectionContext}</b>
+     *       （可选，至多一个，必须第一位）—— 平台凭空构造：
+     *       静态信息 + 宿主实例；</li>
+     *   <li><b>实参捕获参数</b>（可选，任意多个）—— 从<b>宿主方法的
+     *       局部变量槽</b>发射 {@code xLOAD}，按位与宿主实参严格对应。</li>
+     * </ol>
+     *
+     * <p>例如回调 {@code (ctx, int a, int b)} 在宿主
+     * {@code int add(int, int)} 上：先发射 ctx，再从槽 0/1（static 宿主）
+     * 加载两个实参。
+     *
      * <h2>为什么不能「只支持无参回调」绕开这个问题</h2>
      * ABI 明确允许 {@code (InjectionContext)} 形态（见
      * {@code MiliInject} 与扫描器的参数校验），
@@ -786,52 +1124,166 @@ final class InjectionMethodVisitor extends AdviceAdapter {
     private void pushCallbackArguments(
             MiliClassTransformer.MethodInjection injection, String descriptor) {
 
-        Type[] argTypes = Type.getArgumentTypes(descriptor);
-        if (argTypes.length == 0) {
+        Type[] cbArgTypes = Type.getArgumentTypes(descriptor);
+        if (cbArgTypes.length == 0) {
             return;
         }
 
-        // 目标类/方法名以常量形式携带 —— 它们在转换期就完全确定。
-        // 逐个分支而非反射：反射在字节码生成路径上没有价值，
-        // 且这里只有两种可能形态。
-        for (Type argType : argTypes) {
-            if (CONTEXT_TYPE.getDescriptor().equals(argType.getDescriptor())) {
-                super.visitLdcInsn(owner);
-                super.visitLdcInsn(methodName);
-                super.visitMethodInsn(Opcodes.INVOKESTATIC,
-                        Type.getInternalName(InjectionContextFactory.class),
-                        "forMethod",
-                        CONTEXT_FACTORY_DESCRIPTOR, false);
-            } else {
-                throw new org.loader.api.transform.TransformationException(
-                        "不支持的回调参数类型 " + argType.getClassName() + ": "
-                                + injection.point() + " by " + injection.transformerId() + "\n"
-                                + "  回调描述符: " + descriptor + "\n"
-                                + "  目前只支持无参回调或单个 InjectionContext 参数。\n"
-                                + "  传入其他类型无法凭空构造 —— 塞默认值会让Mod"
-                                + "收到看似合法实则错误的数据。",
-                        injection.transformerId(), null);
-            }
+        boolean hasContext = CONTEXT_TYPE.getDescriptor()
+                .equals(cbArgTypes[0].getDescriptor());
+        if (hasContext) {
+            emitContextArgument(injection);
+        }
+
+        int captureCount = cbArgTypes.length - (hasContext ? 1 : 0);
+        if (captureCount > 0) {
+            emitCapturedArguments(injection, cbArgTypes,
+                    hasContext ? 1 : 0, captureCount);
         }
     }
 
-    /** {@code InjectionContext} 的类型 —— 唯一被支持的回调参数类型。 */
+    /**
+     * 发射 {@code InjectionContext} 实参 —— 平台凭空构造的那一种。
+     *
+     * <p>目标类/方法名以常量形式携带 —— 它们在转换期就完全确定。
+     * 逐个分支而非反射：反射在字节码生成路径上没有价值，
+     * 且这里只有两种可能形态。
+     */
+    private void emitContextArgument(MiliClassTransformer.MethodInjection injection) {
+        super.visitLdcInsn(owner);
+        super.visitLdcInsn(methodName);
+        // 宿主实例（this）—— 仅实例方法可传；构造器上的
+        // 未初始化 this 传给外部方法是 VerifyError，传 null。
+        boolean canPassThis = (methodAccess & Opcodes.ACC_STATIC) == 0
+                && !methodName.equals("<init>")
+                && !methodName.equals("<clinit>");
+        if (canPassThis) {
+            super.visitVarInsn(Opcodes.ALOAD, 0);
+        } else {
+            super.visitInsn(Opcodes.ACONST_NULL);
+        }
+        super.visitMethodInsn(Opcodes.INVOKESTATIC,
+                Type.getInternalName(InjectionContextFactory.class),
+                injection.cancellable()
+                        ? "forCancellableMethod" : "forMethodWithTarget",
+                CONTEXT_FACTORY_DESCRIPTOR, false);
+    }
+
+    /**
+     * 发射实参捕获参数 —— 从宿主方法的局部变量槽 {@code xLOAD}。
+     *
+     * <h2>槽位布局（本方法正确性的核心）</h2>
+     * JVM 规定：实例方法的 {@code this} 占槽 0，实参从槽 1 开始；
+     * static 方法实参从槽 0 开始；{@code long}/{@code double}
+     * <b>占两个槽</b>。因此第 i 个实参的槽位 = 基础偏移 + 前面所有
+     * 实参的 {@code Type#getSize()} 之和。用 1 做宽类型推进必然错位
+     * —— 与 {@code modifyArgument} 记录的是同一类陷阱。
+     *
+     * <p>加载指令由 {@code Type.getOpcode(ILOAD)} 按实参类型分派：
+     * 整数族 → {@code ILOAD}（局部变量槽里的 boolean/byte/short/char
+     * 本来就是 int）、{@code J}/{@code F}/{@code D} → 对应宽加载、
+     * 引用 → {@code ALOAD}。
+     *
+     * <h2>防御性逐位校验</h2>
+     * 描述符相等性在这里再验一次：绕过扫描器、直接构造
+     * {@code MethodInjection} 的调用方不受扫描器保护。校验发生在
+     * 生成期 —— 错一个类型就抛 {@code TransformationException}，
+     * 而不是产出 {@code VerifyError} 指向 Minecraft。
+     *
+     * <h2>读取语义（文档化）</h2>
+     * 捕获读取的是<b>触发时刻</b>局部变量槽的当前值：
+     * <ul>
+     *   <li>{@code HEAD} —— 方法体尚未执行，即入口值；</li>
+     *   <li>{@code RETURN} / {@code MODIFY_RETURN} —— 方法体已执行，
+     *       若方法体重写过参数槽（{@code a = ...}），读到的是
+     *       <b>重写后的当前值</b>，不是入口值。参数槽不被 javac
+     *       复用给其他局部变量（参数作用域是整个方法体），
+     *       因此该值总是良定义的。</li>
+     * </ul>
+     */
+    private void emitCapturedArguments(
+            MiliClassTransformer.MethodInjection injection,
+            Type[] cbArgTypes, int captureStart, int captureCount) {
+
+        if (!supportsArgCapture(injection.point())) {
+            throw new org.loader.api.transform.TransformationException(
+                    "回调声明了实参捕获参数，但注入点 " + injection.point()
+                            + " 不支持（仅 HEAD / RETURN / MODIFY_RETURN）: "
+                            + injection.transformerId(),
+                    injection.transformerId(), null);
+        }
+
+        Type[] hostArgs = Type.getArgumentTypes(methodDescriptor);
+        if (captureCount > hostArgs.length) {
+            throw new org.loader.api.transform.TransformationException(
+                    "回调声明了 " + captureCount + " 个捕获参数，但宿主方法 "
+                            + owner + "#" + methodName + " 只有 "
+                            + hostArgs.length + " 个实参。\n"
+                            + "  回调描述符: " + injection.effectiveCallbackDescriptor()
+                            + "\n  宿主描述符: " + methodDescriptor,
+                    injection.transformerId(), null);
+        }
+
+        // 实例方法 this 占槽 0；static 从 0 开始。
+        int slot = (methodAccess & Opcodes.ACC_STATIC) == 0 ? 1 : 0;
+        for (int i = 0; i < captureCount; i++) {
+            Type expected = hostArgs[i];
+            Type declared = cbArgTypes[captureStart + i];
+            if (!declared.getDescriptor().equals(expected.getDescriptor())) {
+                throw new org.loader.api.transform.TransformationException(
+                        "回调的捕获参数 #" + (i + 1) + " 与宿主方法实参不匹配。\n"
+                                + "  期望（宿主第 " + i + " 个实参）: "
+                                + expected.getDescriptor() + "\n"
+                                + "  实际声明: " + declared.getDescriptor() + "\n"
+                                + "  宿主方法: " + owner + "#" + methodName
+                                + methodDescriptor + "\n"
+                                + "  回调: " + injection.effectiveCallbackDescriptor()
+                                + " by " + injection.transformerId() + "\n"
+                                + "捕获按位严格相等：不允许装箱（int ≠ java.lang.Integer）、"
+                                + "不允许子类。",
+                        injection.transformerId(), null);
+            }
+            super.visitVarInsn(expected.getOpcode(Opcodes.ILOAD), slot);
+            slot += expected.getSize();     // long/double 占双槽
+        }
+    }
+
+    /** 该注入点是否支持实参捕获（与扫描器的判定一致）。 */
+    private static boolean supportsArgCapture(InjectionPoint point) {
+        return point == InjectionPoint.HEAD
+                || point == InjectionPoint.RETURN
+                || point == InjectionPoint.MODIFY_RETURN;
+    }
+
+    /**
+     * 回调描述符中实参捕获参数的个数：
+     * 首位是 {@code InjectionContext} 时为「参数总数 − 1」，否则为参数总数。
+     */
+    private static int captureArgCount(String callbackDescriptor) {
+        Type[] types = Type.getArgumentTypes(callbackDescriptor);
+        if (types.length > 0 && CONTEXT_TYPE.getDescriptor()
+                .equals(types[0].getDescriptor())) {
+            return types.length - 1;
+        }
+        return types.length;
+    }
+
+    /**
+     * {@code InjectionContext} 的类型 —— 唯一被支持的回调参数类型。
+     */
     private static final Type CONTEXT_TYPE =
             Type.getType(org.loader.api.transform.callback.InjectionContext.class);
 
     /**
-     * {@code InjectionContextFactory.forMethod} 的描述符。
+     * 上下文工厂描述符 —— 三参形态（携带宿主实例）。
      *
      * <p><b>手写常量而非运行时推导</b>：本类位于「不能 import loader/minecraft」
-     * 的 runtime 模块内，而工厂类就在同一模块 ——
-     * 用 {@code Type.getInternalName} + {@code getMethod} 拼描述符
-     * 会让「工厂类改了签名」变成运行期 {@code NoSuchMethodError}
-     * 而非编译期错误。这里刻意把它写成常量并在
-     * {@link InjectionContextFactory} 的 Javadoc 里标注同样的签名，
-     * 两侧必须同时改。
+     * 的 runtime 模块内。改 {@code InjectionContextFactory} 的签名时
+     * 必须同步这里 —— 见其 Javadoc 的同一标注。
      */
     private static final String CONTEXT_FACTORY_DESCRIPTOR =
-            "(Ljava/lang/String;Ljava/lang/String;)Lorg/loader/api/transform/callback/InjectionContext;";
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;)"
+                    + "Lorg/loader/api/transform/callback/InjectionContext;";
 
     private void record(MiliClassTransformer.MethodInjection injection, String detail) {
         // 命中登记：方法体读完时据此判断「声明了却从未命中」。

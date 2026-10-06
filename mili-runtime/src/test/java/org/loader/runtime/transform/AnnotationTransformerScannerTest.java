@@ -247,18 +247,22 @@ class AnnotationTransformerScannerTest {
     }
 
     @Test
-    @DisplayName("参数个数或类型错误被拒绝")
+    @DisplayName("参数形态错误被拒绝（捕获类型不匹配也在此拦截）")
     void badParameterShapeRejected() {
-        assertThrows(TransformationException.class,
+        // ctx 后跟一个捕获参数，但目标第一实参是 BooleanSupplier 不是 int
+        var e1 = assertThrows(TransformationException.class,
                 () -> AnnotationTransformerScanner.scan(
                         TooManyParams.class, MC_VERSION, "m"),
-                "只允许 0 个参数或 1 个 InjectionContext");
+                "捕获参数与目标实参逐位严格相等 —— int ≠ BooleanSupplier");
+        assertTrue(e1.getMessage().contains("捕获参数"),
+                "错误信息应指出捕获参数不匹配: " + e1.getMessage());
 
-        var e = assertThrows(TransformationException.class,
+        var e2 = assertThrows(TransformationException.class,
                 () -> AnnotationTransformerScanner.scan(
                         WrongParamType.class, MC_VERSION, "m"));
-        assertTrue(e.getMessage().contains("InjectionContext"),
-                "错误信息应说明唯一合法参数类型");
+        assertTrue(e2.getMessage().contains("捕获参数"),
+                "String 不匹配目标实参 —— 错误信息应说明捕获按位严格相等: "
+                        + e2.getMessage());
     }
 
     @Test
@@ -375,9 +379,11 @@ class AnnotationTransformerScannerTest {
 
         List<String> instructions = instructionsOf(result, MiliSymbol.SERVER_TICK.name());
 
+        // 三参工厂（携带宿主实例）—— 上轮实例上下文改造后的形态。
         int factory = instructions.indexOf("INVOKESTATIC "
-                + "org/loader/runtime/transform/asm/InjectionContextFactory.forMethod"
-                + "(Ljava/lang/String;Ljava/lang/String;)"
+                + "org/loader/runtime/transform/asm/InjectionContextFactory"
+                + ".forMethodWithTarget"
+                + "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;)"
                 + "Lorg/loader/api/transform/callback/InjectionContext;");
         int callback = instructions.indexOf("INVOKESTATIC "
                 + internalName(ValidHooks.class)
@@ -393,20 +399,23 @@ class AnnotationTransformerScannerTest {
                 "工厂调用必须排在回调之前 —— 否则栈上的还是空值。\n"
                         + "实际指令序列:\n  " + String.join("\n  ", instructions));
 
-        // 工厂需要两个 String 实参 → 它前面必须恰好有两个 LDC。
-        // 少一个就是又一次栈下溢，且报错点会落在工厂指令上而非回调上。
-        assertEquals("LDC " + MiliSymbol.SERVER_TICK.owner(), instructions.get(factory - 2),
+        // 发射序列：LDC owner → LDC name → ALOAD 0（this）→ INVOKESTATIC。
+        // tickServer 是实例方法，宿主实例必须真的传进去（sampleTargetClass
+        // 未声明为 static），而非 ACONST_NULL。
+        assertEquals("LDC " + MiliSymbol.SERVER_TICK.owner(), instructions.get(factory - 3),
                 "工厂第一个实参应是目标类内部名");
-        assertEquals("LDC " + MiliSymbol.SERVER_TICK.name(), instructions.get(factory - 1),
+        assertEquals("LDC " + MiliSymbol.SERVER_TICK.name(), instructions.get(factory - 2),
                 "工厂第二个实参应是目标方法名");
+        assertEquals("VAR 25 0", instructions.get(factory - 1),
+                "工厂第三个实参应是宿主实例 this（ALOAD 0）");
     }
 
     /**
-     * 不支持的回调参数类型必须在生成期报错，而非产出非法字节码。
+     * 带捕获参数的回调必须在生成期做逐位校验，而非产出非法字节码。
      *
      * <h2>为什么绕过扫描器直接构造注入</h2>
-     * 声明式路径（{@code @MiliInject}）在<b>扫描期</b>就会拦下非
-     * {@code InjectionContext} 参数 —— 那是第一道防线。
+     * 声明式路径（{@code @MiliInject}）在<b>扫描期</b>就会拦下类型
+     * 不匹配的捕获参数 —— 那是第一道防线。
      * 但 {@link org.loader.runtime.transform.asm.MiliClassTransformer}
      * 是<b>公开可调用的</b>：平台内部转换器、以及任何直接使用引擎的代码
      * 都能绕过扫描器构造 {@code MethodInjection}。
@@ -417,13 +426,13 @@ class AnnotationTransformerScannerTest {
      * 宁可生成期失败并说清原因。
      */
     @Test
-    @DisplayName("未知回调参数类型在生成期报错 —— 绝不塞默认值")
+    @DisplayName("捕获类型不匹配在生成期报错 —— 绝不塞默认值")
     void unknownCallbackParameterRejectedAtGenerationTime() {
         var injection = new org.loader.runtime.transform.asm.MiliClassTransformer.MethodInjection(
                 MiliSymbol.SERVER_TICK,
                 null,
                 org.loader.api.transform.InjectionPoint.HEAD,
-                // String 参数不是合法回调形态
+                // String 不是目标第一实参（BooleanSupplier）—— 捕获类型不匹配
                 "(Ljava/lang/String;)V",
                 null,
                 0,
@@ -439,9 +448,9 @@ class AnnotationTransformerScannerTest {
                         sampleTargetClass(), MiliSymbol.SERVER_TICK.owner(), List.of(injection)),
                 "引擎不能假设「所有调用方都走过扫描器」—— "
                         + "它自己就是公开 API。");
-        assertTrue(e.getMessage().contains("不支持的回调参数类型")
-                        && e.getMessage().contains("String"),
-                "错误信息应同时说明参数类型与支持范围: " + e.getMessage());
+        assertTrue(e.getMessage().contains("捕获参数")
+                        && e.getMessage().contains("Ljava/lang/String;"),
+                "错误信息应同时说明捕获位序号与实际声明类型: " + e.getMessage());
     }
 
     /** 列出目标方法的全部指令（可读形式）。 */

@@ -127,6 +127,25 @@ public enum InjectionPoint {
     MODIFY_RETURN,
 
     /**
+     * 修改常量 —— 把方法体中匹配的字面量（{@code LDC}）替换为回调的计算结果。
+     *
+     * <p>需要 {@link org.loader.api.transform.annotation.MiliInject#constant()}
+     * 声明要匹配的常量值；回调必须返回非 void，且返回类型决定匹配方式：
+     * <ul>
+     *   <li>{@code int} / {@code long} / {@code float} / {@code double}
+     *       —— 匹配同类型、同值的数值常量；</li>
+     *   <li>{@code boolean} —— 匹配 {@code 1}/{@code 0} 的整型常量；</li>
+     *   <li>{@code String} —— 匹配相同内容的字符串常量。</li>
+     * </ul>
+     *
+     * <p>方法体内<b>所有</b>匹配的常量都会被替换（与 Mixin 的
+     * {@code ModifyConstant} 行为一致）。同一方法上的多个
+     * MODIFY_CONSTANT 属于语义冲突（无法定义「谁先替换谁」），
+     * 触发 {@link TransformationConflictException}。
+     */
+    MODIFY_CONSTANT,
+
+    /**
      * 整体覆写 —— 丢弃原始方法体，替换为回调实现。
      *
      * <p><b>默认禁用。</b>启用需同时满足：

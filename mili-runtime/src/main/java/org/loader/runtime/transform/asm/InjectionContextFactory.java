@@ -63,6 +63,22 @@ public final class InjectionContextFactory {
          * @param methodName 目标方法名
          */
         InjectionContext create(String className, String methodName);
+
+        /**
+         * 产出一个携带实例与取消能力的上下文。
+         *
+         * <p>默认实现退化为两参形式（丢失 target 与取消能力）——
+         * 仅为兼容既有 Provider 实现而存在；平台自身装配的实现
+         * 必须覆写它，否则 cancellable 注入的 {@code cancel()}
+         * 会抛 IllegalStateException。
+         *
+         * @param target      宿主实例（静态方法 / 构造器为 null）
+         * @param cancellable 是否允许 {@code cancel()}
+         */
+        default InjectionContext create(String className, String methodName,
+                                        Object target, boolean cancellable) {
+            return create(className, methodName);
+        }
     }
 
     /**
@@ -83,7 +99,29 @@ public final class InjectionContextFactory {
                     null,
                     Thread.currentThread());
 
-    private static volatile Provider provider = DETACHED;
+    /**
+     * 脱离 tick 的默认提供器 —— 完整形态。
+     *
+     * <p>实例上下文与取消能力在平台未装配时同样可用：
+     * {@code target()} 如实返回宿主实例，{@code cancel()} 生效。
+     * 这保证「游戏启动早期、平台 provider 尚未就绪」的阶段里
+     * 已加载的注入行为与之后一致，而不是同一注入在两个阶段
+     * 表现不同 —— 那种不一致比崩溃更难查。
+     */
+    private static final Provider DETACHED_FULL = (className, methodName, target, cancellable) ->
+            new InjectionContext(
+                    className,
+                    methodName,
+                    null,
+                    -1L,
+                    null,
+                    ExecutionContext.single(),
+                    null,
+                    Thread.currentThread(),
+                    target,
+                    cancellable);
+
+    private static volatile Provider provider = DETACHED_FULL;
 
     private InjectionContextFactory() {
     }
@@ -96,7 +134,7 @@ public final class InjectionContextFactory {
      * 否则静态字段会让整条对象图在退出后仍可达。
      */
     public static void install(Provider newProvider) {
-        provider = newProvider != null ? newProvider : DETACHED;
+        provider = newProvider != null ? newProvider : DETACHED_FULL;
     }
 
     /** 当前提供器 —— 供诊断输出。 */
@@ -114,5 +152,30 @@ public final class InjectionContextFactory {
      */
     public static InjectionContext forMethod(String className, String methodName) {
         return provider.create(className, methodName);
+    }
+
+    /**
+     * 由生成字节码调用 —— 携带宿主实例构造上下文。
+     *
+     * <p><b>描述符（含 {@code Ljava/lang/Object;}）必须与本方法完全一致</b>，
+     * 引擎侧以常量引用它（见 {@code InjectionMethodVisitor}）。
+     * 静态方法 / 构造器上 {@code target} 为 {@code null}。
+     */
+    public static InjectionContext forMethodWithTarget(
+            String className, String methodName, Object target) {
+        return provider.create(className, methodName, target, false);
+    }
+
+    /**
+     * 由生成字节码调用 —— 构造<b>可取消</b>的上下文。
+     *
+     * <p>与 {@link #forMethodWithTarget} 描述符相同、名字不同：
+     * 取消能力由引擎按注入点合法性选择工厂，而不是让回调
+     * 在运行期探测 —— 探测式的取消会让「平台漏装 provider」
+     * 静默降级为「取消无效」。
+     */
+    public static InjectionContext forCancellableMethod(
+            String className, String methodName, Object target) {
+        return provider.create(className, methodName, target, true);
     }
 }
