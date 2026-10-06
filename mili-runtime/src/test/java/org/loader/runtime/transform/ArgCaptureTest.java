@@ -304,7 +304,7 @@ class ArgCaptureTest implements Opcodes {
         Cap.capturedA = 0;
         Cap.capturedB = 0;
         Cap.capturedD = 0;
-        assertEquals(2.5, c.getMethod("mix", int.class, long.class,
+        assertEquals(2.5, (double) c.getMethod("mix", int.class, long.class,
                         double.class, String.class)
                 .invoke(null, 7, 100L, 2.5, "x"), 0.0, "方法体照常执行");
         assertEquals(7, Cap.capturedA);

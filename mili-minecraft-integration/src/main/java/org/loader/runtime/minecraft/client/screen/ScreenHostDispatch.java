@@ -345,12 +345,19 @@ public final class ScreenHostDispatch {
 
     // ── 反射辅助 ─────────────────────────────────────────────────────────────
 
-    private static Object minecraftInstance() throws Exception {
+    private static Object minecraftInstance() {
         ClassLoader game = Reflect.gameClassLoader();
         if (game == null) {
             return null;
         }
-        return Reflect.gameClass(MC).getMethod("getInstance").invoke(null);
+        try {
+            return Reflect.gameClass(MC).getMethod("getInstance").invoke(null);
+        } catch (ReflectiveOperationException e) {
+            // 方法漂移属于平台 bug —— 伪装成 null 会让调用方误判
+            // 「客户端尚未启动」，错误被埋进错误的处理路径。
+            throw new IllegalStateException(
+                    "反射调用 Minecraft.getInstance() 失败", e);
+        }
     }
 
     private static boolean isSameThread(Object mc) {

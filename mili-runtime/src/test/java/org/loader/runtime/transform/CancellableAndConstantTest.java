@@ -151,7 +151,8 @@ class CancellableAndConstantTest implements Opcodes {
         MethodVisitor mv = cw.visitMethod(ACC_PUBLIC, "set", "()V", null, null);
         mv.visitCode();
         mv.visitVarInsn(ALOAD, 0);
-        mv.visitInsn(ICONST_7);
+        // ICONST 只到 5；7 必须用 BIPUSH —— 不是可互换的简写。
+        mv.visitIntInsn(BIPUSH, 7);
         mv.visitFieldInsn(PUTFIELD, "test/synth/Instance", "f", "I");
         mv.visitInsn(RETURN);
         mv.visitMaxs(2, 1);
