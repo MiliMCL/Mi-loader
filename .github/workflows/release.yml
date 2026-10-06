@@ -16,22 +16,13 @@ jobs:
       - name: Derive version from tag
         id: ver
         run: |
-          # tag 本身就是版本号，不绑 v 前缀。
-          # 若有人还是习惯推 v0.1.0，这里做一次兼容剥离。
-          TAG="${GITHUB_REF_NAME#v}"
-          echo "TAG_VERSION=$TAG"   >> $GITHUB_ENV
-          echo "version=$TAG"       >> $GITHUB_OUTPUT
-          echo "Tag: ${GITHUB_REF_NAME} -> version $TAG"
-
-      - name: Verify tag matches miliPlatformVersion in gradle.properties
-        run: |
-          PROP=$(grep '^miliPlatformVersion=' gradle.properties | cut -d= -f2 | tr -d '[:space:]')
-          if [ "$PROP" != "$TAG_VERSION" ]; then
-            echo "ERROR: tag '${GITHUB_REF_NAME}' (版本 $TAG_VERSION) != miliPlatformVersion=$PROP"
-            echo "请把 gradle.properties 的 miliPlatformVersion 改成 $TAG_VERSION，或改用正确的 tag 重新推送。"
-            exit 1
-          fi
-          echo "Tag matches gradle.properties (${PROP})"
+          # tag 不承载版本语义，仅作为标签使用。
+          # 唯一的版本真相源是 gradle.properties 的 miliPlatformVersion。
+          VER=$(grep '^miliPlatformVersion=' gradle.properties | cut -d= -f2 | tr -d '[:space:]')
+          echo "TAG_VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
+          echo "PLATFORM_VERSION=$VER"        >> $GITHUB_ENV
+          echo "version=$VER"                 >> $GITHUB_OUTPUT
+          echo "Tag label: ${GITHUB_REF_NAME#v} / platform version: $VER"
 
       - name: Set up JDK 25
         uses: actions/setup-java@v4
@@ -111,9 +102,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: "Mili Platform ${{ env.TAG_VERSION }} (MC 26.2)"
+          name: "Mili Platform ${{ env.PLATFORM_VERSION }} (MC 26.2)"
           body: |
-            Mili Platform ${{ env.TAG_VERSION }} for Minecraft 26.2 / Java 25.
+            Mili Platform ${{ env.PLATFORM_VERSION }} for Minecraft 26.2 / Java 25.
 
             ## 快速开始
             下载 `mili-*-mc26.2.tar.gz`（Windows 用 `.zip`），解压后运行：
