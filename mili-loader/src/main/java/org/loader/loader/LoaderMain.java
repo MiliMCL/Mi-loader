@@ -99,7 +99,7 @@ public class LoaderMain {
      *       {@code game/mods/}，结果是零个 Mod 且无任何报错。</li>
      * </ul>
      */
-    private static LaunchOptions parseArgs(String[] args) {
+    static LaunchOptions parseArgs(String[] args) {
         Path gameDir = args.length > 0 ? Path.of(args[0]) : Path.of(".");
         Path modsDir = null;
         java.util.List<String> mc = new java.util.ArrayList<>(args.length);
@@ -117,11 +117,36 @@ public class LoaderMain {
                 mc.add(a);
             }
         }
+        Path resolvedGameDir = gameDir.toAbsolutePath().normalize();
         Path resolvedMods = modsDir != null
                 ? modsDir.toAbsolutePath().normalize()
-                : gameDir.toAbsolutePath().normalize().resolve("mods");
-        return new LaunchOptions(gameDir.toAbsolutePath().normalize(), resolvedMods,
-                mc.toArray(new String[0]));
+                : resolvedGameDir.resolve("mods");
+
+        // ── 注入 --gameDir ───────────────────────────────────────────────
+        //
+        // args[0] 只被平台消费，Minecraft 自己看不到它。而 Minecraft 在
+        // 拿不到 --gameDir 时会把**当前工作目录**当游戏目录 —— 启动脚本
+        // 在 bin/ 里执行 java，于是 gameDir 变成 bin/：
+        //
+        //   · 资源索引读 bin/assets/indexes/32.json，而资源其实下载在
+        //     game/assets/ 下 → 索引读不到 → 界面背景图、多语言（lang）、
+        //     全部音效（assets/sounds.json）一起消失
+        //   · icons/icon_16x16.png 找不到
+        //   · options.txt / saves / resourcepacks 全落在 bin/ 而不是 game/
+        //
+        // 关键点：Minecraft 的资源与存档目录是按 --gameDir 推导的，不是按
+        // 「jar 在哪」。平台定位 jar 用 gameDir，交给游戏用 --gameDir，
+        // 两者必须一致 —— 否则平台能找到游戏，游戏却在自己的目录里找资源。
+        java.util.List<String> forwarded = new java.util.ArrayList<>(mc.size() + 2);
+        boolean hasGameDir = mc.stream().anyMatch(a -> a.startsWith("--gameDir"));
+        if (!hasGameDir) {
+            forwarded.add("--gameDir");
+            forwarded.add(resolvedGameDir.toString());
+        }
+        forwarded.addAll(mc);
+
+        return new LaunchOptions(resolvedGameDir, resolvedMods,
+                forwarded.toArray(new String[0]));
     }
 
     public static void main(String[] args) throws Exception {
@@ -267,6 +292,7 @@ public class LoaderMain {
     private void reportDiscovery(List<ModManifest> mods) {
         Path modsDir = config.getModsPath();
         long jarCount;
+        boolean dirExists = Files.isDirectory(modsDir);
         try (java.util.stream.Stream<Path> files = Files.list(modsDir)) {
             jarCount = files.filter(p -> p.toString().endsWith(".jar")
                     || p.toString().endsWith(".zip")).count();
@@ -279,6 +305,16 @@ public class LoaderMain {
                 + ", 识别=" + mods.size() + ")");
         for (ModManifest m : mods) {
             System.out.println("[Mili]   发现 Mod: " + m.id() + " v" + m.version());
+        }
+
+        // 目录根本不存在 —— 分发包布局下最常见的失效：Mod 在<dist>/mods，
+        // 而 gameDir 是 <dist>/game。不显式报出来，玩家只会看到
+        // 「游戏正常启动了，但什么都没有」。
+        if (!dirExists) {
+            System.err.println("[Mili] 警告: Mod 目录不存在: " + modsDir
+                    + "\n  这会让所有 Mod 被静默跳过（游戏仍会正常启动）。"
+                    + "\n  分发包布局下 Mod 应放在 <dist>/mods，启动脚本需传 --mili-mods <dir>。");
+            return;
         }
 
         if (jarCount > 0 && mods.isEmpty()) {
