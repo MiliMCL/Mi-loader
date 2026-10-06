@@ -37,6 +37,27 @@ public class LoaderConfig {
         return load(gameDir);
     }
 
+    /**
+     * 同 {@link #at(Path)}，但显式指定 Mod 目录。
+     *
+     * <p><b>为什么需要它</b>：分发包的布局是
+     * <pre>
+     *   mili-0.1.0-mc26.2/
+     *     bin/     core/     mods/     game/26.2.jar
+     * </pre>
+     * Mod 在<b>分发根</b>的 {@code mods/}，而 Minecraft 在
+     * {@code game/}。启动脚本把 {@code game/} 当作 gameDir 传进来 ——
+     * 这是对的，Minecraft 只在 game/ 里。但 {@code gameDir.resolve("mods")}
+     * 于是指向 {@code game/mods/}，一个从来不存在的目录。
+     *
+     * <p>后果不是报错，而是<b>零个Mod 被发现</b>：没有异常、没有警告，
+     * 只是游戏照常启动、Mod 内容一片空白。这正是这套代码里反复要消灭的
+     * 静默失效。
+     */
+    public static LoaderConfig at(Path gameDir, Path modsDir) {
+        return new LoaderConfig(gameDir, null, modsDir, null, null);
+    }
+
     public Path getGameDir() { return gameDir; }
     public Path getMinecraftPath() { return minecraftPath; }
     public Path getModsPath() { return modsPath; }

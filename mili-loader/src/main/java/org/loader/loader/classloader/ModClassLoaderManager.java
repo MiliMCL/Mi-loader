@@ -28,6 +28,7 @@ public final class ModClassLoaderManager implements AutoCloseable {
     private final List<String> creationOrder = new ArrayList<>();
     private final MinecraftClassLoader gameClassLoader;
     private final Path gameDir;
+    private final Path modsDir;
 
     /** 全局重复类注册表：className -> 定义它的 modId。 */
     private final Map<String, String> classOwners = new LinkedHashMap<>();
@@ -35,8 +36,20 @@ public final class ModClassLoaderManager implements AutoCloseable {
     private final List<DuplicateClass> duplicates = new ArrayList<>();
 
     public ModClassLoaderManager(MinecraftClassLoader gameClassLoader, Path gameDir) {
+        this(gameClassLoader, gameDir,
+                gameDir != null ? gameDir.resolve("mods") : Path.of("mods"));
+    }
+
+    /**
+     * @param gameClassLoader 全局唯一的 Minecraft ClassLoader
+     * @param gameDir         游戏目录（诊断用）
+     * @param modsDir         Mod 目录；分发包里它<b>不是</b> {@code gameDir/mods}
+     */
+    public ModClassLoaderManager(MinecraftClassLoader gameClassLoader,
+                                 Path gameDir, Path modsDir) {
         this.gameClassLoader = gameClassLoader;
         this.gameDir = gameDir;
+        this.modsDir = modsDir != null ? modsDir : Path.of("mods");
     }
 
     /**
@@ -61,7 +74,7 @@ public final class ModClassLoaderManager implements AutoCloseable {
         if (classLoaders.containsKey(manifest.id())) {
             return classLoaders.get(manifest.id());
         }
-        ModClassLoader mcl = new ModClassLoader(manifest, gameClassLoader, gameDir);
+        ModClassLoader mcl = new ModClassLoader(manifest, gameClassLoader, gameDir, modsDir);
         classLoaders.put(manifest.id(), mcl);
         creationOrder.add(manifest.id());
         return mcl;

@@ -45,7 +45,7 @@ public final class ModClassLoader extends URLClassLoader {
     private final ModManifest manifest;
     private final String modId;
     private final MinecraftClassLoader gameClassLoader;
-    private final Path gameDir;
+    private final Path modsDir;
     private final List<Path> modSources = new ArrayList<>();
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
@@ -57,14 +57,29 @@ public final class ModClassLoader extends URLClassLoader {
     /**
      * @param manifestMod Mod 清单
      * @param gameCL      全局唯一的 Minecraft ClassLoader（作为 parent）
-     * @param gameDir     游戏目录，用于定位 mods/&lt;id&gt;.jar
+     * @param gameDir     游戏目录；Mod 源码位于其下的 {@code mods/}
      */
     public ModClassLoader(ModManifest manifestMod, MinecraftClassLoader gameCL, Path gameDir) {
+        this(manifestMod, gameCL,
+                gameDir != null ? gameDir : Path.of("."),
+                gameDir != null ? gameDir.resolve("mods") : Path.of("mods"));
+    }
+
+    /**
+     * @param manifestMod Mod 清单
+     * @param gameCL      全局唯一的 Minecraft ClassLoader（作为 parent）
+     * @param gameDir     游戏目录（诊断用）
+     * @param modsDir     Mod 目录。<b>必须显式传入</b> ——
+     *                    它不等于 {@code gameDir/mods}：分发包里 Mod 在
+     *                    {@code <dist>/mods} 而Minecraft 在 {@code <dist>/game}。
+     */
+    public ModClassLoader(ModManifest manifestMod, MinecraftClassLoader gameCL,
+                          Path gameDir, Path modsDir) {
         super("mili-mod-" + manifestMod.id(), new URL[0], gameCL);
         this.manifest = manifestMod;
         this.modId = manifestMod.id();
         this.gameClassLoader = gameCL;
-        this.gameDir = gameDir != null ? gameDir : Path.of(".");
+        this.modsDir = modsDir != null ? modsDir : Path.of("mods");
 
         // 仅本 Mod 自己的代码进入 classpath —— 不再把整个 Minecraft classpath
         // 平铺进每个 Mod，那会导致 MC 类被重复定义。
@@ -79,17 +94,17 @@ public final class ModClassLoader extends URLClassLoader {
     }
 
     /**
-     * 定位 Mod 自身的代码源：mods/&lt;id&gt;.jar 或 mods/&lt;id&gt;/。
+     * 定位 Mod 自身的代码源：{@code <modsDir>/<id>.jar} 或 {@code <modsDir>/<id>/}。
      */
     private List<Path> locateModSources() {
         List<Path> found = new ArrayList<>();
-        Path modsDir = gameDir.resolve("mods");
+        Path base = modsDir;
 
-        Path jar = modsDir.resolve(modId + ".jar");
+        Path jar = base.resolve(modId + ".jar");
         if (Files.exists(jar)) {
             found.add(jar);
         }
-        Path dir = modsDir.resolve(modId);
+        Path dir = base.resolve(modId);
         if (Files.isDirectory(dir)) {
             found.add(dir);
             // 开发态：展开 Gradle 输出，便于本地调试

@@ -385,6 +385,91 @@ val distZip = tasks.register<Zip>("distZip") {
 
 tasks.named("build") { dependsOn(distTar) }
 
+// ── 启动脚本编码校验 ────────────────────────────────────────────────────────
+// 踩过的坑：mili-loader.bat 曾经是「UTF-8 中文注释 + LF 行尾」。cmd.exe 在
+// OEM 代码页（中文系统为 GBK/936）下无法正确切分 LF-only 文件的命令边界，
+// 于是一行被劈成碎片，报出：
+//   '浠?Mojang' 不是内部或外部命令
+//   'local' 不是内部或外部命令
+//   批处理参数替换中的路径运算符的下列用法无效: %~fI"
+// 更隐蔽的是：REM 注释里写一个字面百分号也会被 cmd 展开并破坏解析。
+//
+// 因此这里强制三条硬规则，任何一条不满足即构建失败：
+//   1. 纯 ASCII（无 BOM）—— cmd 不需要猜代码页
+//   2. CRLF 行尾，且不允许出现裸 LF
+//   3. REM 注释行内不出现字面百分号
+val launcherScripts = tasks.register("launcherScriptCheck") {
+    group = "verification"
+    description = "校验 bin/ 启动脚本为纯 ASCII + CRLF，且 REM 注释不含字面百分号"
+
+    val scripts = listOf(
+        layout.projectDirectory.file("distribution/bin/mili-loader.bat")
+    )
+    inputs.files(scripts)
+    // 无输出：这是校验任务，每次都跑
+
+    doLast {
+        val problems = mutableListOf<String>()
+
+        scripts.forEach { f ->
+            if (!f.asFile.isFile) {
+                problems += "${f.asFile.name}: 文件不存在"
+                return@forEach
+            }
+            val bytes = f.asFile.readBytes()
+
+            // 规则 1a：BOM
+            if (bytes.size >= 3 &&
+                bytes[0] == 0xEF.toByte() &&
+                bytes[1] == 0xBB.toByte() &&
+                bytes[2] == 0xBF.toByte()
+            ) {
+                problems += "${f.asFile.name}: 含 UTF-8 BOM，cmd 会把 BOM 当命令首字符"
+            }
+
+            // 规则 1b：非 ASCII
+            val nonAscii = bytes.withIndex().filter { it.value >= 0x80 }
+            if (nonAscii.isNotEmpty()) {
+                val first = nonAscii.first()
+                problems += "${f.asFile.name}: 含 ${nonAscii.size} 个非 ASCII 字节" +
+                    "（首个在偏移 ${first.index}，值 0x%02X）".format(first.value.toInt() and 0xFF)
+            }
+
+            // 规则 2：行尾必须是 CRLF，不允许裸 LF
+            val bareLf = bytes.withIndex().count { (i, b) ->
+                b == 0x0A.toByte() && (i == 0 || bytes[i - 1] != 0x0D.toByte())
+            }
+            val crlf = bytes.windowed(2).count { it[0] == 0x0D.toByte() && it[1] == 0x0A.toByte() }
+            if (bareLf > 0) {
+                problems += "${f.asFile.name}: 含 $bareLf 个裸 LF（CRLF 共 $crlf 个）。" +
+                    "cmd.exe 要求 CRLF 行尾，否则命令边界解析错乱"
+            }
+
+            // 规则 3：REM 注释里不得出现字面百分号（cmd 会尝试展开它）
+            val text = String(bytes, Charsets.ISO_8859_1)
+            text.split("\r\n").forEachIndexed { idx, line ->
+                val trimmed = line.trimStart()
+                if (trimmed.startsWith("REM", ignoreCase = true) && line.contains('%')) {
+                    problems += "${f.asFile.name}:${idx + 1}: REM 注释含字面百分号，" +
+                        "cmd 会在 REM 行展开变量并破坏解析"
+                }
+            }
+        }
+
+        if (problems.isNotEmpty()) {
+            throw GradleException(
+                "启动脚本编码校验失败:\n" + problems.joinToString("\n") { "  - $it" } +
+                    "\n\n修复方式：用纯 ASCII 内容 + CRLF 行尾重写该文件。" +
+                    "详见 mili-loader/distribution/bin/mili-loader.bat 顶部说明。"
+            )
+        }
+        logger.lifecycle("启动脚本编码校验通过（纯 ASCII + CRLF）")
+    }
+}
+
+tasks.named("check") { dependsOn(launcherScripts) }
+tasks.named("build") { dependsOn(launcherScripts) }
+
 // ── 分发边界验证（Minecraft 分发红线） ──────────────────────────────────────
 // 递归扫描分发产物，任何 Minecraft 类/源码/本体 JAR 都让构建失败。
 // 详见 distribution-boundary.gradle.kts 顶部的规则说明。

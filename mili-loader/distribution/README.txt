@@ -66,12 +66,23 @@ Mojang 官方 CDN 下载并逐个校验 SHA-1。这样做有两个原因：
 常用参数
 --------
 
+    --mili-mods <dir>   指定 Mod 目录（分发包默认已指向 <dist>/mods，一般无需手动传）
     --dry-run        只查询元数据并打印所需体积，不下载
     --skip-assets    跳过资源下载（约省 480MB，但进世界会缺资源）
     --server         以服务端模式启动
 
 故障排查
 --------
+
+**游戏能启动，但 Mod 内容一片空白**
+Mod 没被发现。启动日志里有一行
+`[Mili] Mod 目录: ... (JAR/ZIP=n, 识别=m)` —— 若 `n > 0` 而 `m = 0`，
+说明 JAR 放在了平台没扫的目录，或JAR 里缺少 `META-INF/mod.json`。
+Mod 必须放在分发包的 `mods/` 目录（不是 `game/mods/`）。
+
+**ClassNotFoundException: net.minecraft.SharedConstants**
+平台没能把 MinecraftClassLoader 交给绑定层，通常意味着 core/ 下的
+平台 JAR 与 bin/ 下的启动脚本版本不匹配。重新解压一份完整的分发包。
 
 **提示找不到 Minecraft**
 运行 `./bin/mili-loader --dry-run` 检查网络能否访问 Mojang CDN。

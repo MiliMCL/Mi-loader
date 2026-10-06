@@ -55,13 +55,21 @@ final class GameSessionState {
     }
 
     /**
-     * 取当前线程所指游戏实例的状态。
+ * 取当前游戏实例的状态。
      *
-     * <p>注意 {@link Reflect#gameClassLoader()} 是 {@code ThreadLocal}：
-     * 状态因此是<b>每线程所见游戏实例</b>一份。在单线程的启动流程里
-     * 这恰好就是「每游戏实例一份」；若平台将来要在同一 JVM 内并发驱动多个
-     * 游戏实例，必须先把游戏 ClassLoader 从 ThreadLocal 提升为显式参数，
-     * 否则此处会串味。类加载器拓扑决定了这一点无法靠加锁解决。
+     * <p>键是 {@link Reflect#gameClassLoader()}：生产拓扑下它就是
+     * {@code MinecraftClassLoader}，未显式设置时是平台 ClassLoader。
+     *
+     * <p><b>键必须全线程一致</b>，否则同一个游戏实例会在不同线程上
+     * 拿到不同的状态对象 —— 例如主线程置位了 {@code versionDetected}，
+     * 游戏线程却读到另一个实例的 {@code false}，于是版本被重复探测、
+     * 甚至在冻结后又去开注册窗口。为此 {@code Reflect} 里的游戏
+     * ClassLoader 必须是<b>静态</b>字段而非 ThreadLocal：游戏跑在
+     * {@code minecraft-main} 线程上，ThreadLocal 会让那条线程看到
+     * 平台 ClassLoader，进而看到一个完全空的状态。
+     *
+     * <p>仍不受支持的场景：同一JVM 内并发驱动多个游戏实例。真要支持，
+     * 必须先把游戏 ClassLoader 从全局状态提升为显式参数。
      */
     static GameSessionState current() {
         ClassLoader key = Reflect.gameClassLoader();

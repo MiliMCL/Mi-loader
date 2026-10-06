@@ -20,6 +20,7 @@ import java.io.InputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -71,12 +72,64 @@ public class LoaderMain {
                 .orElseGet(MinecraftGameProvider::new);
     }
 
+    /**
+     * 启动参数里解析出来的、属于<b>平台</b>（而非 Minecraft）的选项。
+     *
+     * @param gameDir    Minecraft 所在目录（{@code <dist>/game}）
+     * @param modsDir    Mod 所在目录（{@code <dist>/mods}）；未显式指定时
+     *                   回退到 {@code gameDir/mods}
+     * @param mcArgs     转发给 Minecraft main 的参数（已剔除平台选项）
+     */
+    private record LaunchOptions(Path gameDir, Path modsDir, String[] mcArgs) {
+    }
+
+    /**
+     * 拆分平台选项与 Minecraft 参数。
+     *
+     * <p><b>为什么必须拆</b>：{@code args[0]} 是 gameDir，其余全部原样转发给
+     * {@code net.minecraft.client.main.Main}。Minecraft 用 joptsimple 解析参数，
+     * 遇到不认识的 {@code --xxx} 会直接抛 {@code UnrecognizedOptionException}
+     * 并拒绝启动。所以平台自己的选项必须在转发前摘掉。
+     *
+     * <p>支持的平台选项：
+     * <ul>
+     *   <li>{@code --mili-mods <dir>} —— Mod 目录。分发包把Mod 放在
+     *       {@code <dist>/mods}，而 gameDir 是 {@code <dist>/game}，
+     *       两者不是同一个目录；不显式指定就会去扫一个不存在的
+     *       {@code game/mods/}，结果是零个 Mod 且无任何报错。</li>
+     * </ul>
+     */
+    private static LaunchOptions parseArgs(String[] args) {
+        Path gameDir = args.length > 0 ? Path.of(args[0]) : Path.of(".");
+        Path modsDir = null;
+        java.util.List<String> mc = new java.util.ArrayList<>(args.length);
+        for (int i = 1; i < args.length; i++) {
+            String a = args[i];
+            if ("--mili-mods".equals(a)) {
+                if (i + 1 >= args.length) {
+                    throw new IllegalArgumentException(
+                            "--mili-mods requires a directory argument");
+                }
+                modsDir = Path.of(args[++i]);
+            } else if (a.startsWith("--mili-mods=")) {
+                modsDir = Path.of(a.substring("--mili-mods=".length()));
+            } else {
+                mc.add(a);
+            }
+        }
+        Path resolvedMods = modsDir != null
+                ? modsDir.toAbsolutePath().normalize()
+                : gameDir.toAbsolutePath().normalize().resolve("mods");
+        return new LaunchOptions(gameDir.toAbsolutePath().normalize(), resolvedMods,
+                mc.toArray(new String[0]));
+    }
+
     public static void main(String[] args) throws Exception {
-        Path gd = args.length > 0 ? Path.of(args[0]) : Path.of(".");
-        LoaderConfig config = LoaderConfig.load(gd);
+        LaunchOptions opts = parseArgs(args);
+        LoaderConfig config = LoaderConfig.at(opts.gameDir(), opts.modsDir());
         LoaderMain m = new LoaderMain(config);
-        m.gameDir = gd.toAbsolutePath().normalize();
-        m.launch(args);
+        m.gameDir = opts.gameDir();
+        m.launch(opts.mcArgs());
     }
 
     /**
@@ -154,7 +207,6 @@ public class LoaderMain {
      */
     public void launch(String[] mcArgs) throws Exception {
         ensureMinecraftPresent();
-        String[] passThrough = stripGameDirArg(mcArgs);
 
         // ── 2. 发现 Minecraft ────────────────────────────────────────────
         List<Path> gameClasspath = gameProvider.locateGame(gameDir);
@@ -166,12 +218,16 @@ public class LoaderMain {
                             + gameProvider.getClass().getName());
         }
         MinecraftClassLoader gameCL = mcProvider.createGameClassLoader(gameClasspath);
-        classLoaderManager = new ModClassLoaderManager(gameCL, gameDir);
+        classLoaderManager = new ModClassLoaderManager(gameCL, gameDir, config.getModsPath());
 
         // ── 4. 发现 Mod ──────────────────────────────────────────────────
-        LoaderConfig gameConfig = LoaderConfig.at(gameDir);
-        ModDiscovery modDiscovery = ModDiscovery.scan(gameConfig);
+        //
+        // config 已由 main() 按--mili-mods 装配好 Mod 目录；这里必须复用
+        // 它，不能重新 LoaderConfig.at(gameDir) —— 那会把 Mod 目录重置回
+        // gameDir/mods，在分发包布局下指向一个不存在的目录。
+        ModDiscovery modDiscovery = ModDiscovery.scan(config);
         List<ModManifest> resolved = modDiscovery.resolveDependencies(modDiscovery.discover());
+        reportDiscovery(resolved);
 
         runtime.start();
 
@@ -194,9 +250,42 @@ public class LoaderMain {
 
         // ── 9. 启动 Minecraft ────────────────────────────────────────────
         try {
-            gameProvider.launch(gameDir, runtime, classLoaderManager, gameClasspath, passThrough);
+            gameProvider.launch(gameDir, runtime, classLoaderManager, gameClasspath, mcArgs);
         } finally {
             shutdown();
+        }
+    }
+
+    /**
+     * 打印 Mod 发现结果 —— 并在「目录里有JAR 但一个都没被识别」时报警。
+     *
+     * <p>这个检查专门针对一种特别难查的失效：Mod 放错目录时
+     * {@link ModDiscovery} 不抛异常、不打警告，只是安静地返回空列表，
+     * 于是游戏正常启动、Mod 内容一片空白，而启动日志里看不出任何异常。
+     * 用户能看到的唯一线索就是「我明明放了 Mod」。
+     */
+    private void reportDiscovery(List<ModManifest> mods) {
+        Path modsDir = config.getModsPath();
+        long jarCount;
+        try (java.util.stream.Stream<Path> files = Files.list(modsDir)) {
+            jarCount = files.filter(p -> p.toString().endsWith(".jar")
+                    || p.toString().endsWith(".zip")).count();
+        } catch (Exception e) {
+            jarCount = -1;
+        }
+
+        System.out.println("[Mili] Mod 目录: " + modsDir
+                + "  (JAR/ZIP=" + (jarCount < 0 ? "?" : jarCount)
+                + ", 识别=" + mods.size() + ")");
+        for (ModManifest m : mods) {
+            System.out.println("[Mili]   发现 Mod: " + m.id() + " v" + m.version());
+        }
+
+        if (jarCount > 0 && mods.isEmpty()) {
+            System.err.println("[Mili] 警告: " + modsDir + " 里有 " + jarCount
+                    + " 个 JAR，但一个 Mod 都没被识别。"
+                    + "\n  Mod JAR 必须包含 META-INF/mod.json 或 mod.json，"
+                    + "且 mod.json 里的 id / entrypoint 必填项不能为空。");
         }
     }
 
@@ -324,14 +413,8 @@ public class LoaderMain {
         }
     }
 
-    private String[] stripGameDirArg(String[] args) {
-        if (args == null || args.length <= 1) {
-            return new String[0];
-        }
-        String[] rest = new String[args.length - 1];
-        System.arraycopy(args, 1, rest, 0, rest.length);
-        return rest;
-    }
+    // 平台参数的拆分已移到 parseArgs()：它同时要摘掉 --mili-mods，
+    // 而不只是 args[0] 的 gameDir。
 
     /**
      * 强制平台版本三元组精确匹配。任一不匹配即拒绝。

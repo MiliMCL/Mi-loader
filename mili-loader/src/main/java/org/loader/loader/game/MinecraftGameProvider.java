@@ -131,6 +131,26 @@ public class MinecraftGameProvider implements GameProvider {
                             + "。请确认 gameDir 中的 Minecraft 完整且版本匹配 ("
                             + getRawGameVersion() + ")");
         }
+
+        // 把游戏 ClassLoader 交给绑定层（org.loader.runtime.minecraft.reflect.Reflect）。
+        //
+        // 这一行曾经根本不存在，于是整个绑定层在生产路径上用的是
+        // Reflect.class.getClassLoader() —— 平台的 AppClassLoader。
+        // Minecraft 的类只存在于 MinecraftClassLoader 的 URL 里，
+        // 平台 CL 看不见，于是启动第一次触碰游戏类时就炸：
+        //   ClassNotFoundException: net.minecraft.SharedConstants
+        //   → SharedVersionGate.ensureVersionDetected 失败
+        //   → EntryPointHook 拒绝启动游戏。
+        //
+        // 测试路径靠 GameTestClassLoader.install() 调useGameClassLoader，
+        // 于是这个缺陷在「有 MC 的测试」里完全不可见 —— 测试和生产
+        // 唯一的区别就是这一行。
+        //
+        // 必须在任何 Mod 加载、任何注册动作排队之前设置：Mod 的
+        // initialize() 里第一次 registry().block(...) 就会解析游戏类。
+        org.loader.runtime.minecraft.reflect.Reflect
+                .useGameClassLoader(gameClassLoader);
+
         return gameClassLoader;
     }
 

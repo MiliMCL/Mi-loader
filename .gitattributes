@@ -1,0 +1,22 @@
+# 统一文本文件行尾策略。
+#
+# 默认：文本文件以 LF 存储（仓库内），检出时按平台处理。
+# 例外：cmd 批处理必须是 CRLF。cmd.exe 在 OEM 代码页（中文环境为 GBK/936）
+# 下解析 .bat；若文件是 LF-only 且含非 ASCII 字节，cmd 会退化为按字节猜测
+# 命令边界，把单行拆成碎片，产生 "'local' 不是内部或外部命令"、
+# "%%~fI 用法无效" 之类的错误。详见 mili-loader/distribution/bin/mili-loader.bat
+# 顶部的说明。
+* text=auto
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制资源，禁止任何行尾/编码转换
+*.jar       binary
+*.class     binary
+*.bin       binary
+*.gz        binary
+*.zip       binary
+*.png       binary
+*.ogg       binary
+*.dat       binary

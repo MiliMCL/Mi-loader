@@ -22,12 +22,25 @@ public final class Reflect {
     private static final Map<String, Field> FIELD_CACHE = new ConcurrentHashMap<>();
 
     /**
-     * 游戏类的 ClassLoader，由 Loader 在启动时设置。
+     * 游戏类的 ClassLoader，由 Loader 在创建 MinecraftClassLoader 时设置。
      *
-     * <p>用 ThreadLocal 而非静态字段：绑定层可能被多个 ClassLoader 各自加载
-     * （测试、Mod 隔离场景），静态字段会在它们之间串味。
+     * <p><b>为什么是静态字段而不是 ThreadLocal</b>：
+     * 本类的读者遍布全平台，其中一部分必然运行在<b>游戏自己的线程</b>上 ——
+     * {@code BehaviourDispatch.tick}、{@code CurrentWorld.current()}、
+     * tick 回调里的任何反射访问，都发生在 {@code minecraft-main} 线程上。
+     * 用 ThreadLocal 的话，主线程设的值对那条线程<b>不可见</b>，
+     * {@link #gameClassLoader()} 会在游戏运行期间悄悄回落到平台 ClassLoader，
+     * 症状是「启动好好的，进游戏就 ClassNotFoundException」。
+     *
+     * <p>原设计的顾虑是「绑定层可能被多个 ClassLoader 各自加载，静态字段会串味」。
+     * 但那种情况下 {@code Reflect} 本身就有多份，每份各有一个静态字段 ——
+     * 静态字段本来就是按定义它的 ClassLoader 隔离的，ThreadLocal 在这里
+     * 一点也没解决串味，只制造了跨线程不可见。
+     *
+     * <p>进程内并发跑多个游戏实例仍不受支持（见 {@code GameSessionState}
+     * 的说明）；真要支持，得把游戏 ClassLoader 从全局状态提升为显式参数。
      */
-    private static final ThreadLocal<ClassLoader> GAME_CL = new ThreadLocal<>();
+    private static volatile ClassLoader GAME_CL;
 
     private Reflect() {
     }
@@ -49,13 +62,14 @@ public final class Reflect {
     /**
      * 游戏类的 ClassLoader。
      *
-     * <p>默认是平台 JAR 的加载器 —— 适用于游戏类与平台在同一个 CL 的情况。
-     * 但真实拓扑是 Minecraft 由独立的 {@code MinecraftClassLoader} 加载，
-     * 不在平台 CL 上；此时必须通过 {@link #useGameClassLoader} 显式指定，
-     * 否则 {@code ClassNotFoundException: net.minecraft.SharedConstants}。
+     * <p>默认是平台 JAR 的加载器 —— 适用于游戏类与平台在同一个 CL 的情况
+     * （IDE 直跑、纯契约测试）。但生产拓扑是 Minecraft 由独立的
+     * {@code MinecraftClassLoader} 加载，不在平台 CL 上；此时必须通过
+     * {@link #useGameClassLoader} 显式指定，否则
+     * {@code ClassNotFoundException: net.minecraft.SharedConstants}。
      */
     public static ClassLoader gameClassLoader() {
-        ClassLoader explicit = GAME_CL.get();
+        ClassLoader explicit = GAME_CL;
         return explicit != null ? explicit : Reflect.class.getClassLoader();
     }
 
@@ -68,7 +82,7 @@ public final class Reflect {
      * @param loader 定义 {@code net.minecraft.*} 的加载器；传 null 恢复默认
      */
     public static void useGameClassLoader(ClassLoader loader) {
-        GAME_CL.set(loader);
+        GAME_CL = loader;
         clearCaches();
     }
 
