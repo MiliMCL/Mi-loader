@@ -193,11 +193,16 @@ class ClientUiTransformersTest {
         // 端到端：回调在本测试环境无 Minecraft，必须被分发器吞掉而非抛出
         Class<?> c = define(
                 MiliSymbol.TITLE_SCREEN_INIT.owner().replace('/', '.'), transformed);
-        c.getDeclaredMethod("init").setAccessible(true);
         c.getDeclaredConstructor().newInstance(); // 类初始化不炸
+        // init 是 protected（与原版签名一致），测试类在另一个包，反射调用必须
+        // setAccessible。注意：getDeclaredMethod 每次都返回【新的】Method 拷贝，
+        // setAccessible 只对拿到的那个实例生效 —— 必须捕获同一个实例再 invoke，
+        // 否则 IllegalAccessException。
+        java.lang.reflect.Method init = c.getDeclaredMethod("init");
+        init.setAccessible(true);
         // 调用 init 本身：onTitleScreenInit 内部失败必须静默（无 MC 环境）
         Object instance = c.getDeclaredConstructor().newInstance();
-        c.getDeclaredMethod("init").invoke(instance);
+        init.invoke(instance);
     }
 
     // ── 匹配与符号一致性 ────────────────────────────────────────────────────
