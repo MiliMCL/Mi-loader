@@ -76,16 +76,82 @@ class RegistryClassInitOrderTest {
             if (!guarded && inOpenRegistryWindow(lines, i)) {
                 guarded = true;
             }
+            // 第三种合法豁免：触碰点所在的代码块内带有显式的书面论证。
+            //
+            // 为什么必须有这条：drainUnregisteredBlocks() 由 closeRegistryWindow()
+            // 在窗口【已关闭之后】调用，而 ensureRegistriesReadable() 内部走
+            // openRegistryWindow()，遇到 windowClosed=true 会抛
+            // "The registration window is already closed"—— 加了必然炸，
+            // 且会屏蔽掉该方法真正要报告的内容。
+            //
+            // 那种豁免无法用「前8 行有调用」表达：论证性注释常超过 8 行，
+            // 而窗口宽度不该被注释长度绑架。改为识别显式标记：
+            // 触碰点之前（含其所在语句块内）出现约定的豁免声明标记。
+            if (!guarded && hasExplicitExemption(lines, i)) {
+                guarded = true;
+            }
 
             if (!guarded) {
                 throw new AssertionError(String.format(
                         "%s:%d 直接触碰了注册表静态字段却没有先调用 "
                                 + "ensureRegistriesReadable():%n    %s%n%n"
                                 + "这会让该处成为「首次失败」的一环，类初始化失败不可重试，"
-                                + "之后平台开窗必然抛 NoClassDefFoundError。",
-                        sourcePath, i + 1, line));
+                                + "之后平台开窗必然抛 NoClassDefFoundError。%n"
+                                + "若此处确实无法调用（如窗口已关闭之后），请在该语句块内"
+                                + "显式声明豁免标记：%s",
+                        sourcePath, i + 1, line, EXEMPTION_MARKER));
             }
         }
+    }
+
+    /**
+     * 约定的豁免标记。
+     *
+     * <p>写在触碰点之前的注释里，形如
+     * {@code // [registry-exempt: 窗口已关闭，无法开窗]}。
+     * 它的作用不是「让测试闭嘴」，而是<b>强制作者把理由写下来</b> ——
+     * 没有理由的豁免无法通过 review，标记本身就是那份理由的锚点。
+     */
+    private static final String EXEMPTION_MARKER = "[registry-exempt:";
+
+    /**
+     * 触碰点是否带有显式豁免标记。
+     *
+     * <p>从触碰点向前扫到最近的 {@code try} 块开头；标记本身允许注释多长。
+     *
+     * <p><b>只认「专门声明标记的那一行」</b>：该行必须以 {@code //} 或
+     * {@code *} 开头（即它是一条注释），且整行trim 后以标记开头。
+     * 这样后来在别处<i>提到</i>这个标记（例如在文档里解释这套机制）
+     * 不会被误当成授权 —— 否则删掉真正的声明行后，讨论它的说明行
+     * 会让豁免「诈尸」，测试变成假绿。
+     */
+    private static boolean hasExplicitExemption(String[] lines, int index) {
+        for (int i = index; i >= 0; i--) {
+            String t = lines[i].trim();
+            if (t.startsWith("//")) {
+                // 剥掉行注释前缀后再看，避免 '// [registry-exempt' 与
+                // '//[registry-exempt' 因一个空格之差而漏判。
+                String body = t.substring(2).trim();
+                if (body.startsWith(EXEMPTION_MARKER)) {
+                    return true;
+                }
+            } else if (t.startsWith("*")) {
+                // Javadoc 行：'* [registry-exempt: ...'
+                String body = t.substring(1).trim();
+                if (body.startsWith(EXEMPTION_MARKER)) {
+                    return true;
+                }
+            }
+            // 只回溯到最近的 try 块开头；超出即认为不在同一论证范围内。
+            if (t.startsWith("try {")) {
+                return false;
+            }
+            // 防御性上限：避免跨整个方法去找一个更早的标记。
+            if (i <= index - 60) {
+                return false;
+            }
+        }
+        return false;
     }
 
     /** 触碰点是否位于 {@code openRegistryWindow()} 内部（那是合法的一处）。 */

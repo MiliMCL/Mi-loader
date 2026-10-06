@@ -330,6 +330,8 @@ private static final String[] SUB_BOOTSTRAPS = {
         List<Object> orphans = new ArrayList<>();
         try {
             // 【不要在这里调 ensureRegistriesReadable()】
+            // [registry-exempt: 窗口已关闭，无法开窗]
+            //
             // 本方法由 closeRegistryWindow() 在【窗口已关闭之后】调用，
             // 而 ensureRegistriesReadable() 内部走 openRegistryWindow()，
             // 遇到 windowClosed=true 会直接抛
@@ -340,6 +342,10 @@ private static final String[] SUB_BOOTSTRAPS = {
             //
             // 此刻注册表类必然已初始化完毕（窗口能开就说明标志已置、
             // BuiltInRegistries 已被触碰过），直接读即可。
+            //
+            // 本方法上方的豁免标记是 RegistryClassInitOrderTest 要求的显式声明：
+            // 强制把"为何此处可以裸触碰"的理由写在代码里，
+            // 而不是靠注释长度碰巧落在测试的扫描窗口内。
             Object registry = Reflect.staticField(BUILTIN, "BLOCK");
             // 【必须沿类继承链查找】字段声明在父类 MappedRegistry 里
             // （26.2 实测第 66 行），而 BuiltInRegistries.BLOCK 的运行时类
