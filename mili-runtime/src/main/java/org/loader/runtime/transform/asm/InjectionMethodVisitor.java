@@ -219,12 +219,44 @@ final class InjectionMethodVisitor extends AdviceAdapter {
      *
      * <p>栈效果：回调为 void（注册期已强制），栈高度不变；
      * 结束后栈顶是 {@code int} 型取消标志，调用方必须立即消费。
+     *
+     * <h2>为什么不能委托 {@link #pushCallback}（曾经的 AIOOBE 根因）</h2>
+     * {@code pushCallback} 会把「构造 ctx」与「调用回调」一起发出。
+     * 可取消回调是 {@code (ctx)V} —— 回调消费掉栈上的 ctx 后栈已空，
+     * 随后的 {@code ASTORE} 就在从<b>空栈</b>弹值。ASM 的帧模拟对空栈
+     * {@code pop} 打 {@code STACK_KIND} 前缀标记，该标记进入局部变量后，
+     * 在分支合并处被解析为 {@code inputStack[-1]} —— 转换期直接抛
+     * {@code ArrayIndexOutOfBoundsException}（而非运行期 VerifyError），
+     * 堆栈指向 {@code Frame.getConcreteOutputType}，与生成代码的形状
+     * 完全对不上。正确顺序是：ctx 先入槽，回调以槽内副本为实参调用，
+     * 再重读槽内 ctx 查询取消标志。
      */
     private void emitCancellableCallback(MiliClassTransformer.MethodInjection injection) {
+        String callbackOwner = injection.replacementOwner();
+        if (callbackOwner == null) {
+            throw new org.loader.api.transform.TransformationException(
+                    "可取消注入缺少回调目标（replacementOwner 为 null）: "
+                            + injection.point() + " by " + injection.transformerId(),
+                    injection.transformerId(), null);
+        }
+        String callbackDescriptor = injection.effectiveCallbackDescriptor();
         Type ctxType = CONTEXT_TYPE;
         int slot = newLocal(ctxType);
-        pushCallback(injection);
+
+        // 1. 只构造 ctx（emitContextArgument 按 cancellable 选择
+        //    forCancellableMethod）并存入局部变量 —— 此处绝不调用回调。
+        emitContextArgument(injection);
         storeLocal(slot, ctxType);
+
+        // 2. ctx 副本入栈（+ 捕获实参），调用 void 回调 —— 副本被消费，栈清空。
+        loadLocal(slot, ctxType);
+        pushCallbackArguments(injection, callbackDescriptor, true);
+        super.visitMethodInsn(Opcodes.INVOKESTATIC, callbackOwner,
+                injection.replacementName() != null
+                        ? injection.replacementName() : "onInject",
+                callbackDescriptor, false);
+
+        // 3. 重新加载槽内 ctx 读取取消标志 —— 栈顶留下 int，调用方立即消费。
         loadLocal(slot, ctxType);
         super.visitMethodInsn(Opcodes.INVOKEVIRTUAL,
                 Type.getInternalName(org.loader.api.transform.callback.InjectionContext.class),
@@ -1084,7 +1116,7 @@ final class InjectionMethodVisitor extends AdviceAdapter {
                     injection.transformerId(), null);
         }
         String descriptor = injection.effectiveCallbackDescriptor();
-        pushCallbackArguments(injection, descriptor);
+        pushCallbackArguments(injection, descriptor, false);
         super.visitMethodInsn(Opcodes.INVOKESTATIC, owner,
                 injection.replacementName() != null
                         ? injection.replacementName() : "onInject",
@@ -1120,9 +1152,13 @@ final class InjectionMethodVisitor extends AdviceAdapter {
      * 塞默认值（如 0 / null）会让 Mod 收到<b>看起来合法但完全错误</b>的
      * 数据：坐标变成 0、tickId 变成 0。Mod 会基于这些值做出错误决策，
      * 且没有任何错误提示。宁可加载失败并说清原因。
+     *
+     * @param contextAlreadyOnStack ctx 已由调用方压栈时传 true
+     *        （可取消路径先把 ctx 存槽再重读，此时只补发射捕获实参）
      */
     private void pushCallbackArguments(
-            MiliClassTransformer.MethodInjection injection, String descriptor) {
+            MiliClassTransformer.MethodInjection injection, String descriptor,
+            boolean contextAlreadyOnStack) {
 
         Type[] cbArgTypes = Type.getArgumentTypes(descriptor);
         if (cbArgTypes.length == 0) {
@@ -1131,7 +1167,7 @@ final class InjectionMethodVisitor extends AdviceAdapter {
 
         boolean hasContext = CONTEXT_TYPE.getDescriptor()
                 .equals(cbArgTypes[0].getDescriptor());
-        if (hasContext) {
+        if (hasContext && !contextAlreadyOnStack) {
             emitContextArgument(injection);
         }
 

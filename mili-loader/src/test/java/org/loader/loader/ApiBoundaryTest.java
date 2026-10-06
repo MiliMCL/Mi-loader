@@ -68,7 +68,11 @@ class ApiBoundaryTest {
             // 因此 loader 仍然不能碰 registry / verifier / ASM 等内部件。
             // 边界真正要防的是「loader 自行实现转换逻辑」，
             // 而不是「loader 调用平台提供的转换入口」。
-            "import org.loader.runtime.transform.engine.TransformerPipeline;"
+            "import org.loader.runtime.transform.engine.TransformerPipeline;",
+            // MinecraftGameProvider 需要 TransformerRegistry 构建注册表并登记
+            // 平台自身的转换器（TransformerPipeline 由它构建后持有）。与上一条
+            // 同类：白名单是具体类 —— loader 仍不能碰 ASM / verifier 等内部件。
+            "import org.loader.runtime.transform.engine.TransformerRegistry;"
     );
 
     /** Path to loader's src/main/java. Gradle runs subproject tests with

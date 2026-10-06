@@ -121,6 +121,16 @@ class ArgCaptureTest implements Opcodes {
         ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
         cw.visit(V17, ACC_PUBLIC | ACC_SUPER, "test/synth/CapInstance",
                 null, "java/lang/Object", null);
+
+        // ASM 不自动生成默认构造器；测试用 getDeclaredConstructor() 实例化。
+        MethodVisitor ctor = cw.visitMethod(ACC_PUBLIC, "<init>", "()V", null, null);
+        ctor.visitCode();
+        ctor.visitVarInsn(ALOAD, 0);
+        ctor.visitMethodInsn(INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false);
+        ctor.visitInsn(RETURN);
+        ctor.visitMaxs(1, 1);
+        ctor.visitEnd();
+
         MethodVisitor mv = cw.visitMethod(ACC_PUBLIC,
                 "scale", "(I)I", null, null);
         mv.visitCode();
@@ -202,6 +212,16 @@ class ArgCaptureTest implements Opcodes {
                 null, "java/lang/Object", null);
         cw.visitField(ACC_PUBLIC | ACC_STATIC, "counter", "I", null, null)
                 .visitEnd();
+
+        // ASM 不自动生成默认构造器；测试用 getDeclaredConstructor() 实例化。
+        MethodVisitor ctor = cw.visitMethod(ACC_PUBLIC, "<init>", "()V", null, null);
+        ctor.visitCode();
+        ctor.visitVarInsn(ALOAD, 0);
+        ctor.visitMethodInsn(INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false);
+        ctor.visitInsn(RETURN);
+        ctor.visitMaxs(1, 1);
+        ctor.visitEnd();
+
         MethodVisitor mv = cw.visitMethod(ACC_PUBLIC,
                 "tickServer", "(Ljava/util/function/BooleanSupplier;)V", null, null);
         mv.visitCode();

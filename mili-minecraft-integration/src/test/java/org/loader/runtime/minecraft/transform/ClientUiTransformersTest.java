@@ -63,6 +63,17 @@ class ClientUiTransformersTest {
         cw.visit(Opcodes.V25, Opcodes.ACC_PUBLIC | Opcodes.ACC_SUPER,
                 MiliSymbol.TITLE_SCREEN_INIT.owner(), null, "java/lang/Object", null);
 
+        // ASM 不自动生成默认构造器；测试用 getDeclaredConstructor() 实例化。
+        MethodVisitor ctor = cw.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V",
+                null, null);
+        ctor.visitCode();
+        ctor.visitVarInsn(Opcodes.ALOAD, 0);
+        ctor.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Object",
+                "<init>", "()V", false);
+        ctor.visitInsn(Opcodes.RETURN);
+        ctor.visitMaxs(1, 1);
+        ctor.visitEnd();
+
         MethodVisitor mv = cw.visitMethod(Opcodes.ACC_PROTECTED,
                 MiliSymbol.TITLE_SCREEN_INIT.name(),
                 MiliSymbol.TITLE_SCREEN_INIT.descriptor(), null, null);

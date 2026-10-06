@@ -148,6 +148,18 @@ class CancellableAndConstantTest implements Opcodes {
         cw.visit(V17, ACC_PUBLIC | ACC_SUPER, "test/synth/Instance",
                 null, "java/lang/Object", null);
         cw.visitField(ACC_PUBLIC, "f", "I", null, null).visitEnd();
+
+        // ASM 不像 javac 会自动补默认构造器；测试用
+        // getDeclaredConstructor().newInstance() 实例化该类，
+        // 缺 <init> 会在 defineClass 之后抛 NoSuchMethodException。
+        MethodVisitor ctor = cw.visitMethod(ACC_PUBLIC, "<init>", "()V", null, null);
+        ctor.visitCode();
+        ctor.visitVarInsn(ALOAD, 0);
+        ctor.visitMethodInsn(INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false);
+        ctor.visitInsn(RETURN);
+        ctor.visitMaxs(1, 1);
+        ctor.visitEnd();
+
         MethodVisitor mv = cw.visitMethod(ACC_PUBLIC, "set", "()V", null, null);
         mv.visitCode();
         mv.visitVarInsn(ALOAD, 0);
