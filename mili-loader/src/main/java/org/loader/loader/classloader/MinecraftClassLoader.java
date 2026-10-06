@@ -157,10 +157,23 @@ public final class MinecraftClassLoader extends URLClassLoader {
      * 重新变回静默失效 —— Mod 的功能悄悄消失、游戏照常运行、
      * 日志里什么都没有。这正是本系统要消灭的那类问题。
      *
+     * <h2>为什么必须带上 jar 条目证书（SecurityException 根因记录）</h2>
+     * 拦截路径若用裸 {@code defineClass(name, bytes, off, len)}，类的
+     * ProtectionDomain 没有任何证书；而未被转换的类走 {@code super.findClass}
+     * （URLClassLoader 标准路径）会带上 jar 条目的签名证书。Mojang 客户端
+     * jar 是签名 jar —— 一旦同一个 {@code net.minecraft.*} 包里既有
+     * 「证书路径」定义的类又有「裸路径」定义的类，JDK 的包级证书一致性
+     * 校验（{@code ClassLoader.checkCerts}）直接抛
+     * {@code SecurityException: ... signer information does not match ...}。
+     * 这与加载顺序无关（拦截器装配前后各有一批类时必然触发），因此
+     * 转换路径必须自己构造与标准路径<b>完全一致</b>的 CodeSource：
+     * 同一 jar 的 URL + 同一条目的证书。
+     *
      * <h2>流必须关闭</h2>
      * jar 内嵌在 zip 中，Windows 上不关流会<b>锁住 Minecraft jar</b>。
      * 本仓库已在 {@link ModClassLoader#getResourceAsStream} 处记录过这个教训
-     * （为此专门禁用了 JVM 级 jar 缓存）。此处用 try-with-resources。
+     * （为此专门禁用了 JVM 级 jar 缓存）。此处用 try-with-resources，
+     * 并继续 {@code setUseCaches(false)}。
      */
     @Override
     protected Class<?> findClass(String name) throws ClassNotFoundException {
@@ -177,16 +190,45 @@ public final class MinecraftClassLoader extends URLClassLoader {
             return super.findClass(name);
         }
 
-        try (InputStream in = getResourceAsStream(resourcePath(name))) {
-            if (in == null) {
-                return super.findClass(name);   // 交回标准路径，保持行为一致
+        String resource = resourcePath(name);
+        URL url = findResource(resource);
+        if (url == null) {
+            return super.findClass(name);   // 交回标准路径，保持行为一致
+        }
+
+        byte[] original;
+        java.security.cert.Certificate[] entryCerts = null;
+        URL codeSourceUrl = url;
+        try {
+            URLConnection conn = url.openConnection();
+            conn.setUseCaches(false);
+            if (conn instanceof java.net.JarURLConnection jarConn) {
+                // CodeSource 的 location 必须是 jar 本身的 URL（与
+                // URLClassLoader 标准路径一致），而不是条目 URL。
+                codeSourceUrl = jarConn.getJarFileURL();
             }
-            byte[] transformed = hook.transformFromStream(name, this, in);
-            return defineClass(name, transformed, 0, transformed.length);
+            try (InputStream in = conn.getInputStream()) {
+                original = in.readAllBytes();
+            }
+            if (conn instanceof java.net.JarURLConnection jarConn) {
+                // 条目证书只有在读流（触发 jar 签名校验）之后才可用；
+                // 未签名 jar 返回 null —— 与标准路径行为一致。
+                entryCerts = jarConn.getCertificates();
+            }
         } catch (java.io.IOException e) {
             // 读取失败：退到标准路径，让 ClassNotFoundException 表达真实原因
             return super.findClass(name);
         }
+        if (original.length == 0) {
+            return super.findClass(name);
+        }
+
+        byte[] transformed = hook.transform(name, this, original);
+        java.security.CodeSource codeSource =
+                new java.security.CodeSource(codeSourceUrl, entryCerts);
+        return defineClass(name, transformed, 0, transformed.length,
+                new java.security.ProtectionDomain(codeSource,
+                        getPermissions(codeSource)));
     }
 
     /** 点分/斜杠形式的资源路径 —— jar 内条目用斜杠。 */

@@ -136,6 +136,21 @@ public class MinecraftGameProvider implements GameProvider {
         gameClassLoader = new MinecraftClassLoader("minecraft-game", urls,
                 getClass().getClassLoader());
 
+        // 转换管线必须在本方法内、canLoad 之前装好（根因记录）：
+        //
+        // 此前它装在 launch() 里，而 LoaderMain 的时序是
+        //   createGameClassLoader → 加载 Mod 并调 initialize() → launch()
+        // Mod 的 initialize() 会经由注册 API 触发一批 net.minecraft.* 类
+        // 加载 —— 那时拦截器还没就位，这批类从 super.findClass 走
+        // URLClassLoader 标准路径定义，带上了签名 jar 的条目证书；拦截器
+        // 就位后的类走拦截路径。canLoad 同理：它在装配前就定义了入口类。
+        //
+        // 除了转换窗口缺口本身，证书混装在 JDK 的包级一致性校验
+        // （ClassLoader.checkCerts）上是硬错误：同包两类证书不同 →
+        // SecurityException，游戏根本起不来。把装配提前到第一个游戏类
+        // 定义之前，窗口从根上消失。
+        installTransformPipeline(gameClassLoader);
+
         // 硬校验：主类必须真的能解析，不能只看文件存在
         String mainClass = getEntrypoint();
         if (!gameClassLoader.canLoad(mainClass)) {
@@ -192,7 +207,7 @@ public class MinecraftGameProvider implements GameProvider {
         // Logger.getLogger() 会自行初始化并挂上文件 appender。
         PlatformLog.enableFileLogging();
 
-        // ── 装配字节码转换管线（必须在任何 Minecraft 类被加载之前） ──────
+        // ── 字节码转换管线 ────────────────────────────────────────────
         //
         // 【根因记录】此前生产启动路径从未装配 TransformerPipeline /
         // ClassTransformInterceptor —— 它们只存在于测试里。于是
@@ -204,11 +219,11 @@ public class MinecraftGameProvider implements GameProvider {
         //   1. F3 显示原版客户端（ClientBrandRetriever 未被替换）；
         //   2. 主界面没有 mod 列表入口（TitleScreen#init 未被注入）。
         //
-        // 时机：canLoad() 在 createGameClassLoader 里已定义过入口类
-        //（不在转换目标内，无碍）；此后所有 net.minecraft.* 类都必须
-        // 在拦截器就位后才加载 —— registerCreativeTabs 等 Mod 注册
-        // 动作发生在 hook.invokeMinecraftMain 内部，晚于本调用。
-        installTransformPipeline(gameClassLoader);
+        // 【时机演变】管线最初装在这里，但 Mod 的 initialize() 发生在
+        // launch() 之前且已触发游戏类加载 —— 转换窗口与包内证书一致性
+        // 都被破坏（SecurityException 根因，见 createGameClassLoader
+        // 与 MinecraftClassLoader.findClass 的根因记录）。装配已上移到
+        // createGameClassLoader 内、canLoad 之前；本方法不再重复装配。
 
         // 主界面 mod 列表的数据源 —— 必须在主界面显示之前设置
         armModListProvider(classLoaderManager);
