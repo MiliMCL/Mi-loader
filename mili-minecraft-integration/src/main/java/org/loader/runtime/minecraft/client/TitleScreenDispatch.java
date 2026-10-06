@@ -256,9 +256,16 @@ public final class TitleScreenDispatch {
     }
 
     /** {@code gui.setScreen(screen)}。 */
-    private static void showScreen(Object gui, Object screen) throws Exception {
-        Class<?> screenClass = Reflect.gameClass(SCREEN);
-        gui.getClass().getMethod("setScreen", screenClass).invoke(gui, screen);
+    private static void showScreen(Object gui, Object screen) {
+        try {
+            Class<?> screenClass = Reflect.gameClass(SCREEN);
+            gui.getClass().getMethod("setScreen", screenClass).invoke(gui, screen);
+        } catch (ReflectiveOperationException e) {
+            // setScreen 符号漂移属于平台 bug —— 带着原因炸在调用栈上，
+            // 而不是伪装成「屏幕没打开」。收窄声明还让本方法可以
+            // 直接出现在 Runnable lambda 里（run() 不允许 checked 异常）。
+            throw new IllegalStateException("反射调用 setScreen 失败", e);
+        }
     }
 
     /** 沿父类链查找按名声明的方法（覆盖 protected 泛型方法）。 */
