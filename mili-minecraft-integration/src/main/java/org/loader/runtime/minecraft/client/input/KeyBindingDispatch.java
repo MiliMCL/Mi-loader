@@ -65,6 +65,21 @@ public final class KeyBindingDispatch {
             this.handler = handler;
             this.keyMapping = keyMapping;
         }
+
+        // 访问器与字段同名：本类由 record 重构而来，调用点沿用了
+        // record 的访问器风格。保留访问器让调用点不必改成字段引用
+        // —— 两种风格混用是又一处「看起来都能跑」的漂移源头。
+        KeyBindingSpec spec() {
+            return spec;
+        }
+
+        Consumer<KeyEventType> handler() {
+            return handler;
+        }
+
+        Object keyMapping() {
+            return keyMapping;
+        }
     }
 
     private static final List<Entry> bindings = new CopyOnWriteArrayList<>();

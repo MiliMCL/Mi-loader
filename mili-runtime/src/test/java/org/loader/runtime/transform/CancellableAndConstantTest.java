@@ -319,7 +319,7 @@ class CancellableAndConstantTest implements Opcodes {
                         CB, "grabTarget", "(L"
                         + InjectionContext.class.getName().replace('.', '/')
                         + ";)V",
-                        true, "test-target", 0, false, null))));
+                        true, "test-target", 0, false, null)));
 
         Class<?> c = define("test.synth.Instance", transformed);
         Object instance = c.getDeclaredConstructor().newInstance();
@@ -344,7 +344,7 @@ class CancellableAndConstantTest implements Opcodes {
                         CB, "grabTarget", "(L"
                         + InjectionContext.class.getName().replace('.', '/')
                         + ";)V",
-                        true, "test-target-static", 0, false, null))));
+                        true, "test-target-static", 0, false, null)));
         Class<?> c2 = define("test.synth.StaticCtx", staticTransformed);
         c2.getMethod("val").invoke(null);
         assertNull(Cb.lastTarget, "静态方法上 ctx.target() 必须为 null");

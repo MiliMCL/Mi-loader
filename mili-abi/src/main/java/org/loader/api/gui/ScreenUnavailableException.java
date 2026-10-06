@@ -11,4 +11,8 @@ public class ScreenUnavailableException extends RuntimeException {
     public ScreenUnavailableException(String message) {
         super(message);
     }
+
+    public ScreenUnavailableException(String message, Throwable cause) {
+        super(message, cause);
+    }
 }
