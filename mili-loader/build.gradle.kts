@@ -479,8 +479,169 @@ tasks.named("build") { dependsOn(launcherScripts) }
 
 // ── 分发边界验证（Minecraft 分发红线） ──────────────────────────────────────
 // 递归扫描分发产物，任何 Minecraft 类/源码/本体 JAR 都让构建失败。
-// 详见 distribution-boundary.gradle.kts 顶部的规则说明。
-apply(from = "distribution-boundary.gradle.kts")
+//
+// **为什么内联在这里，而不是单独一个脚本文件**
+//
+// 原来它住在 distribution-boundary.gradle.kts，由 `apply(from = ...)` 引入。
+// 但 `apply(from = ...)` 是 Gradle 8.x起废弃、**Gradle 9 已移除**的 API：
+// Gradle 9 静默忽略它 —— 不报任何错，只是那个脚本根本不会被执行，
+// 于是 :mili-loader:distributionBoundaryCheck 任务「不存在」，
+// CI 报 Cannot locate tasks that match。
+//
+// 这个坑格外阴险：本地用旧 Gradle 时 apply 仍然有效，一切正常；
+// 只有 CI 升级到 Gradle 9 后才会暴露，而暴露方式是「任务消失」而非「报错」，
+// 很容易被误判成 CI 配置问题。Gradle 9 要求脚本级组合走 `plugins {}`，
+// 而预编译脚本插件需要 buildSrc —— 对一个校验任务而言引入 buildSrc
+// 远不划算，直接内联是最诚实的做法。
+//
+// 规则本身的完整说明保留在 distribution-boundary.gradle.kts（该文件保留为
+// 设计文档），实现以本处为准。两处逻辑故意保持独立、互不复用：
+// CI 里还有一份纯 shell 实现，两套独立实现必须同时通过才算干净。
+
+val distributionBoundaryCheck by tasks.registering {
+    group = "verification"
+    description = "扫描分发产物，确保不包含任何 Minecraft 类、源码或数据（Mojang 分发边界红线）"
+
+    // 依赖打包任务 —— 必须在产物生成后检查
+    dependsOn("shadowJar")
+    dependsOn("distTar")
+    dependsOn("distZip")
+    dependsOn("releaseArtifacts")
+
+    val distDir = layout.buildDirectory.dir("distributions").get().asFile
+    val fatJar = layout.buildDirectory
+        .file("libs/mili-${miliPlatformVersion}-mc${minecraftVersion}.jar")
+        .get().asFile
+
+    inputs.dir(distDir).optional()
+    inputs.file(fatJar)
+    // 无输出文件：该任务每次都执行（它是校验，不是转换）
+
+    doLast {
+        val violations = mutableListOf<String>()
+
+        // ── Minecraft 禁止前缀与文件名模式 ──────────────────────────────────
+        val forbiddenDirs = listOf(
+            "net/minecraft/",
+            "com/mojang/",
+            "decompiled/",
+            "net/minecraftforge/",
+            "cpw/mods/",
+            "org/bukkit/",
+            "io/papermc/"
+        )
+        val forbiddenNamePatterns = listOf(
+            Regex("^minecraft.*\\.(jar|zip)$", RegexOption.IGNORE_CASE),
+            Regex("^server.*\\.(jar|zip)$", RegexOption.IGNORE_CASE),
+            Regex("^client.*\\.(jar|zip)$", RegexOption.IGNORE_CASE),
+            Regex("\\.mcpack$", RegexOption.IGNORE_CASE),
+            Regex("\\.mca$", RegexOption.IGNORE_CASE),
+            Regex("^.*-decompiled.*\\.(jar|zip)$", RegexOption.IGNORE_CASE)
+        )
+
+        fun isForbiddenPath(path: String): String? {
+            val normalized = path.replace('\\', '/')
+            for (prefix in forbiddenDirs) {
+                if (normalized.contains(prefix)) {
+                    return "包含 Minecraft 内部目录 '$prefix'"
+                }
+            }
+            val fileName = normalized.substringAfterLast('/')
+            for (pattern in forbiddenNamePatterns) {
+                if (pattern.matches(fileName)) {
+                    return "文件名匹配 Minecraft 模式 '$fileName'"
+                }
+            }
+            return null
+        }
+
+        // ── 1. 检查 fat JAR 内部条目 ───────────────────────────────────────
+        if (fatJar.exists()) {
+            logger.lifecycle("[Boundary] 扫描平台 JAR: ${fatJar.name}")
+            java.util.zip.ZipFile(fatJar).use { zf ->
+                val entries = zf.entries()
+                var entryCount = 0
+                while (entries.hasMoreElements()) {
+                    val entry = entries.nextElement()
+                    entryCount++
+                    val reason = isForbiddenPath(entry.name)
+                    if (reason != null) {
+                        violations.add("平台 JAR ${fatJar.name} 条目 '${entry.name}' — $reason")
+                    }
+                }
+                logger.lifecycle("[Boundary] 平台 JAR 共 $entryCount 个条目")
+            }
+        } else {
+            violations.add("平台 JAR 不存在: ${fatJar.absolutePath}（无法验证分发边界）")
+        }
+
+        // ── 2. 检查分发目录树 ───────────────────────────────────────────────
+        if (distDir.exists() && distDir.walkTopDown().any { it.isFile }) {
+            logger.lifecycle("[Boundary] 扫描分发目录: ${distDir.absolutePath}")
+            distDir.walkTopDown().filter { it.isFile }.forEach { file ->
+                val relative = file.relativeTo(distDir).path
+                val reason = isForbiddenPath(relative)
+                if (reason != null) {
+                    violations.add("分发目录 '$relative' — $reason")
+                }
+                if (file.name.endsWith(".jar")) {
+                    val n = file.name.lowercase()
+                    if (n.startsWith("minecraft") || n.startsWith("server")
+                        || n.startsWith("client")
+                    ) {
+                        violations.add("分发目录含疑似 Minecraft 本体 JAR: '$relative'")
+                    }
+                }
+            }
+        }
+
+        // ── 3. 检查 release 目录 ────────────────────────────────────────────
+        val releaseDir = layout.buildDirectory.dir("release").get().asFile
+        if (releaseDir.exists()) {
+            releaseDir.walkTopDown().filter { it.isFile }.forEach { file ->
+                val relative = file.relativeTo(releaseDir).path
+                val reason = isForbiddenPath(relative)
+                if (reason != null) {
+                    violations.add("release 目录 '$relative' — $reason")
+                }
+            }
+        }
+
+        // ── 4. 校验 SHA256SUMS 与 release-manifest.json 覆盖所有产物 ─────────
+        val shaFile = releaseDir.resolve("SHA256SUMS")
+        val manifestFile = releaseDir.resolve("release-manifest.json")
+        if (!shaFile.exists()) {
+            violations.add("缺少 SHA256SUMS —— 发布产物必须带校验和")
+        }
+        if (!manifestFile.exists()) {
+            violations.add("缺少 release-manifest.json —— 发布产物必须带清单")
+        }
+        if (manifestFile.exists()) {
+            val manifest = manifestFile.readText()
+            for (required in listOf(
+                "\"platformId\"", "\"version\"", "\"abi\"",
+                "\"minecraft\"", "\"java\"", "\"assets\""
+            )) {
+                if (!manifest.contains(required)) {
+                    violations.add("release-manifest.json 缺少字段 $required")
+                }
+            }
+        }
+
+        // ── 5. 结论 ────────────────────────────────────────────────────────
+        if (violations.isNotEmpty()) {
+            logger.error("[Boundary] 分发边界检查失败 —— ${violations.size} 项违规：")
+            violations.forEach { logger.error("  x $it") }
+            throw GradleException(
+                "分发边界违规：发布产物不得包含 Minecraft 本体、类或反编译源码。\n" +
+                    violations.joinToString("\n") { "  - $it" }
+            )
+        }
+
+        logger.lifecycle("[Boundary] 分发边界检查通过 —— 未发现任何 Minecraft 内容")
+        logger.lifecycle("[Boundary] 确认: 无 net/minecraft/, 无 com/mojang/, 无 Minecraft 本体 JAR, 无反编译源码")
+    }
+}
 
 tasks.named("check") {
     dependsOn("distributionBoundaryCheck")

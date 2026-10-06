@@ -1,5 +1,38 @@
 import java.util.zip.ZipFile
 
+/*
+ * ============================================================================
+ *  【本文件已不再被 Gradle 加载 —— 请勿在此实现校验逻辑】
+ * ============================================================================
+ *
+ * 校验任务的<b>实现已内联</b>进 build.gradle.kts 的
+ * `val distributionBoundaryCheck by tasks.registering { ... }`。
+ * 保留本文件仅作为规则的设计文档。
+ *
+ * 为什么不继续用脚本文件引入：原来靠
+ *
+ *     apply(from = "distribution-boundary.gradle.kts")
+ *
+ * 而 `apply(from = ...)` 是 Gradle 8.x 起废弃、**Gradle 9 已移除**的 API。
+ * Gradle 9 遇到它会<b>静默忽略</b> —— 不报错、不警告，那个脚本就是不执行。
+ * 于是 `:mili-loader:distributionBoundaryCheck` 任务根本不存在，
+ * CI 报的是：
+ *
+ *     Cannot locate tasks that match ':mili-loader:distributionBoundaryCheck'
+ *     as task 'distributionBoundaryCheck' not found in project ':mili-loader'.
+ *
+ * 这个坑阴险在两点：
+ *   1. 本地用旧 Gradle 时 apply 仍有效，边界检查照常跑，完全看不出来；
+ *   2. 失败表现是「任务消失」，很容易被误判成 CI 配置写错，
+ *      而真正的根因在构建脚本里、且只在 CI 上现形。
+ *
+ * Gradle 9 里脚本级组合要走 `plugins {}`，预编译脚本插件则需要 buildSrc。
+ * 为一个校验任务引入 buildSrc 不划算，内联是最诚实的做法。
+ *
+ * 注意：改规则时请改 build.gradle.kts 里的那份实现，本文件不会生效。
+ * ============================================================================
+ */
+
 /**
  * Distribution Boundary Verification (Minecraft 分发边界验证)
  * ------------------------------------------------------------------
