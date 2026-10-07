@@ -162,9 +162,14 @@ public final class BytecodeVerifier {
         String analysisError =
                 runAnalyzer(className, bytecode, transformerId, modId, gameLoader);
         if (analysisError != null) {
-            throw new TransformationVerificationException(
-                    className, null, transformerId, modId, -1,
-                    "类型推断失败:\n" + analysisError, null);
+            TransformationVerificationException failure =
+                    new TransformationVerificationException(
+                            className, null, transformerId, modId, -1,
+                            "类型推断失败:\n" + analysisError, null);
+            // 黑匣子：完整堆栈直达 stderr —— message 只承载结构化字段，
+            // 真正的指令级细节（哪条指令、期望什么、实际什么）只在堆栈里。
+            failure.printStackTrace();
+            throw failure;
         }
     }
 
@@ -354,7 +359,10 @@ public final class BytecodeVerifier {
             // 都能查出来 —— 而这些正是注入事故的主要形态。
             MethodAnalysis lenient = analyzeMethod(node, method, gameLoader, false);
             if (lenient.description() != null) {
-                return "方法 " + method.name + method.desc + ": " + lenient.description();
+                // 同时保留 strict 的失败细节：降级后的报错可能源于降级本身
+                // （SimpleVerifier 给出了更精确的线索），合并输出避免二次排查。
+                return "方法 " + method.name + method.desc + ": " + lenient.description()
+                        + "\n[strict 阶段详情] " + strict.description();
             }
         }
         return null;
@@ -439,17 +447,22 @@ public final class BytecodeVerifier {
         return verifier;
     }
 
-    /** 提取可读的错误描述。 */
+    /** 提取可读的错误描述 —— 保留完整 message 与 cause 链，绝不截断。 */
     private static String describe(Throwable t) {
-        String msg = t.getMessage();
-        String type = t.getClass().getSimpleName();
-        // ASM 的分析异常消息常含大量堆栈帧，这里只取首行，
-        // 完整上下文由 TransformationVerificationException 承载。
-        if (msg == null) {
-            return type;
+        StringBuilder sb = new StringBuilder();
+        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
+            if (sb.length() > 0) {
+                sb.append("\n  caused by ");
+            }
+            String msg = cur.getMessage();
+            sb.append(cur.getClass().getName());
+            if (msg != null && !msg.isBlank()) {
+                sb.append(": ").append(msg);
+            }
+            if (cur.getCause() == cur) {
+                break;      // 自引用，防止死循环
+            }
         }
-        int nl = msg.indexOf('\n');
-        String head = nl > 0 ? msg.substring(0, nl) : msg;
-        return head.trim().isEmpty() ? type : head.trim();
+        return sb.length() > 0 ? sb.toString() : t.getClass().getName();
     }
 }
