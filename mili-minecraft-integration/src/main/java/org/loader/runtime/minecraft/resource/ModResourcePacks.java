@@ -679,9 +679,16 @@ public final class ModResourcePacks {
                                     throw new NoSuchMethodException(
                                             "ResourceOutput.accept(?,?) not found");
                                 }
+                                // 原版契约：accept 的 Identifier 是命名空间根的
+                                // 完整路径（含请求的 directory 前缀，如
+                                // textures/block/harvest.png）——DirectoryLister
+                                // 拿到后还要 fileToId() 剥前缀后缀。此前传的是
+                                // 剥掉 directory 的相对路径 → substring 越界，
+                                // 整个 reload 被原版回滚（014e3fc 实测）。
+                                String nsRoot = "assets/" + ns + "/";
                                 for (String entryName : listEntries(jar, prefix)) {
-                                    String rel = entryName.substring(prefix.length());
-                                    Object id = identifier(idClass, ns, rel);
+                                    String fullPath = entryName.substring(nsRoot.length());
+                                    Object id = identifier(idClass, ns, fullPath);
                                     if (id == null) {
                                         continue;
                                     }
