@@ -659,14 +659,26 @@ public final class ModResourcePacks {
                             String prefix = "assets/" + ns + "/"
                                     + (path.isEmpty() ? "" : path);
                             // 26.2 的 ResourceOutput extends
-                            // BiConsumer<Identifier, IoSupplier<InputStream>>——
-                            // 第二参是游戏侧 IoSupplier，不是
-                            // java.util.function.Supplier（用后者查 getMethod
-                            // 直接 NoSuchMethodException，整个资源 reload 被
-                            // 原版回滚，b1240c3 实测）。
+                            // BiConsumer<Identifier, IoSupplier<InputStream>>。
+                            // 接口本身不声明 accept —— 字节码里只有继承自
+                            // BiConsumer 的擦除签名 accept(Object,Object)，
+                            // 用具体类型（Identifier/IoSupplier/Supplier）查
+                            // getMethod 全部 NoSuchMethodException（b1240c3、
+                            // 2d653a5 实测两种形态都炸过）。按名字+参数个数
+                            // 找才稳。
                             try {
-                                Method accept = outputIface.getMethod("accept",
-                                        idClass, ioSupplierClass());
+                                Method accept = null;
+                                for (Method m : outputIface.getMethods()) {
+                                    if (m.getName().equals("accept")
+                                            && m.getParameterCount() == 2) {
+                                        accept = m;
+                                        break;
+                                    }
+                                }
+                                if (accept == null) {
+                                    throw new NoSuchMethodException(
+                                            "ResourceOutput.accept(?,?) not found");
+                                }
                                 for (String entryName : listEntries(jar, prefix)) {
                                     String rel = entryName.substring(prefix.length());
                                     Object id = identifier(idClass, ns, rel);
