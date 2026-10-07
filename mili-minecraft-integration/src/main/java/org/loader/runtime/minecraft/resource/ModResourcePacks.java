@@ -120,6 +120,9 @@ public final class ModResourcePacks {
             addRepositorySource(repository, modId, modJar);
             // 让游戏重新加载资源：PackRepository 变更后必须显式 reload，
             // 否则新资源包不会进入 ReloadableResourceManager。
+            // 【必须先等稳态】启动首轮 reload 还挂在前台时请求 reload 会崩游戏，
+            // 见 awaitReloadSafePoint 的说明。
+            awaitReloadSafePoint(minecraft);
             reloadResources(minecraft);
 
             // 【如实报告，不做过度承诺】
@@ -845,6 +848,61 @@ public final class ModResourcePacks {
             LOG.log(Level.FINE, "Cannot list " + prefix + " in " + jar, e);
         }
         return out;
+    }
+
+    /**
+     * 等待游戏到达可安全触发资源 reload 的稳态。
+     *
+     * <p><b>为什么必须等</b>：启动时 {@code Minecraft.<init>} 的首轮 reload 还挂着
+     * LoadingOverlay，此时从别的线程调 {@code reloadResourcePacks()} 会命中原版
+     * pending 分支（日志 "Reload already ongoing, replacing"）——请求被挂到
+     * pendingReload 上不执行，原版 tick 在 overlay 一消失就立刻补发：首轮 reload
+     * 负责初始化的贴图被中途作废，下一帧 extract 渲染状态时直接崩
+     * {@code IllegalStateException: Texture view does not exist}（b1240c3 实测）。
+     * 等 overlay 关闭且 pendingReload 清空后再触发，等价于标题界面按 F3+T
+     * 的原版支持路径。
+     */
+    private static void awaitReloadSafePoint(Object minecraft) {
+        Class<?> loadingOverlay;
+        try {
+            loadingOverlay = Reflect.gameClass("net.minecraft.client.gui.screens.LoadingOverlay");
+        } catch (ReflectiveOperationException e) {
+            return; // 该版本没有这个类 → 不阻塞，按旧路径走
+        }
+        long deadline = System.currentTimeMillis() + 60_000L;
+        while (System.currentTimeMillis() < deadline) {
+            if (reloadSafeNow(minecraft, loadingOverlay)) {
+                return;
+            }
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        LOG.warning("Resource reload safe point not reached in 60s — requesting reload anyway;"
+                + " if the game crashes with 'Texture view does not exist', this is why.");
+    }
+
+    /** 现在是否没有进行中的 reload（pendingReload 为空且前台不是 LoadingOverlay）。 */
+    private static boolean reloadSafeNow(Object minecraft, Class<?> loadingOverlay) {
+        try {
+            Object pending = Reflect.instanceField(
+                    minecraft, "net.minecraft.client.Minecraft", "pendingReload");
+            if (pending != null) {
+                return false;
+            }
+            Object gui = Reflect.instanceField(minecraft, "net.minecraft.client.Minecraft", "gui");
+            if (gui == null) {
+                return true;
+            }
+            Object overlay = Reflect.method("net.minecraft.client.gui.Gui", "overlay").invoke(gui);
+            return overlay == null || !loadingOverlay.isInstance(overlay);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            // 不认识这个版本的结构 → 不阻塞，尽力而为
+            return true;
+        }
     }
 
     /** 触发游戏重新加载资源包。 */
