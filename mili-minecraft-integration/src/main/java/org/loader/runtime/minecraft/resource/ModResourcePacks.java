@@ -863,12 +863,10 @@ public final class ModResourcePacks {
      * 的原版支持路径。
      */
     private static void awaitReloadSafePoint(Object minecraft) {
-        Class<?> loadingOverlay;
-        try {
-            loadingOverlay = Reflect.gameClass("net.minecraft.client.gui.screens.LoadingOverlay");
-        } catch (ReflectiveOperationException e) {
+        if (!Reflect.hasGameClass("net.minecraft.client.gui.screens.LoadingOverlay")) {
             return; // 该版本没有这个类 → 不阻塞，按旧路径走
         }
+        final Class<?> loadingOverlay = Reflect.gameClass("net.minecraft.client.gui.screens.LoadingOverlay");
         long deadline = System.currentTimeMillis() + 60_000L;
         while (System.currentTimeMillis() < deadline) {
             if (reloadSafeNow(minecraft, loadingOverlay)) {
