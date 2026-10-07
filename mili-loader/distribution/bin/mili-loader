@@ -68,7 +68,7 @@ mkdir -p "$GAME_DIR" "$MODS_DIR"
 # --mili-mods 必须显式给出：Mod 放在分发根的 mods/，而 gameDir 是 game/，
 # 少了它加载器会去扫 game/mods/（不存在），结果是零个 Mod 且无任何报错。
 exec "$JAVA_BIN" \
-  -Xmx2G \
+  -Xmx4G \
   -Dfile.encoding=UTF-8 \
   -Djava.library.path="$DIST_DIR/game/natives" \
   -jar "$PLATFORM_JAR" "$GAME_DIR" --mili-mods "$MODS_DIR" "$@"

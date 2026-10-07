@@ -232,6 +232,13 @@ public final class BytecodeVerifier {
             UNRESOLVED.add(missing);
             return null;
         }
+        // PrintWriter 输出可能包含整段 AnalyzerException 堆栈 ——
+        // 若内层异常的 message 本身嵌入了完整验证报告，
+        // 这段文本同样会参与外层包装的指数膨胀。封顶。
+        if (text.length() > MAX_DESCRIPTION_LENGTH) {
+            text = text.substring(0, MAX_DESCRIPTION_LENGTH)
+                    + "\n…[结构校验输出过长已截断，完整堆栈见 stderr]";
+        }
         return text;
     }
 
@@ -420,6 +427,28 @@ public final class BytecodeVerifier {
                     break;      // 自引用，防止死循环
                 }
             }
+            // 资源耗尽 ≠ 字节码非法。
+            //
+            // 真实案例：Minecraft.<init> 数万条指令，SimpleVerifier 全量
+            // 类型推断的内存开销与指令数成正比，在受限堆（-Xmx2G 且游戏
+            // 已占用大半）里直接 OutOfMemoryError。把它当「验证失败」
+            // 拒绝 defineClass，等于让正常的游戏类永远加载不进来 ——
+            // 游戏窗口都不会出现。StackOverflowError 同理（深递归分析）。
+            // 这类失败只能跳过本层：结构校验（第 1 层）已经通过，
+            // JVM 自己的 defineClass 校验仍会兜底。
+            for (Throwable cause = t; cause != null; cause = cause.getCause()) {
+                if (cause instanceof OutOfMemoryError
+                        || cause instanceof StackOverflowError) {
+                    System.err.println("[Mili][verify] WARNING: 数据流分析因 "
+                            + cause.getClass().getSimpleName()
+                            + " 中断（方法过大/堆受限），已跳过类型推断层，"
+                            + "结构校验已通过: " + node.name + "." + method.name);
+                    return MethodAnalysis.pass();
+                }
+                if (cause.getCause() == cause) {
+                    break;
+                }
+            }
             return MethodAnalysis.error(describe(t));
         }
     }
@@ -447,7 +476,20 @@ public final class BytecodeVerifier {
         return verifier;
     }
 
-    /** 提取可读的错误描述 —— 保留完整 message 与 cause 链，绝不截断。 */
+    /**
+     * 错误描述的最大长度。
+     *
+     * <p>必须设上限：异常 message 会被外层包装复用
+     * （{@code TransformationVerificationException} 嵌入本描述，
+     * 下游再嵌入它的 message……）。若描述里含整条内层消息，
+     * 每经过一层包装长度至少翻倍 —— 真实事故里滚出了 5GB 的日志。
+     */
+    private static final int MAX_DESCRIPTION_LENGTH = 4096;
+
+    /**
+     * 提取可读的错误描述 —— 保留完整 message 与 cause 链，
+     * 但总长度封顶，杜绝包装层的消息雪崩。
+     */
     private static String describe(Throwable t) {
         StringBuilder sb = new StringBuilder();
         for (Throwable cur = t; cur != null; cur = cur.getCause()) {
@@ -458,6 +500,11 @@ public final class BytecodeVerifier {
             sb.append(cur.getClass().getName());
             if (msg != null && !msg.isBlank()) {
                 sb.append(": ").append(msg);
+            }
+            if (sb.length() > MAX_DESCRIPTION_LENGTH) {
+                sb.setLength(MAX_DESCRIPTION_LENGTH);
+                sb.append("\n  …[描述过长已截断，完整堆栈见 stderr]");
+                break;
             }
             if (cur.getCause() == cur) {
                 break;      // 自引用，防止死循环

@@ -162,6 +162,6 @@ echo [Mili] User       : %GAME_NAME%
 if defined SAVED_TOKEN (echo [Mili] Auth       : online) else (echo [Mili] Auth       : offline)
 echo.
 
-"%JAVA_BIN%" -Xmx2G -Dfile.encoding=UTF-8 -Djava.library.path="%NATIVES_DIR%" -jar "%PLATFORM_JAR%" "%GAME_DIR%" --mili-mods "%MODS_DIR%" --version "%MC_VERSION%" --gameDir "%GAME_DIR%" --assetsDir "%ASSETS_DIR%" --assetIndex "%ASSET_INDEX%" %AUTH_ARGS% %*
+"%JAVA_BIN%" -Xmx4G -Dfile.encoding=UTF-8 -Djava.library.path="%NATIVES_DIR%" -jar "%PLATFORM_JAR%" "%GAME_DIR%" --mili-mods "%MODS_DIR%" --version "%MC_VERSION%" --gameDir "%GAME_DIR%" --assetsDir "%ASSETS_DIR%" --assetIndex "%ASSET_INDEX%" %AUTH_ARGS% %*
 
 endlocal
