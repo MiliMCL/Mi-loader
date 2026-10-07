@@ -160,8 +160,13 @@ public final class BlockStatePropertyInference {
             if (eq <= 0) {
                 continue;
             }
-            out.computeIfAbsent(part.substring(0, eq).trim(), k -> new TreeSet<>())
-                    .add(part.substring(eq + 1).trim());
+            String name = part.substring(0, eq).trim();
+            String value = part.substring(eq + 1).trim();
+            // 畸形键（"age=" / "=3" / 空值）不是有效的属性绑定，跳过
+            if (name.isEmpty() || value.isEmpty()) {
+                continue;
+            }
+            out.computeIfAbsent(name, k -> new TreeSet<>()).add(value);
         }
     }
 

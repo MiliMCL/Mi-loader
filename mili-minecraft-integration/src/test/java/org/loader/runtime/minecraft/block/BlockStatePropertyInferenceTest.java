@@ -68,10 +68,9 @@ class BlockStatePropertyInferenceTest {
     void toleratesMalformedJson() {
         assertTrue(BlockStatePropertyInference.parseVariantProperties("{ not json").isEmpty());
         assertTrue(BlockStatePropertyInference.parseVariantProperties("").isEmpty());
-        assertTrue(BlockStatePropertyInference.parseVariantProperties(
-                "{ \"variants\": { \"age=\": { \"model\": \"x\" } } }").get("age") == null
-                || BlockStatePropertyInference.parseVariantProperties(
-                        "{ \"variants\": { \"age=\": { \"model\": \"x\" } } }")
-                        .get("age").isEmpty());
+        // "age=" 是畸形键（空值）：整个键被跳过，age 不出现在结果里
+        Map<String, Set<String>> out = BlockStatePropertyInference
+                .parseVariantProperties("{ \"variants\": { \"age=\": { \"model\": \"x\" } } }");
+        assertTrue(out.isEmpty() || !out.containsKey("age"));
     }
 }
