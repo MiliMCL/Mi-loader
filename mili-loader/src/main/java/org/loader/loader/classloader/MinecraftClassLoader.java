@@ -182,6 +182,23 @@ public final class MinecraftClassLoader extends URLClassLoader {
      * 此处所有流均用 try-with-resources 关闭；JarFile 本身经由
      * {@link #SHARED_JARS} 进程级共享（见其根因记录），随进程退出释放。
      */
+    /**
+     * 正在经过转换管线的类（内部名 → 转换中）。
+     *
+     * <h2>为什么必须存在（真实的「无限递归」事故）</h2>
+     * 验证器（SimpleVerifier）分析 {@code Minecraft.<init>} 时需要解析
+     * 被调用类的类型，于是 {@code Class.forName} 走回本加载器 ——
+     * 目标恰恰是<b>正在验证中的 Minecraft 自己</b>：findClass 再次拦截、
+     * 再次转换、再次验证、再次 forName…… 无限递归耗尽堆内存
+     * （表现为 OutOfMemoryError / StackOverflowError / duplicate
+     * class definition，三者全是递归的副作用）。
+     * 重入时抛 {@link ClassNotFoundException}：验证器把它识别为
+     * 「缺类」并降级为 BasicVerifier（不解析类型、无递归路径）。
+     * 跨线程并发由 loadClass 的类名锁保证，同线程重入由此集合短路。
+     */
+    private static final java.util.Set<String> TRANSFORMING =
+            java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+
     @Override
     protected Class<?> findClass(String name) throws ClassNotFoundException {
         org.loader.loader.transform.ClassTransformInterceptor hook = this.interceptor;
@@ -197,6 +214,21 @@ public final class MinecraftClassLoader extends URLClassLoader {
             return super.findClass(name);
         }
 
+        // 验证器重入短路：同一线程已在转换该类时，绝不能再进管线
+        // （见 TRANSFORMING 的根因记录 —— 无限递归）。
+        if (!TRANSFORMING.add(name)) {
+            throw new ClassNotFoundException(name);
+        }
+        try {
+            return findClassTransformed(name, hook);
+        } finally {
+            TRANSFORMING.remove(name);
+        }
+    }
+
+    private Class<?> findClassTransformed(String name,
+            org.loader.loader.transform.ClassTransformInterceptor hook)
+            throws ClassNotFoundException {
         String resource = resourcePath(name);
         URL url = findResource(resource);
         if (url == null) {
