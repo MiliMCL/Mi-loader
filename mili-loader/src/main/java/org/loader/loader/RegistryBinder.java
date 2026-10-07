@@ -30,9 +30,17 @@ final class RegistryBinder {
      *
      * @param runtimeCtx 该 Mod 的 runtime 上下文
      * @param mod        该 Mod 的清单（提供命名空间）
+     * @param modJar     Mod 的 jar 文件；注册方块时 loader 据此从 blockstate
+     *                   推断方块属性（见 BlockStatePropertyInference）。
+     *                   可为 null（如无 jar 的开发态目录布局）。
      */
-    static void bind(ModContext runtimeCtx, Mod mod) {
+    static void bind(ModContext runtimeCtx, Mod mod, java.nio.file.Path modJar) {
         String modId = mod.id();
-        runtimeCtx.bindApiRegistry(new ApiMinecraftRegistry(modId));
+        runtimeCtx.bindApiRegistry(new ApiMinecraftRegistry(modId, modJar));
+    }
+
+    /** 无 jar 源的绑定（测试/开发态）：推断自动降级为无属性。 */
+    static void bind(ModContext runtimeCtx, Mod mod) {
+        bind(runtimeCtx, mod, null);
     }
 }

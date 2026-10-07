@@ -41,14 +41,21 @@ public final class BlockRegistrar {
     private static final String REGISTRIES_CLASS = "net.minecraft.core.registries.Registries";
 
     private final String modId;
+    /** Mod 的 jar 文件；用于从 blockstate 推断方块属性。可为 null（无推断源）。 */
+    private final java.nio.file.Path modJar;
     /** 已成功注册的 key → Block，用于重复注册检测与诊断。 */
     private final Map<String, Object> registered = new LinkedHashMap<>();
 
     public BlockRegistrar(String modId) {
+        this(modId, null);
+    }
+
+    public BlockRegistrar(String modId, java.nio.file.Path modJar) {
         if (modId == null || modId.isBlank()) {
             throw new IllegalArgumentException("modId must not be blank");
         }
         this.modId = modId;
+        this.modJar = modJar;
     }
 
     public String modId() {
@@ -105,10 +112,17 @@ public final class BlockRegistrar {
                     ? null
                     : BehaviourDispatch.register(behaviour, fullId);
 
-            // 3. 造出 Block 实例
+            // 3. 造出 Block 实例。
+            //    属性从 Mod 自己的 blockstate JSON 推断（BlockSpec 尚无属性 API）：
+            //    没有 blockstate 就返回空列表，行为与不推断时完全一致。
+            String[] idParts = splitId(fullId);
+            java.util.List<Object> stateProperties =
+                    BlockStatePropertyInference.inferProperties(
+                            modJar, idParts[0], idParts[1]);
             Object block;
             try {
-                block = GeneratedBlockFactory.createBlock(properties, handle, fullId);
+                block = GeneratedBlockFactory.createBlock(
+                        properties, handle, fullId, stateProperties);
             } catch (RuntimeException | Error e) {
                 if (handle != null) {
                     BehaviourDispatch.unregister(handle);

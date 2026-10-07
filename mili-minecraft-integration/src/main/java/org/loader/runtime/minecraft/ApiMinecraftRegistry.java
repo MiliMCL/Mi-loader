@@ -98,6 +98,14 @@ public final class ApiMinecraftRegistry implements MinecraftRegistry {
         this(modId, new BlockRegistrar(modId));
     }
 
+    /**
+     * @param modJar Mod 的 jar 文件；注册方块时用于从 blockstate 推断属性。
+     *               可为 null（如纯契约测试环境），推断自动降级为无属性。
+     */
+    public ApiMinecraftRegistry(String modId, java.nio.file.Path modJar) {
+        this(modId, new BlockRegistrar(modId, modJar));
+    }
+
     public ApiMinecraftRegistry(String modId, BlockRegistrar registrar) {
         this.modId = Objects.requireNonNull(modId, "modId");
         this.registrar = Objects.requireNonNull(registrar, "registrar");

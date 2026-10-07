@@ -98,6 +98,24 @@ public final class GeneratedBlockFactory {
     public static Object createBlock(Object properties,
                                      BehaviourDispatch.Handle handle,
                                      String debugName) {
+        return createBlock(properties, handle, debugName, java.util.List.of());
+    }
+
+    /**
+     * 同上，但为生成的方块附加原版方块属性（{@code StateDefinition}）。
+     *
+     * <p>属性对象由 {@link BlockStatePropertyInference} 从 Mod 自己的
+     * blockstate JSON 推断（或未来由 BlockSpec 显式声明）。非空时生成类
+     * 会覆写 {@code createBlockStateDefinition}，让 {@code Block.<init>} 在
+     * 构造期间把这些属性收进 {@code StateDefinition} —— 这样 blockstate
+     * 的 {@code age=0..N} 变体才能匹配，方块才有模型。
+     *
+     * @param stateProperties 原版 {@code Property} 实例列表；空列表 = 不覆写
+     */
+    public static Object createBlock(Object properties,
+                                     BehaviourDispatch.Handle handle,
+                                     String debugName,
+                                     java.util.List<Object> stateProperties) {
         // 窗口关着就不能造 Block —— 提前给出可理解的错误。
         org.loader.runtime.minecraft.RegistrationPhase.openRegistryWindow();
         // 只探测版本，不做游戏 bootstrap —— bootstrap 会冻结方块注册表，
@@ -108,8 +126,11 @@ public final class GeneratedBlockFactory {
         Class<?> propertiesClass = loadGameClass(
                 "net.minecraft.world.level.block.state.BlockBehaviour$Properties");
 
-        Class<?> generated = generate(blockClass, debugName);
+        Class<?> generated = generate(blockClass, debugName, stateProperties);
 
+        // 构造期间 Block.<init> 会回调 createBlockStateDefinition ——
+        // 按类登记属性，构造完立刻解除（StateDefinition 只在这一刻构建）。
+        BlockStateDefinitionHook.register(generated, stateProperties);
         Object block;
         try {
             Constructor<?> ctor = generated.getDeclaredConstructor(propertiesClass);
@@ -134,6 +155,8 @@ public final class GeneratedBlockFactory {
                             + "\n  Generated class: " + generated.getName()
                             + "\n  Constructor:     (" + propertiesClass.getName() + ")V"
                             + "\n  Real failure:    " + describe(real), real);
+        } finally {
+            BlockStateDefinitionHook.unregister(generated);
         }
 
         if (handle != null) {
@@ -225,6 +248,11 @@ public final class GeneratedBlockFactory {
      * 覆写的行为钩子。
      */
     private static Class<?> generate(Class<?> blockClass, String debugName) {
+        return generate(blockClass, debugName, java.util.List.of());
+    }
+
+    private static Class<?> generate(Class<?> blockClass, String debugName,
+                                     java.util.List<Object> stateProperties) {
         String internalName = GENERATED_PACKAGE + GENERATED_PREFIX + COUNTER.incrementAndGet();
         String superName = blockClass.getName().replace('.', '/');
 
@@ -283,6 +311,12 @@ public final class GeneratedBlockFactory {
 
         emitDestroyProgress(cw, internalName);
         emitUseWithoutItem(cw, internalName);
+
+        // 有属性才覆写 createBlockStateDefinition —— Block.<init> 在父类
+        // 构造器里虚调用它，属性经 BlockStateDefinitionHook 注入。
+        if (stateProperties != null && !stateProperties.isEmpty()) {
+            emitCreateBlockStateDefinition(cw, internalName);
+        }
 
         cw.visitEnd();
         byte[] bytes = cw.toByteArray();
@@ -462,6 +496,28 @@ public final class GeneratedBlockFactory {
                 "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;"
                         + "Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", false);
         mv.visitInsn(Opcodes.ARETURN);
+        mv.visitMaxs(0, 0);
+        mv.visitEnd();
+    }
+
+    /**
+     * 覆写 {@code Block.createBlockStateDefinition(StateDefinition.Builder)}：
+     * 只把 {@code (this, builder)} 转交给 {@link BlockStateDefinitionHook}。
+     *
+     * <p>签名必须与 26.2 的虚方法一致，否则生成的不是覆写而是重载 ——
+     * 属性会被静默丢弃（父类空实现被调用），表现为「推断成功但没有模型」。
+     */
+    private static void emitCreateBlockStateDefinition(ClassWriter cw, String internalName) {
+        MethodVisitor mv = cw.visitMethod(Opcodes.ACC_PROTECTED, "createBlockStateDefinition",
+                "(Lnet/minecraft/world/level/block/state/StateDefinition$Builder;)V",
+                null, null);
+        mv.visitCode();
+        mv.visitVarInsn(Opcodes.ALOAD, 0); // this
+        mv.visitVarInsn(Opcodes.ALOAD, 1); // builder
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC,
+                BlockStateDefinitionHook.class.getName().replace('.', '/'),
+                "addStates", "(Ljava/lang/Object;Ljava/lang/Object;)V", false);
+        mv.visitInsn(Opcodes.RETURN);
         mv.visitMaxs(0, 0);
         mv.visitEnd();
     }

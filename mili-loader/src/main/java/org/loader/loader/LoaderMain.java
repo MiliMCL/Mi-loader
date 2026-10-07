@@ -397,7 +397,9 @@ public class LoaderMain {
 
                 // 平台侧装入 Minecraft 注册表契约实现：这一步必须在 Mod
                 // 的 initialize() 之前完成，否则 Mod 调 registry() 只会拿到 null。
-                RegistryBinder.bind(runtimeCtx, mod);
+                // 顺带把 Mod 自己的 jar 传下去：注册方块时 loader 据此从
+                // blockstate 推断属性（BlockSpec 还没有属性 API）。
+                RegistryBinder.bind(runtimeCtx, mod, firstModJar(mcl));
 
                 // 传给 Mod 的是契约接口的实现，不是 runtime 的具体类。
                 org.loader.api.ModContext apiCtx = new ApiModContext(runtimeCtx);
@@ -468,6 +470,25 @@ public class LoaderMain {
     public List<String> declaredBlocksOf(String modId) {
         List<String> paths = declaredBlocksByMod.get(modId);
         return paths == null ? List.of() : List.copyOf(paths);
+    }
+
+    /**
+     * 取该 Mod 的第一个 jar 源，供 blockstate 属性推断用。
+     *
+     * <p>开发态目录布局（{@code mods/&lt;id&gt;/}）没有单一 jar，返回 null ——
+     * 推断自动降级为无属性，不影响注册。jar 里有多个源时取第一个：
+     * 标准布局下一个 Mod 只有一个 jar。
+     */
+    private static java.nio.file.Path firstModJar(ModClassLoader mcl) {
+        if (mcl == null) {
+            return null;
+        }
+        for (java.nio.file.Path p : mcl.modSources()) {
+            if (p.toString().endsWith(".jar")) {
+                return p;
+            }
+        }
+        return null;
     }
 
     /**
