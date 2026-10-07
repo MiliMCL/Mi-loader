@@ -658,24 +658,35 @@ public final class ModResourcePacks {
                             Object output = args[3];
                             String prefix = "assets/" + ns + "/"
                                     + (path.isEmpty() ? "" : path);
-                            for (String entryName : listEntries(jar, prefix)) {
-                                String rel = entryName.substring(prefix.length());
-                                Object id = identifier(idClass, ns, rel);
-                                if (id == null) {
-                                    continue;
-                                }
-                                // 复制成 final 局部量：lambda 捕获循环变量在
-                                // Java 21+ 的 effectively-final 规则下会编译失败，
-                                // 且值会在循环推进后变化 —— 每次迭代必须绑定自己的值。
-                                final String jarEntry = entryName;
+                            // 26.2 的 ResourceOutput extends
+                            // BiConsumer<Identifier, IoSupplier<InputStream>>——
+                            // 第二参是游戏侧 IoSupplier，不是
+                            // java.util.function.Supplier（用后者查 getMethod
+                            // 直接 NoSuchMethodException，整个资源 reload 被
+                            // 原版回滚，b1240c3 实测）。
+                            try {
                                 Method accept = outputIface.getMethod("accept",
-                                        idClass, java.util.function.Supplier.class);
-                                // 注意：Supplier 没有 of() 工厂方法（那是 Optional 的），
-                                // 直接用 lambda 构造。
-                                java.util.function.Supplier<java.io.InputStream> supplier =
-                                        () -> new java.io.ByteArrayInputStream(
-                                                readOrEmpty(jar, jarEntry));
-                                accept.invoke(output, id, supplier);
+                                        idClass, ioSupplierClass());
+                                for (String entryName : listEntries(jar, prefix)) {
+                                    String rel = entryName.substring(prefix.length());
+                                    Object id = identifier(idClass, ns, rel);
+                                    if (id == null) {
+                                        continue;
+                                    }
+                                    // 复制成 final 局部量：lambda 捕获循环变量在
+                                    // Java 21+ 的 effectively-final 规则下会编译
+                                    // 失败，且值会在循环推进后变化 —— 每次迭代
+                                    // 必须绑定自己的值。
+                                    final String jarEntry = entryName;
+                                    accept.invoke(output, id, lazyIoSupplier(jar, jarEntry));
+                                }
+                            } catch (ReflectiveOperationException | RuntimeException e) {
+                                // 枚举失败只意味着这些资源不被收录，
+                                // 绝不能把异常抛出代理 —— 代理抛出的任何
+                                // 异常都会包成 UndeclaredThrowableException
+                                // 炸掉整个 reload。
+                                LOG.log(Level.WARNING,
+                                        "listResources failed for " + prefix, e);
                             }
                             return null;
                         }
@@ -739,6 +750,33 @@ public final class ModResourcePacks {
             return "assets/" + s;
         }
         return null;
+    }
+
+    /** 游戏侧 {@code IoSupplier<InputStream>} 的 Class（多处要用，统一解析）。 */
+    private static Class<?> ioSupplierClass() {
+        try {
+            return Reflect.gameClass(PACKS + "resources.IoSupplier");
+        } catch (RuntimeException e) {
+            throw new BridgeMismatchException(
+                    "IoSupplier not found; cannot adapt mod resources to this version.", e);
+        }
+    }
+
+    /**
+     * 惰性读取的 {@code IoSupplier<InputStream>}：get() 时才从 Mod JAR 读条目。
+     *
+     * <p>listResources 一次枚举几十上百个条目，若急切读取会把整包贴图
+     * 全部载入内存；游戏实际只会 get() 其中被收录进图集的那部分。
+     */
+    private static Object lazyIoSupplier(Path jar, String entry) {
+        ClassLoader gameCl = Reflect.gameClassLoader();
+        return Proxy.newProxyInstance(gameCl, new Class<?>[]{ioSupplierClass()},
+                (p, m, a) -> {
+                    if ("get".equals(m.getName())) {
+                        return new java.io.ByteArrayInputStream(readOrEmpty(jar, entry));
+                    }
+                    return defaultValue(m);
+                });
     }
 
     private static Object ioSupplier(String entry, byte[] data)
