@@ -99,6 +99,11 @@ public final class TickCallbackDispatch {
     private static final AtomicLong errorCount = new AtomicLong();
     private static final AtomicReference<String> lastError = new AtomicReference<>();
 
+    /** 服务端/主循环 tick 的累计 begin 次数；游戏从未进入 tick 时为 0。 */
+    public static long totalTicks() {
+        return beginCount.get();
+    }
+
     private TickCallbackDispatch() {
     }
 

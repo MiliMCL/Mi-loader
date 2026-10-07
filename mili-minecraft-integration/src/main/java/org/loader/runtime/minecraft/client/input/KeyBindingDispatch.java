@@ -129,9 +129,19 @@ public final class KeyBindingDispatch {
 
     // ── 轮询（由生成字节码在 Minecraft#tick 头部调用，必须吞异常） ──────────
 
+    /** 已执行的客户端 tick 数。启动看门狗以此判断「游戏主循环是否真的跑起来了」。 */
+    private static final java.util.concurrent.atomic.AtomicLong tickCount =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /** 已执行的客户端 tick 数；游戏主循环从未启动时为 0。 */
+    public static long tickCount() {
+        return tickCount.get();
+    }
+
     /** 每客户端 tick 一次。描述符固定 {@code ()V}。 */
     public static void tick() {
         try {
+            tickCount.incrementAndGet();
             for (Entry entry : bindings) {
                 poll(entry);
             }

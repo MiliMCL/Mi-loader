@@ -198,14 +198,17 @@ public class MinecraftGameProvider implements GameProvider {
             createGameClassLoader(gameClasspath);
         }
 
-        // 开启文件日志：此后所有 [Mili] 诊断都会进 logs/latest.log。
+        // 开启平台文件日志 → <gameDir>/logs/mili-platform.log。
         //
         // 【为什么必须开】平台此前全靠 System.out，输出只在控制台。
         // 于是排查时「latest.log 里零条 [Mili]」被误读成「代码没执行」，
         // 连续两轮把诊断方向带偏 —— 日志源缺失本身就是一种故障。
-        // 此时游戏 main 尚未调用，但 log4j 已随游戏类加载器就绪，
-        // Logger.getLogger() 会自行初始化并挂上文件 appender。
-        PlatformLog.enableFileLogging();
+        //
+        // 【为什么不写 latest.log】旧实现反射调游戏的 log4j，但本类加载在
+        // 平台类加载器上，log4j 在游戏类加载器里 —— Class.forName 必然
+        // ClassNotFoundException 且被吞，结果建出空文件（真实事故）。
+        // 现在写平台自有文件，无加载器可见性依赖，见 PlatformLog 类注释。
+        PlatformLog.enableFileLogging(gameDir.resolve("logs"));
 
         // ── 字节码转换管线 ────────────────────────────────────────────
         //

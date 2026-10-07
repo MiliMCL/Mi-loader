@@ -322,6 +322,7 @@ public class EntryPointHook {
         if (!threadStarted.await(5, TimeUnit.SECONDS)) {
             throw new IllegalStateException("Minecraft main 线程未能在 5s 内启动");
         }
+        startLaunchWatchdog(exited);
         // 阻塞直到游戏退出
         exited.await();
 
@@ -330,6 +331,78 @@ public class EntryPointHook {
             Throwable cause = err.getCause() != null ? err.getCause() : err;
             throw new IllegalStateException("Minecraft main 异常退出: " + cause.getMessage(), cause);
         }
+    }
+
+    /**
+     * 启动看门狗 —— 静默挂起的黑匣子。
+     *
+     * <h2>为什么需要它</h2>
+     * 游戏 main 在独立线程上运行后，若它卡死（窗口不出现、日志无输出、
+     * 无异常抛出），平台与用户都没有任何抓手：进程活着、Mod 线程还在
+     * tick、控制台一片寂静。真实事故：客户端启动深入到 Minecraft 构造
+     * 阶段（joml 已加载）后静默挂起数分钟，唯一可观测的只有 Mod 的
+     * 季节时钟 —— 连线程卡在哪一行都无法得知。
+     *
+     * <h2>判定信号</h2>
+     * 游戏主循环一旦运行，客户端 tick 会经注入代码进入
+     * {@code KeyBindingDispatch.tick()}（计数 &gt; 0），服务端 tick 走
+     * {@code TickCallbackDispatch}。两个计数全为 0 且超过时限 =
+     * 主循环从未启动，输出全线程转储（含监视器锁信息，可诊断死锁）。
+     * 转储写 stderr 与平台日志文件各一份；不干预进程，只观测。
+     */
+    private void startLaunchWatchdog(java.util.concurrent.CountDownLatch exited) {
+        final long firstDumpMs = 120_000L;
+        final long intervalMs = 120_000L;
+        Thread watchdog = new Thread(() -> {
+            long nextDump = System.currentTimeMillis() + firstDumpMs;
+            while (true) {
+                if (exited.getCount() == 0) {
+                    return;   // 游戏 main 已退出，无需监控
+                }
+                boolean gameLoopAlive =
+                        org.loader.runtime.minecraft.client.input.KeyBindingDispatch.tickCount() > 0
+                        || org.loader.runtime.minecraft.transform.TickCallbackDispatch.totalTicks() > 0;
+                if (gameLoopAlive) {
+                    return;   // 主循环已运行，正常启动
+                }
+                long now = System.currentTimeMillis();
+                if (now >= nextDump) {
+                    nextDump = now + intervalMs;
+                    dumpAllThreads();
+                }
+                try {
+                    Thread.sleep(5_000L);
+                } catch (InterruptedException e) {
+                    return;
+                }
+            }
+        }, "mili-launch-watchdog");
+        watchdog.setDaemon(true);
+        watchdog.start();
+    }
+
+    /** 全线程转储（含锁持有/等待信息）→ stderr + 平台日志文件。 */
+    private void dumpAllThreads() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("===== [Mili] THREAD DUMP: 游戏 main 长时间未进入任何 tick =====")
+          .append(System.lineSeparator());
+        sb.append("时间: ").append(java.time.LocalDateTime.now())
+          .append(System.lineSeparator());
+        try {
+            java.lang.management.ThreadMXBean mx =
+                    java.lang.management.ManagementFactory.getThreadMXBean();
+            sb.append("线程总数: ").append(mx.getThreadCount())
+              .append(System.lineSeparator());
+            for (java.lang.management.ThreadInfo ti : mx.dumpAllThreads(true, true)) {
+                sb.append(ti.toString()).append(System.lineSeparator());
+            }
+        } catch (Throwable t) {
+            sb.append("线程转储失败: ").append(t).append(System.lineSeparator());
+        }
+        sb.append("===== [Mili] THREAD DUMP END =====").append(System.lineSeparator());
+        System.err.println("[Mili] 启动看门狗：游戏 main 超时未进入任何 tick，"
+                + "全线程转储已写入 stderr 与 logs/mili-platform.log");
+        PlatformLog.raw(sb.toString());
     }
 
     /**
