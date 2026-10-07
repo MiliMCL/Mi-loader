@@ -677,6 +677,15 @@ public final class ModResourcePacks {
                             return null;
                         }
 
+                        case "getNamespaces": {
+                            // (PackType) → 该资源目录下的命名空间集合。
+                            // 【不可返回 null】接口契约 Set<String> 非 @Nullable，
+                            // 26.2 的 MultiPackResourceManager 对返回值直接 .stream()，
+                            // 返回 null = Initializing game 崩溃（8996796 实测）。
+                            String dir = packDirectory(args, packTypeClass);
+                            return Set.copyOf(listNamespaces(jar, dir));
+                        }
+
                         case "toString":
                             return "MiliModResources(" + modId + ")";
 
@@ -743,7 +752,51 @@ public final class ModResourcePacks {
                 });
     }
 
-    /** 构造游戏侧的 {@code Identifier}（运行期才存在，编译期不能引用）。 */
+    /**
+     * PackType 参数 → 资源根目录（assets / data）。
+     * 反射调 {@code getDirectory()}，取不到退回 {@code assets}（客户端场景）。
+     */
+    private static String packDirectory(Object[] args, Class<?> packTypeClass) {
+        if (args != null && args.length > 0 && packTypeClass.isInstance(args[0])) {
+            try {
+                Method d = packTypeClass.getMethod("getDirectory");
+                Object v = d.invoke(args[0]);
+                if (v != null) {
+                    return String.valueOf(v);
+                }
+            } catch (ReflectiveOperationException ignored) {
+                // 26.2 有 getDirectory()；真缺失时退回客户端目录
+            }
+        }
+        return "assets";
+    }
+
+    /** 列出 JAR 内 {@code <dir>/<ns>/...} 顶层命名空间集合（不存在返回空集）。 */
+    private static Set<String> listNamespaces(Path jar, String dir) {
+        Set<String> out = new LinkedHashSet<>();
+        String prefix = dir + "/";
+        try (ZipFile zip = new ZipFile(jar.toFile())) {
+            var entries = zip.entries();
+            while (entries.hasMoreElements()) {
+                String n = entries.nextElement().getName();
+                if (!n.startsWith(prefix) || n.length() <= prefix.length()) {
+                    continue;
+                }
+                String rest = n.substring(prefix.length());
+                int slash = rest.indexOf('/');
+                if (slash > 0) {
+                    out.add(rest.substring(0, slash));
+                }
+            }
+        } catch (Exception ignored) {
+            // jar 读不了 → 空集：命名空间缺了只是资源不被枚举，不能崩
+        }
+        return out;
+    }
+
+    /**
+     * 构造游戏侧的 {@code Identifier}（运行期才存在，编译期不能引用）。
+     */
     private static Object identifier(Class<?> idClass, String ns, String path) {
         try {
             Method fromNs = idClass.getMethod("fromNamespaceAndPath", String.class, String.class);
@@ -820,6 +873,18 @@ public final class ModResourcePacks {
             }
             if (r == Optional.class) {
                 return Optional.empty();
+            }
+            // 【集合/Map/数组一律空实例，不返回 null】这些返回类型在游戏侧
+            // 常被直接 .stream()/.size()/迭代（如 PackResources.getNamespaces
+            // 返回 null 直接 NPE 崩启动）。空集合语义=「没有」，null=「崩溃」。
+            if (java.util.Collection.class.isAssignableFrom(r)) {
+                return java.util.Collections.emptyList();
+            }
+            if (java.util.Map.class.isAssignableFrom(r)) {
+                return java.util.Collections.emptyMap();
+            }
+            if (r.isArray()) {
+                return java.lang.reflect.Array.newInstance(r.getComponentType(), 0);
             }
             return null;
         }
