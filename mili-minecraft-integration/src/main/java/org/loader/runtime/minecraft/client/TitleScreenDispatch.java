@@ -138,7 +138,9 @@ public final class TitleScreenDispatch {
 
         instrumented.put(screen, Boolean.TRUE);
         addCount.incrementAndGet();
-        LOG.fine(() -> "[Mili] Mods 按钮已添加到主界面");
+        // INFO：按钮是否装上直接决定「点不动」问题能否定位 ——
+        // 按钮存在但点击无反应 与 按钮根本不存在 是完全不同的故障。
+        LOG.info("[Mili] Mods 按钮已添加到主界面 (" + x + "," + y + ")");
     }
 
     /**
@@ -166,6 +168,10 @@ public final class TitleScreenDispatch {
                             default -> null;
                         };
                     }
+                    // INFO：用户点了按钮却没反应时，先确认回调到底
+                    // 有没有被游戏调到 —— 没有这行，「点了没反应」与
+                    // 「回调炸了」在日志里无法区分。
+                    LOG.info("[Mili] Mods 按钮被点击: " + method.getName());
                     openModList();
                     return null;
                 });
@@ -189,6 +195,7 @@ public final class TitleScreenDispatch {
             Object screen = currentScreen();
             Object gui = guiOf(screen);
             if (gui == null) {
+                LOG.warning("[Mili] 打开 mod 列表: 当前无 screen 或取不到 gui，放弃");
                 return;
             }
 
@@ -219,6 +226,7 @@ public final class TitleScreenDispatch {
                             title, body);
 
             showScreen(gui, alert);
+            LOG.info("[Mili] mod 列表已展示 (" + mods.size() + " mods)");
         } catch (Throwable t) {
             errorCount.incrementAndGet();
             LOG.log(Level.WARNING, "[Mili] 打开 mod 列表失败", t);

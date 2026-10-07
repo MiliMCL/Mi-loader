@@ -411,9 +411,20 @@ public final class ModResourcePacks {
                 } else if (t == boolean.class) {
                     args[i] = Boolean.FALSE;
                 } else {
-                    // 未知类型：无法安全构造，放弃这个构造器
-                    fillable = false;
-                    break;
+                    // 未知类型：先尝试「该类型的公共静态实例」。
+                    //
+                    // 真实事故（26.2）：PackSource 从枚举变成了接口 ——
+                    // isEnum() 为 false，上面的分支全部落空，于是整个
+                    // PackLocationInfo 构造不出来，mod 资源包从未进入
+                    // 游戏（全部方块 Missing model）。接口版的实例放在
+                    // public static 字段里（DEFAULT/BUILT_IN/...），
+                    // 与枚举常量在运行期的用法完全等价。
+                    Object constant = firstPublicStaticInstance(t);
+                    if (constant == null) {
+                        fillable = false;
+                        break;
+                    }
+                    args[i] = constant;
                 }
             }
             if (fillable) {
@@ -452,6 +463,42 @@ public final class ModResourcePacks {
     private static Object firstEnumConstant(Class<?> enumClass) {
         Object[] cs = enumClass.getEnumConstants();
         return cs != null && cs.length > 0 ? cs[0] : null;
+    }
+
+    /**
+     * 取「非枚举类型」的公共静态实例 —— 优先 {@code BUILT_IN}/{@code DEFAULT}。
+     *
+     * <p>26.2 的 {@code PackSource} 是接口，实例全在 public static 字段里。
+     * 取不到返回 null，调用方按「填不了」处理。
+     */
+    private static Object firstPublicStaticInstance(Class<?> type) {
+        java.lang.reflect.Field best = null;
+        java.lang.reflect.Field fallback = null;
+        for (java.lang.reflect.Field f : type.getFields()) {
+            if (!java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                continue;
+            }
+            if (!type.isAssignableFrom(f.getType())) {
+                continue;
+            }
+            String name = f.getName();
+            if (name.equals("BUILT_IN") || name.equals("DEFAULT")) {
+                best = f;
+                break;
+            }
+            if (fallback == null) {
+                fallback = f;
+            }
+        }
+        java.lang.reflect.Field chosen = best != null ? best : fallback;
+        if (chosen == null) {
+            return null;
+        }
+        try {
+            return chosen.get(null);
+        } catch (ReflectiveOperationException e) {
+            return null;
+        }
     }
 
     private static Object newSelectionConfig(Class<?> selectionClass)

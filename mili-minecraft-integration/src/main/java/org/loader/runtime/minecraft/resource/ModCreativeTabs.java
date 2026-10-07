@@ -243,6 +243,11 @@ public final class ModCreativeTabs {
         try {
             Object item = lookupItem(modId, path);
             if (item == null) {
+                // INFO 而非 FINE：物品查不到 = 标签内容为空 = shouldDisplay()
+                // 为 false = 标签整个不显示。静默吞掉这个问题曾让
+                // 「创造栏没有 mod 标签」完全无法排查。
+                LOG.info("[Mili] creative tab: item not found for "
+                        + modId + ":" + path + " (registry lookup returned null)");
                 return;
             }
             Class<?> outputIface = Reflect.gameClass(
@@ -262,7 +267,7 @@ public final class ModCreativeTabs {
             accept.invoke(output, item,
                     enumOf(visibilityClass, "PARENT_AND_SEARCH_TABS"));
         } catch (ReflectiveOperationException | RuntimeException e) {
-            LOG.log(Level.FINE, "Cannot add " + modId + ":" + path
+            LOG.log(Level.WARNING, "[Mili] Cannot add " + modId + ":" + path
                     + " to creative tab", e);
         }
     }
@@ -314,6 +319,12 @@ public final class ModCreativeTabs {
                 new Class<?>[]{genClass},
                 (proxy, method, args) -> {
                     if ("accept".equals(method.getName()) && args != null && args.length == 2) {
+                        // 游戏打开创造栏时才构建标签内容 —— 这里是全链路
+                        // 唯一的入口。此前全链路都是 FINE 级（控制台不输出），
+                        // 「标签不显示」时无从下手：究竟 generator 没被调、
+                        // 还是 lookupItem 拿不到物品，日志里完全一样。
+                        LOG.info("[Mili] creative tab content build for '"
+                                + modId + "' (" + blockIds.size() + " blocks)");
                         for (String path : blockIds) {
                             addBlockItem(modId, path, args[1]);
                         }
