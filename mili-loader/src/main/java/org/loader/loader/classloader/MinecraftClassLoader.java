@@ -286,10 +286,10 @@ public final class MinecraftClassLoader extends URLClassLoader {
         } catch (java.net.URISyntaxException e) {
             throw new java.io.IOException("无法定位 jar 文件: " + key, e);
         }
-        // Release.RUNTIME 与 URLClassLoader 语义一致：启用 multi-release jar
+        // Runtime.version() 与 URLClassLoader 语义一致：启用 multi-release jar
         // 的版本化条目（netty 等库依赖它选 natives）。
         java.util.jar.JarFile created = new java.util.jar.JarFile(path.toFile(), true,
-                java.util.zip.ZipFile.OPEN_READ, java.util.jar.JarFile.Release.RUNTIME);
+                java.util.zip.ZipFile.OPEN_READ, Runtime.version());
         java.util.jar.JarFile winner = SHARED_JARS.putIfAbsent(key, created);
         if (winner != null) {
             try {
