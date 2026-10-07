@@ -121,8 +121,15 @@ public final class MinecraftClassLoader extends URLClassLoader {
             // 2) 平台自有包（org.loader.*）与 JDK 包一律委派给 parent。
             //    绝不能让 MC 的 classpath 阴影掉平台的 abi/runtime，
             //    也不能让 MC 依赖里的 shaded java.* 复制一份 JDK 类。
+            //
+            //    例外：com.sun.jna.* 是 Mojang 官方依赖（JNA 恰好住在
+            //    com.sun 命名空间下），不是 JDK 自有类 —— 必须走 self-first。
+            //    否则父加载器找不到它，客户端 main 直接
+            //    NoClassDefFoundError: com/sun/jna/platform/win32/Win32Exception
+            //    （实测事故：窗口前夜炸在 Main.main 第 286 行）。
             if (startsWithAny(name, PLATFORM_OWNED_PREFIXES)
-                    || startsWithAny(name, JDK_OWNED_PREFIXES)) {
+                    || (startsWithAny(name, JDK_OWNED_PREFIXES)
+                        && !name.startsWith("com.sun.jna."))) {
                 Class<?> c = getParent().loadClass(name);
                 if (resolve) resolveClass(c);
                 return c;
@@ -171,9 +178,9 @@ public final class MinecraftClassLoader extends URLClassLoader {
      *
      * <h2>流必须关闭</h2>
      * jar 内嵌在 zip 中，Windows 上不关流会<b>锁住 Minecraft jar</b>。
-     * 本仓库已在 {@link ModClassLoader#getResourceAsStream} 处记录过这个教训
-     * （为此专门禁用了 JVM 级 jar 缓存）。此处用 try-with-resources，
-     * 并继续 {@code setUseCaches(false)}。
+     * 本仓库已在 {@link ModClassLoader#getResourceAsStream} 处记录过这个教训。
+     * 此处所有流均用 try-with-resources 关闭；JarFile 本身经由
+     * {@link #SHARED_JARS} 进程级共享（见其根因记录），随进程退出释放。
      */
     @Override
     protected Class<?> findClass(String name) throws ClassNotFoundException {
@@ -201,19 +208,29 @@ public final class MinecraftClassLoader extends URLClassLoader {
         URL codeSourceUrl = url;
         try {
             URLConnection conn = url.openConnection();
-            conn.setUseCaches(false);
             if (conn instanceof java.net.JarURLConnection jarConn) {
                 // CodeSource 的 location 必须是 jar 本身的 URL（与
                 // URLClassLoader 标准路径一致），而不是条目 URL。
                 codeSourceUrl = jarConn.getJarFileURL();
-            }
-            try (InputStream in = conn.getInputStream()) {
-                original = in.readAllBytes();
-            }
-            if (conn instanceof java.net.JarURLConnection jarConn) {
+                // 共享 JarFile（见 SHARED_JARS 的根因记录）：签名 jar 的
+                // 全量校验对同一个 JarFile 只发生一次。
+                java.util.jar.JarFile jar = sharedJar(codeSourceUrl);
+                java.util.jar.JarEntry entry = jar.getJarEntry(jarConn.getEntryName());
+                if (entry == null) {
+                    return super.findClass(name);
+                }
+                try (InputStream in = jar.getInputStream(entry)) {
+                    original = in.readAllBytes();
+                }
                 // 条目证书只有在读流（触发 jar 签名校验）之后才可用；
                 // 未签名 jar 返回 null —— 与标准路径行为一致。
-                entryCerts = jarConn.getCertificates();
+                entryCerts = entry.getCertificates();
+            } else {
+                // 非 jar 资源（目录 classpath）：按连接读取，不缓存。
+                conn.setUseCaches(false);
+                try (InputStream in = conn.getInputStream()) {
+                    original = in.readAllBytes();
+                }
             }
         } catch (java.io.IOException e) {
             // 读取失败：退到标准路径，让 ClassNotFoundException 表达真实原因
@@ -234,6 +251,55 @@ public final class MinecraftClassLoader extends URLClassLoader {
     /** 点分/斜杠形式的资源路径 —— jar 内条目用斜杠。 */
     private static String resourcePath(String binaryName) {
         return binaryName.replace('.', '/') + ".class";
+    }
+
+    /**
+     * 已打开的 classpath jar（jar URL → JarFile）—— 进程生命周期内强持有。
+     *
+     * <h2>为什么不能每次连接各开各的（真实的「启动挂起」事故）</h2>
+     * <p>每个新建的 {@link java.util.jar.JarFile} 都要独立完成签名校验：
+     * {@code JarFile.initializeVerifier} 会把整个 MANIFEST.MF 逐段摘要。
+     * Mojang 签名客户端 jar 的 MANIFEST 有上万个条目 —— 若每个类的读取
+     * 都新建 JarFile，就要重付上万次这笔开销（实测主线程 96% CPU 烧在
+     * {@code ManifestDigester.findSection}，bootstrap 被拖慢几十倍，
+     * 用户看到的就是「窗口永远不出现」的挂起）。
+     * 共享同一个 JarFile 后校验只做一次，后续每个条目只付自身字节的
+     * 摘要成本 —— 这也正是 URLClassLoader 标准路径（JarFileFactory 缓存）
+     * 快的原因。
+     *
+     * <p>强持有与 URLClassLoader 标准路径语义一致：jar 在进程运行期间
+     * 保持打开（Windows 上表现为文件被锁 —— 官方启动器同样如此）。
+     */
+    private static final java.util.concurrent.ConcurrentHashMap<String, java.util.jar.JarFile>
+            SHARED_JARS = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** 取（或打开）与 jar URL 对应的共享 JarFile；多线程竞争时复用先到者。 */
+    private static java.util.jar.JarFile sharedJar(URL jarFileUrl) throws java.io.IOException {
+        String key = jarFileUrl.toString();
+        java.util.jar.JarFile existing = SHARED_JARS.get(key);
+        if (existing != null) {
+            return existing;
+        }
+        java.nio.file.Path path;
+        try {
+            path = java.nio.file.Paths.get(jarFileUrl.toURI());
+        } catch (java.net.URISyntaxException e) {
+            throw new java.io.IOException("无法定位 jar 文件: " + key, e);
+        }
+        // Release.RUNTIME 与 URLClassLoader 语义一致：启用 multi-release jar
+        // 的版本化条目（netty 等库依赖它选 natives）。
+        java.util.jar.JarFile created = new java.util.jar.JarFile(path.toFile(), true,
+                java.util.zip.ZipFile.OPEN_READ, java.util.jar.JarFile.Release.RUNTIME);
+        java.util.jar.JarFile winner = SHARED_JARS.putIfAbsent(key, created);
+        if (winner != null) {
+            try {
+                created.close();
+            } catch (java.io.IOException ignored) {
+                // 输家关闭自己的实例即可
+            }
+            return winner;
+        }
+        return created;
     }
 
     private boolean startsWithAny(String className, List<String> prefixes) {
