@@ -1,6 +1,6 @@
 # Mili Platform
 
-Mili 是一个从零编写的 Minecraft Mod 加载器，基于 Java 25，不克隆也不兼容 Fabric。它自带独立的 Runtime 内核（Scope / Scheduler / EventBus / Capability / ResourceManager），为 Mod 提供纯 Mili 原生 API，不依赖 Fabric，不使用 Mixin，也不依赖 LaunchWrapper。整个平台以运行时契约（ABI）为核心，所有 Mod 只面向契约编程， Loader 负责注入真实实现。Mili 的目标不是替代 Fabric，而是为 Minecraft 客户端 Mod 工程提供一个全新的、无历史包袱的基础设施选择。我们面向的是那些对现有加载器架构有深刻不满的 Mod 开发者——那些受够了字节码操控的脆弱性、Classpath 污染的微妙性、以及事件系统优先级战争的混乱的开发者。同样，我们也面向那些想要构建大型复杂 Mod 但又苦于基础设施不足的玩家端 Mod 作者——Mili 的结构化并发与能力系统让多 Mod 协作的工程维护成为可能。
+Mili-loader 是一个从零编写的 Minecraft Mod 加载器，基于 Java 25，不克隆也不兼容 Fabric。它自带独立的 Runtime 内核（Scope / Scheduler / EventBus / Capability / ResourceManager），为 Mod 提供纯 Mili 原生 API，不依赖 Fabric，不使用 Mixin，也不依赖 LaunchWrapper。整个平台以运行时契约（ABI）为核心，所有 Mod 只面向契约编程， Loader 负责注入真实实现。Mili 的目标不是替代 Fabric，而是为 Minecraft 客户端 Mod 工程提供一个全新的、无历史包袱的基础设施选择。我们面向的是那些对现有加载器架构有深刻不满的 Mod 开发者——那些受够了字节码操控的脆弱性、Classpath 污染的微妙性、以及事件系统优先级战争的混乱的开发者。同样，我们也面向那些想要构建大型复杂 Mod 但又苦于基础设施不足的玩家端 Mod 作者——Mili 的结构化并发与能力系统让多 Mod 协作的工程维护成为可能。
 
 ## 核心特性
 
