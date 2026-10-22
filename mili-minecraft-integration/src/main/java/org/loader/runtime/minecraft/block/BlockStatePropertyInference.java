@@ -59,9 +59,29 @@ public final class BlockStatePropertyInference {
      * @return 原版 {@code Property} 实例列表（可能为空）；<b>绝不抛异常</b>
      */
     public static List<Object> inferProperties(Path modJar, String namespace, String blockPath) {
+        return inferProperties(modJar, namespace, blockPath, java.util.Set.of());
+    }
+
+    /**
+     * 同上，但跳过 {@code excludeNames} 里已声明过的属性名。
+     *
+     * <p>用于「显式声明优先、推断补缺」的合并策略：Mod 通过
+     * {@code BlockSpec.property(...)} 显式声明的属性由平台直接落地，
+     * 推断不再重复创建同名属性 —— 原版 {@code IntegerProperty.create}
+     * 对同名属性返回同一实例，但取值域不同时会生成两个不相等的实例，
+     * 进而在 {@code StateDefinition.Builder.add} 处抛
+     * {@code IllegalArgumentException}。显式声明说了算，推断让位。
+     *
+     * @param excludeNames 已被显式声明覆盖的属性名；null 视为空集合
+     */
+    public static List<Object> inferProperties(Path modJar, String namespace,
+                                               String blockPath,
+                                               java.util.Set<String> excludeNames) {
         if (modJar == null || namespace == null || blockPath == null) {
             return List.of();
         }
+        java.util.Set<String> excluded = excludeNames == null
+                ? java.util.Set.of() : excludeNames;
         String entry = "assets/" + namespace + "/blockstates/" + blockPath + ".json";
         try {
             String json;
@@ -73,7 +93,7 @@ public final class BlockStatePropertyInference {
                 json = new String(zip.getInputStream(ze).readAllBytes(), StandardCharsets.UTF_8);
             }
 
-            Map<String, Set<String>> values = parseVariantProperties(json);
+            Map<String, Set<String>> values = parseVariantProperties(json, excluded);
             if (values.isEmpty()) {
                 return List.of();
             }
@@ -115,6 +135,14 @@ public final class BlockStatePropertyInference {
      * 模型路径等深度 ≥2 的字符串一律跳过。
      */
     static Map<String, Set<String>> parseVariantProperties(String json) {
+        return parseVariantProperties(json, java.util.Set.of());
+    }
+
+    /**
+     * 同上，但跳过 {@code excludeNames} 里的属性名（显式声明优先、推断让位）。
+     */
+    static Map<String, Set<String>> parseVariantProperties(String json,
+                                                           java.util.Set<String> excludeNames) {
         Map<String, Set<String>> out = new LinkedHashMap<>();
         int v = json.indexOf("\"variants\"");
         if (v < 0) {
@@ -145,13 +173,14 @@ public final class BlockStatePropertyInference {
                 }
                 String key = json.substring(p + 1, close);
                 p = close;
-                collectKey(out, key);
+                collectKey(out, key, excludeNames);
             }
         }
         return out;
     }
 
-    private static void collectKey(Map<String, Set<String>> out, String key) {
+    private static void collectKey(Map<String, Set<String>> out, String key,
+                                   java.util.Set<String> excludeNames) {
         if (key.indexOf('=') <= 0) {
             return;
         }
@@ -165,6 +194,9 @@ public final class BlockStatePropertyInference {
             // 畸形键（"age=" / "=3" / 空值）不是有效的属性绑定，跳过
             if (name.isEmpty() || value.isEmpty()) {
                 continue;
+            }
+            if (excludeNames.contains(name)) {
+                continue; // 显式声明已覆盖，推断让位
             }
             out.computeIfAbsent(name, k -> new TreeSet<>()).add(value);
         }
@@ -188,25 +220,51 @@ public final class BlockStatePropertyInference {
                 break;
             }
         }
-        try {
-            if (allInt) {
-                Class<?> cls = Reflect.gameClass(INTEGER_PROPERTY_CLASS);
-                return cls.getMethod("create", String.class, int.class, int.class)
-                        .invoke(null, name, min, max);
-            }
-            if (values.equals(Set.of("true", "false"))) {
-                Class<?> cls = Reflect.gameClass(BOOLEAN_PROPERTY_CLASS);
-                return cls.getMethod("create", String.class).invoke(null, name);
-            }
-        } catch (ReflectiveOperationException | RuntimeException e) {
-            LOG.log(Level.FINE, "cannot create property '" + name + "' with values " + values, e);
-            return null;
+        if (allInt) {
+            return createIntegerProperty(name, min, max);
+        }
+        if (values.equals(Set.of("true", "false"))) {
+            return createBooleanProperty(name);
         }
         // 枚举属性需要真实的 enum class，无法从字符串值合成 —— 明确跳过。
         LOG.warning("blockstate property '" + name + "' has non-numeric values " + values
                 + "; only integer/boolean properties can be inferred — skipping."
                 + " The block will be registered without this property.");
         return null;
+    }
+
+    /**
+     * 构造原版 {@code IntegerProperty.create(name, min, max)}。
+     *
+     * <p>包级可见：{@link BlockRegistrar} 也用它落地
+     * {@code BlockSpec.property(BlockPropertySpec.integer(...))} 的显式声明，
+     * 与推断共用同一套反射路径，避免两处维护 26.2 的属性类名。
+     *
+     * @return 原版 {@code Property} 实例；原版类不可达时返回 null
+     */
+    static Object createIntegerProperty(String name, int min, int max) {
+        try {
+            Class<?> cls = Reflect.gameClass(INTEGER_PROPERTY_CLASS);
+            return cls.getMethod("create", String.class, int.class, int.class)
+                    .invoke(null, name, min, max);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            LOG.log(Level.FINE, "cannot create integer property '" + name
+                    + "' [" + min + ".." + max + "]", e);
+            return null;
+        }
+    }
+
+    /**
+     * 构造原版 {@code BooleanProperty.create(name)}。约束与返回值同上。
+     */
+    static Object createBooleanProperty(String name) {
+        try {
+            Class<?> cls = Reflect.gameClass(BOOLEAN_PROPERTY_CLASS);
+            return cls.getMethod("create", String.class).invoke(null, name);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            LOG.log(Level.FINE, "cannot create boolean property '" + name + "'", e);
+            return null;
+        }
     }
 
     private static String describe(List<String> names) {

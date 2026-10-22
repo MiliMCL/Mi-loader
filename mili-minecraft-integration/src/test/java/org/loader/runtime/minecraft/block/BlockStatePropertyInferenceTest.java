@@ -73,4 +73,21 @@ class BlockStatePropertyInferenceTest {
                 .parseVariantProperties("{ \"variants\": { \"age=\": { \"model\": \"x\" } } }");
         assertTrue(out.isEmpty() || !out.containsKey("age"));
     }
+
+    @Test
+    void parseVariantPropertiesRespectsExcludeNames() {
+        // 显式声明优先、推断补缺：排除集里的属性名直接跳过
+        String json = """
+                {
+                  "variants": {
+                    "age=0": { "model": "a" },
+                    "age=1": { "model": "b" },
+                    "lit=false": { "model": "c" }
+                  }
+                }
+                """;
+        Map<String, Set<String>> out =
+                BlockStatePropertyInference.parseVariantProperties(json, Set.of("age"));
+        assertEquals(Set.of("lit"), out.keySet());
+    }
 }

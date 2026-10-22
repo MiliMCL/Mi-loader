@@ -2,7 +2,9 @@ package org.loader.api.registry;
 
 import org.loader.api.world.MiliBlock;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -40,6 +42,7 @@ public final class BlockSpec {
     private final int lightLevel;
     private final boolean redstoneConducts;
     private final boolean solid;
+    private final List<BlockPropertySpec> properties;
 
     private BlockSpec(Builder b) {
         this.path = b.path;
@@ -56,6 +59,7 @@ public final class BlockSpec {
         this.lightLevel = b.lightLevel;
         this.redstoneConducts = b.redstoneConducts;
         this.solid = b.solid;
+        this.properties = List.copyOf(b.properties);
     }
 
     public static Builder builder(String path) {
@@ -123,6 +127,16 @@ public final class BlockSpec {
     }
 
     /**
+     * 显式声明的方块状态属性，按声明顺序排列。
+     *
+     * <p>平台注册方块时：显式属性优先落地，其余由 blockstate 推断补齐
+     * （同名时推断让位）。列表可能为空 —— 此时行为与旧版本完全一致。
+     */
+    public List<BlockPropertySpec> properties() {
+        return properties;
+    }
+
+    /**
      * 材质种类。
      *
      * <p>刻意做成枚举而非直接暴露 Minecraft 的 Material —— 后者在不同
@@ -173,6 +187,7 @@ public final class BlockSpec {
         private int lightLevel;
         private boolean redstoneConducts;
         private boolean solid = true;
+        private final List<BlockPropertySpec> properties = new ArrayList<>();
 
         private Builder(String path) {
             if (path == null || path.isBlank()) {
@@ -261,6 +276,33 @@ public final class BlockSpec {
 
         public Builder solid(boolean solid) {
             this.solid = solid;
+            return this;
+        }
+
+        /**
+         * 声明一个方块状态属性（如作物的 {@code age}）。
+         *
+         * <p><b>编译期契约</b>：属性名与取值域写进代码，改名即编译错误，
+         * 不再依赖 blockstate JSON 里的隐含约定。同名属性重复声明会被拒绝
+         * —— 那几乎总是复制粘贴错误，静默去重只会掩盖问题。
+         *
+         * @param property 属性声明；见 {@link BlockPropertySpec}
+         * @return this
+         * @throws IllegalArgumentException 同名属性已声明时
+         */
+        public Builder property(BlockPropertySpec property) {
+            if (property == null) {
+                throw new IllegalArgumentException("property must not be null");
+            }
+            for (BlockPropertySpec existing : properties) {
+                if (existing.name().equals(property.name())) {
+                    throw new IllegalArgumentException(
+                            "duplicate property name '" + property.name()
+                                    + "' (existing: " + existing
+                                    + ", new: " + property + ")");
+                }
+            }
+            properties.add(property);
             return this;
         }
 

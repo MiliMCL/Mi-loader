@@ -113,12 +113,12 @@ public final class BlockRegistrar {
                     : BehaviourDispatch.register(behaviour, fullId);
 
             // 3. 造出 Block 实例。
-            //    属性从 Mod 自己的 blockstate JSON 推断（BlockSpec 尚无属性 API）：
-            //    没有 blockstate 就返回空列表，行为与不推断时完全一致。
+            //    状态属性两条来源合并：Mod 显式声明（BlockSpec.property）优先，
+            //    blockstate JSON 推断补缺 —— 没有 blockstate 也无显式声明时
+            //    返回空列表，行为与完全不处理属性时完全一致。
             String[] idParts = splitId(fullId);
             java.util.List<Object> stateProperties =
-                    BlockStatePropertyInference.inferProperties(
-                            modJar, idParts[0], idParts[1]);
+                    collectStateProperties(spec, idParts[0], idParts[1]);
             Object block;
             try {
                 block = GeneratedBlockFactory.createBlock(
@@ -243,6 +243,46 @@ public final class BlockRegistrar {
 
     private static final java.util.logging.Logger LOG =
             java.util.logging.Logger.getLogger("Mili/BlockRegistrar");
+
+    /**
+     * 汇总一个方块的状态属性：显式声明优先，推断补缺。
+     *
+     * <p><b>顺序即注册顺序</b>：显式声明按 Mod 书写顺序排在最前，推断的
+     * 其余属性按字母序跟随。属性顺序不影响游戏语义，但稳定顺序让
+     * 同一份 Mod 在多次启动间产出完全相同的 {@code StateDefinition}。
+     *
+     * <p>显式属性落地失败（原版属性类不可达等）只记日志并降级为「无此属性」，
+     * 绝不让一次属性转换失败升级成方块注册失败 —— 与推断的降级策略一致。
+     */
+    private java.util.List<Object> collectStateProperties(
+            BlockSpec spec, String namespace, String blockPath) {
+        java.util.LinkedHashMap<String, Object> merged = new java.util.LinkedHashMap<>();
+        for (org.loader.api.registry.BlockPropertySpec declared : spec.properties()) {
+            Object mcProperty = switch (declared.kind()) {
+                case INTEGER -> BlockStatePropertyInference.createIntegerProperty(
+                        declared.name(), declared.min(), declared.max());
+                case BOOLEAN -> BlockStatePropertyInference.createBooleanProperty(
+                        declared.name());
+            };
+            if (mcProperty != null) {
+                merged.put(declared.name(), mcProperty);
+            } else {
+                LOG.warning("explicit property '" + declared + "' of block "
+                        + namespace + ":" + blockPath + " could not be created"
+                        + " (game property classes unavailable?) — registering"
+                        + " the block without it.");
+            }
+        }
+        // 推断补缺：排除显式已覆盖的名字，避免同属性两个实例导致
+        // StateDefinition.Builder.add 抛 IllegalArgumentException。
+        // 注意不能走 merged.values().addAll —— Map 的 values 视图不支持
+        // add（会抛 UnsupportedOperationException）；推断已按名字排除，
+        // 直接列表追加即安全。
+        java.util.List<Object> out = new java.util.ArrayList<>(merged.values());
+        out.addAll(BlockStatePropertyInference.inferProperties(
+                modJar, namespace, blockPath, merged.keySet()));
+        return out;
+    }
 
     // ── 反射工具 ────────────────────────────────────────────────────────────
 

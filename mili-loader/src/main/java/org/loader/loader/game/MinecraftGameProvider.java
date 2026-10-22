@@ -48,6 +48,27 @@ public class MinecraftGameProvider implements GameProvider {
     /** 全局唯一的 Minecraft ClassLoader。 */
     private MinecraftClassLoader gameClassLoader;
 
+    /**
+     * 各 Mod 声明的方块清单（modId → 方块路径），由 {@code LoaderMain} 在
+     * 调用完全部 Mod 入口后、启动游戏前注入。
+     *
+     * <p>这是创造栏标签与资源注入的数据源。走实例注入而非 LoaderMain
+     * 静态字段：静态可变状态会让多次启动（测试、未来热重启）之间的
+     * 清单互相泄漏，且依赖方向会被藏起来 —— 现在数据流向与依赖方向
+     * 一致：LoaderMain → GameProvider → EntryPointHook。
+     */
+    private volatile java.util.Map<String, java.util.List<String>> declaredBlocks =
+            java.util.Map.of();
+
+    /**
+     * 注入各 Mod 声明的方块清单。必须在 {@link #launch} 之前调用；
+     * null 视为空映射。
+     */
+    public void declaredBlocks(java.util.Map<String, java.util.List<String>> byMod) {
+        this.declaredBlocks = byMod == null
+                ? java.util.Map.of() : java.util.Map.copyOf(byMod);
+    }
+
     @Override
     public String getGameId() {
         return "minecraft";
@@ -252,6 +273,8 @@ public class MinecraftGameProvider implements GameProvider {
         // 注册为 bootstrap 的外部资源 —— 失败/停止时随之释放
         EntryPointHook hook = new EntryPointHook();
         hook.install(gameClassLoader, runtime, classLoaderManager, detectedEnvironment);
+        // 方块清单在游戏 main 之前注入 —— 创造栏标签与资源注入都依赖它。
+        hook.declaredBlocks(declaredBlocks);
         hook.invokeMinecraftMain(gameClassLoader, args != null ? args : new String[0]);
     }
 

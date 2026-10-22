@@ -40,7 +40,7 @@ for %%F in ("%DIST_DIR%\core\mili-*.jar") do (
 )
 if not defined PLATFORM_JAR (
     echo [Mili] ERROR: Platform JAR not found in "%DIST_DIR%\core\"
-    exit /b 1
+    goto fail
 )
 
 REM --------------------------------------------------------------------------
@@ -78,11 +78,11 @@ if not defined MC_VERSION (
 if not defined MC_VERSION (
     echo [Mili] ERROR: Cannot determine the Minecraft version.
     echo        Checked platform.json and the JAR file name in "%DIST_DIR%\core\".
-    exit /b 1
+    goto fail
 )
 
 REM --------------------------------------------------------------------------
-REM  Locate Java 25
+REM  Locate Java
 REM --------------------------------------------------------------------------
 set "JAVA_BIN="
 if defined JAVA_HOME (
@@ -93,7 +93,30 @@ if not defined JAVA_BIN (
 )
 if not defined JAVA_BIN (
     echo [Mili] ERROR: Java not found. Please install JDK 25 and set JAVA_HOME.
-    exit /b 1
+    goto fail
+)
+
+REM --------------------------------------------------------------------------
+REM  Verify the Java major version.
+REM  Minecraft 26.2 needs Java 25. An older JDK would only fail later with a
+REM  cryptic UnsupportedClassVersionError, so fail here with a clear message.
+REM  If the version string cannot be parsed, fall through and let the loader
+REM  report whatever it sees - never block on a missing check.
+REM --------------------------------------------------------------------------
+set "JAVA_TMP=%TEMP%\mili-java-version-%RANDOM%.txt"
+"%JAVA_BIN%" -version > "%JAVA_TMP%" 2>&1
+set "JAVA_VER="
+for /f "tokens=3" %%V in ('findstr /c:"version" "%JAVA_TMP%" 2^>nul') do (
+    if not defined JAVA_VER set "JAVA_VER=%%~V"
+)
+del "%JAVA_TMP%" >nul 2>&1
+if defined JAVA_VER (
+    for /f "tokens=1 delims=.-" %%M in ("!JAVA_VER!") do set "JAVA_MAJOR=%%M"
+)
+if defined JAVA_MAJOR if !JAVA_MAJOR! LSS 25 (
+    echo [Mili] ERROR: Found Java !JAVA_VER!, but Minecraft 26.2 requires Java 25.
+    echo        Set JAVA_HOME to a JDK 25 installation and run this script again.
+    goto fail
 )
 
 REM --------------------------------------------------------------------------
@@ -147,8 +170,24 @@ if not defined GAME_UUID set "GAME_UUID=00000000-0000-0000-0000-000000000000"
 if not exist "%GAME_DIR%" mkdir "%GAME_DIR%" >nul 2>&1
 if not exist "%MODS_DIR%" mkdir "%MODS_DIR%" >nul 2>&1
 
+REM --------------------------------------------------------------------------
+REM  Pick the asset index.
+REM  Primary source: the newest index JSON (the installer writes the index for
+REM  the installed Minecraft version last). Older copies, e.g. from a previous
+REM  platform version sharing this game dir, must not win - a wrong index
+REM  silently strips every sound and language file from the game.
+REM  Fallback: last JSON found by the plain glob, then "legacy".
+REM --------------------------------------------------------------------------
 set "ASSET_INDEX="
-for %%F in ("%ASSETS_DIR%\indexes\*.json") do set "ASSET_INDEX=%%~nF"
+set "ASSETS_INDEXES_DIR=%ASSETS_DIR%\indexes"
+if exist "%ASSETS_INDEXES_DIR%\*.json" (
+    for /f "usebackq delims=" %%I in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "(Get-ChildItem -LiteralPath $env:ASSETS_INDEXES_DIR -Filter *.json | Sort-Object LastWriteTime -Descending | Select-Object -First 1).BaseName" 2^>nul`) do (
+        if not defined ASSET_INDEX set "ASSET_INDEX=%%I"
+    )
+)
+if not defined ASSET_INDEX (
+    for %%F in ("%ASSETS_INDEXES_DIR%\*.json") do set "ASSET_INDEX=%%~nF"
+)
 if not defined ASSET_INDEX set "ASSET_INDEX=legacy"
 
 set "AUTH_ARGS=--username "%GAME_NAME%" --uuid "%GAME_UUID%""
@@ -158,10 +197,27 @@ echo [Mili] Platform   : %PLATFORM_JAR%
 echo [Mili] Game dir   : %GAME_DIR%
 echo [Mili] Mods dir   : %MODS_DIR%
 echo [Mili] MC version : %MC_VERSION%
+echo [Mili] Java       : %JAVA_BIN% (!JAVA_VER!)
 echo [Mili] User       : %GAME_NAME%
 if defined SAVED_TOKEN (echo [Mili] Auth       : online) else (echo [Mili] Auth       : offline)
 echo.
 
 "%JAVA_BIN%" -Xmx4G -Dfile.encoding=UTF-8 -Djava.library.path="%NATIVES_DIR%" -jar "%PLATFORM_JAR%" "%GAME_DIR%" --mili-mods "%MODS_DIR%" --version "%MC_VERSION%" --gameDir "%GAME_DIR%" --assetsDir "%ASSETS_DIR%" --assetIndex "%ASSET_INDEX%" %AUTH_ARGS% %*
 
+set "EXIT_CODE=!ERRORLEVEL!"
+if not "!EXIT_CODE!"=="0" (
+    echo.
+    echo [Mili] The loader exited with code !EXIT_CODE!.
+    echo        Logs: "%GAME_DIR%\logs\mili-platform.log"
+    echo              "%GAME_DIR%\logs\latest.log"
+    goto fail
+)
+
 endlocal
+exit /b 0
+
+:fail
+echo.
+echo [Mili] Press any key to close this window.
+pause >nul
+exit /b 1

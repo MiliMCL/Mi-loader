@@ -255,6 +255,37 @@ HIGH、NORMAL、LOW 与 IDLE，优先级高的任务在同一执行批次中优�
 若模组需要在同一能力类型下提供多个实现，应使用包装类或使用命名关键字的注册变体形式加
 以区分。
 
+## 注册 Minecraft 内容：方块与物品
+
+`registry()` 同时是 Minecraft 内容注册的入口（`MinecraftRegistry` 契约）。在
+`initialize()` 中声明的内容会被平台排队，并在游戏 bootstrap 前的注册窗口统一写入
+游戏注册表 —— Mod 代码不需要（也无法）接触任何 Minecraft 内部注册表对象。
+
+方块通过 `BlockSpec` 声明，物品通过 `ItemSpec` 声明：
+
+```java
+public void initialize(ModContext ctx) {
+    ctx.registry().block(BlockSpec.builder("crops/amaranth")
+        .material(BlockSpec.Material.PLANT)
+        .noCollision().replaceable().hardness(0.0f)
+        // 显式声明方块状态属性（ABI 1 新增）：
+        .property(BlockPropertySpec.integer("age", 0, 6))
+        .property(BlockPropertySpec.booleanProperty("hydrated"))
+        .behavior(new AmaranthCrop())
+        .build());
+}
+```
+
+`BlockPropertySpec` 是纯契约数据类（整数 / 布尔两种取值域），平台在注册时把它映射
+为目标 Minecraft 版本真实的 `Property` 实例。属性也可以完全不声明：平台会从 Mod
+JAR 自带的 `assets/<ns>/blockstates/<path>.json` 变体键**推断**属性（`age=0..6`
+→ 整数属性）。两条来源共存且互补 —— 显式声明优先，推断补齐其余；同名时推断让位。
+已有 Mod（只有 blockstate、没有显式声明）不受影响；新代码推荐显式声明，因为改名
+一个属性在编译期就会报错，而不是在游戏里表现为「模型匹配不上」。
+
+注意约束：显式属性名不得含空格、`=` 或 `,`（会破坏 blockstate 变体键格式）；同名
+属性重复声明会被直接拒绝（几乎总是复制粘贴错误，静默去重只会掩盖问题）。
+
 ## 模组九阶段生命周期
 
 Mili Loader 为每个模组定义了严格顺序的九阶段生命周期，阶段名称与状态枚举值如下：DISCOVERED、

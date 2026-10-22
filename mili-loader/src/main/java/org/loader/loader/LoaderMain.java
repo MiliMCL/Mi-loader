@@ -55,8 +55,18 @@ public class LoaderMain {
     private final org.loader.runtime.kernel.Runtime runtime;
     private ModClassLoaderManager classLoaderManager;
     private final GameProvider gameProvider;
+    /** 强类型的 Minecraft Provider 引用；步骤 3 校验后赋值，供实例传值使用。 */
+    private MinecraftGameProvider mcProvider;
     private Path gameDir;
     private final List<Mod> loadedMods = new ArrayList<>();
+
+    /** 强类型的 provider 访问器；步骤 3 未执行前不可调用。 */
+    private MinecraftGameProvider mcProvider() {
+        if (mcProvider == null) {
+            throw new IllegalStateException("GameProvider 尚未装配（步骤 3 未执行）");
+        }
+        return mcProvider;
+    }
 
     public LoaderMain(LoaderConfig config) {
         this.config = config;
@@ -251,6 +261,7 @@ public class LoaderMain {
         }
         MinecraftClassLoader gameCL = mcProvider.createGameClassLoader(gameClasspath);
         classLoaderManager = new ModClassLoaderManager(gameCL, gameDir, config.getModsPath());
+        this.mcProvider = mcProvider;
 
         // ── 4. 发现 Mod ──────────────────────────────────────────────────
         //
@@ -278,12 +289,14 @@ public class LoaderMain {
         // ── 8. 调用 Mod 入口 ─────────────────────────────────────────────
         invokeModEntrypoints();
 
-        // 快照方块清单：创造栏标签在 EntryPointHook 里创建，而 Hook 拿不到
-        // 本实例（中间隔着 GameProvider 接口），走静态快照是最小改动。
-        lastDeclaredBlocks = Map.copyOf(declaredBlocksByMod);
-        if (!lastDeclaredBlocks.isEmpty()) {
-            PlatformLog.info("Declared blocks: " + lastDeclaredBlocks);
+        // 快照方块清单：创造栏标签在 EntryPointHook 里创建。清单经
+        // MinecraftGameProvider 实例传递（见 mcProvider.declaredBlocks），
+        // 不再走静态字段 —— 静态可变状态会让多次启动（测试/热重启）
+        // 之间的清单互相泄漏。
+        if (!declaredBlocksByMod.isEmpty()) {
+            PlatformLog.info("Declared blocks: " + declaredBlocksByMod);
         }
+        mcProvider().declaredBlocks(Map.copyOf(declaredBlocksByMod));
 
         PlatformLog.info("ClassLoader 拓扑:\n" + classLoaderManager.diagnostics());
 
@@ -451,19 +464,9 @@ public class LoaderMain {
      */
     private final Map<String, List<String>> declaredBlocksByMod = new LinkedHashMap<>();
 
-    /**
-     * 上一轮启动中各 Mod 声明的方块路径。
-     *
-     * <p><b>为什么用静态</b>：创造栏标签在 {@code EntryPointHook} 里创建，
-     * 而 Hook 与 {@code LoaderMain} 之间隔着 {@code GameProvider} 接口 ——
-     * 把清单塞进接口参数会波及所有实现类。走静态是最小改动，
-     * 且生命周期一致（都在同一次启动内）。
-     */
-    private static volatile Map<String, List<String>> lastDeclaredBlocks = Map.of();
-
     /** 本次启动中各 Mod 声明的方块路径（modId → 相对命名空间的路径）。 */
-    public static Map<String, List<String>> declaredBlocksSnapshot() {
-        return lastDeclaredBlocks;
+    public Map<String, List<String>> declaredBlocksSnapshot() {
+        return Map.copyOf(declaredBlocksByMod);
     }
 
     /** 某Mod 声明的方块路径；未声明过则返回空列表。 */

@@ -8,11 +8,13 @@ Mili Platform — Minecraft 26.2 Mod 加载器
 2. 运行启动脚本：
      Linux / macOS:  ./bin/mili-loader
      Windows:        bin\mili-loader.bat
-3. Windows 版首次运行会问你两件事，问一次就记住了：
+3. 首次运行会问你两件事（三个平台的脚本行为一致），问一次就记住了：
      * 游戏名        —— 游戏内显示的名字，同时用于派生离线 UUID
      * 访问令牌      —— 只有联机正版服务器/Realms 才需要，直接回车跳过即
                      以离线模式运行
-   回答结果保存在 bin\mili-loader.cfg，之后每次启动不再询问。
+   回答结果保存在 bin/mili-loader.cfg，之后每次启动不再询问。
+   脚本还会预检 Java 版本：低于 25 时直接给出明确的错误提示，
+   而不是让加载器在启动深处报晦涩的类版本错误。
 4. 首次运行会自动从 Mojang 官方源下载 Minecraft 26.2 并校验（约 600MB，
    请耐心等待）。下载完成后游戏会自动启动。
 

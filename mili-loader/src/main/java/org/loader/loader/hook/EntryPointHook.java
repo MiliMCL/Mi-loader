@@ -51,9 +51,15 @@ public class EntryPointHook {
      * <p>26.2 的 {@code CreativeModeTabs} 全是硬编码 {@code accept(...)} 列表，
      * 物品注册本身不会让Mod 物品出现在创造栏 —— 必须由平台显式塞进某个标签。
      * 搜索页会自动聚合所有标签，所以进了任一标签就能被搜到。
+     *
+     * <p><b>数据来源</b>：{@code LoaderMain} 把清单经
+     * {@code MinecraftGameProvider.declaredBlocks(...)} 实例传递进来，
+     * 在 {@code launch()} 内、游戏 main 调用之前设置 —— 不再读取
+     * LoaderMain 的静态字段（静态可变状态会让多次启动间互相泄漏）。
+     * 未设置时为空映射：不注册任何创造栏标签，其余流程不受影响。
      */
     private volatile java.util.Map<String, java.util.List<String>> declaredBlocks =
-            org.loader.loader.LoaderMain.declaredBlocksSnapshot();
+            java.util.Map.of();
 
     /**
      * 设置各 Mod 声明的方块清单。必须在游戏启动前调用。
