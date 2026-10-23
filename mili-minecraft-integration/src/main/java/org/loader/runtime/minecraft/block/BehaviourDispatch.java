@@ -392,21 +392,44 @@ public final class BehaviourDispatch {
         }
     }
 
+    /**
+     * 把「行为回调是否消费了这次交互」映射成游戏的 {@code InteractionResult}。
+     *
+     * <p><b>false 必须返回 PASS，绝不能返回 null。</b>原版
+     * {@code MultiPlayerGameMode.performUseItemOn} 对返回值直接链式调用
+     * {@code consumesAction()} —— null 意味着玩家右键任何平台方块就崩溃。
+     * 这个 bug 直到创造栏页签修好、玩家第一次能把方块拿在手里才暴露。
+     * 语义对照 BlockBehaviour.java:205：无行为时的默认就是 {@code PASS}。
+     *
+     * <p>常量按需解析并缓存：{@code InteractionResult} 是 sealed 接口，
+     * PASS/SUCCESS 都是 public static final 字段，反射可读；但本类可能
+     * 在游戏类可用之前加载，不能在 clinit 里解析。
+     */
+    private static volatile Object successResult;
+    private static volatile Object passResult;
+
     private static Object interactionResult(boolean consumed) {
-        if (!consumed) {
-            return null;
+        Object cached = consumed ? successResult : passResult;
+        if (cached != null) {
+            return cached;
         }
         try {
             Class<?> ir = Class.forName("net.minecraft.world.InteractionResult",
                     true, org.loader.runtime.minecraft.reflect.Reflect.gameClassLoader());
-            Object success = ir.getField("SUCCESS").get(null);
-            if (success != null) {
-                return success;
+            Object resolved = ir.getField(consumed ? "SUCCESS" : "PASS").get(null);
+            if (consumed) {
+                successResult = resolved;
+            } else {
+                passResult = resolved;
             }
+            return resolved;
         } catch (ReflectiveOperationException e) {
-            LOG.log(Level.WARNING, "Cannot resolve InteractionResult.SUCCESS", e);
+            // 解析失败没有安全的替代值（接口无法伪造实例）；原版调用方
+            // 会 NPE，但这条日志至少把根因钉在平台上而不是 Mod。
+            LOG.log(Level.SEVERE, "Cannot resolve InteractionResult."
+                    + (consumed ? "SUCCESS" : "PASS"), e);
+            return null;
         }
-        return null;
     }
 
     /**

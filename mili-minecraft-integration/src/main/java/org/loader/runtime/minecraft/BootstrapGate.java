@@ -54,6 +54,10 @@ public final class BootstrapGate {
                 // Mod 注册夹在"窗口开"与"窗口关"之间 —— 这是 26.2 唯一的机会。
                 RegistrationPhase.runRegistrations();
                 RegistrationPhase.closeRegistryWindow();
+                // 原版的状态缓存循环在 Blocks.<clinit> 里，只覆盖 clinit 时刻
+                // 已入册的方块；Mod 方块一旦错过就永远缺缓存，渲染即崩。
+                // 详见 BlockRegistrar.initModdedBlockStates()。
+                org.loader.runtime.minecraft.block.BlockRegistrar.initModdedBlockStates();
                 state.bootstrapDone.set(true);
                 LOG.info("Minecraft bootstrap OK in " + (System.currentTimeMillis() - start) + "ms");
             } catch (Throwable t) {

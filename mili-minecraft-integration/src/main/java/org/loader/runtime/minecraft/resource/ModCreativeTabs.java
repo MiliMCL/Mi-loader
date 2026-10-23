@@ -325,8 +325,12 @@ public final class ModCreativeTabs {
             // `protected static interface`，方法本身 public，但声明类不是
             // public —— 直接 invoke 会抛 IllegalAccessException，表现为
             // 「标签创建成功但内容永远为空」（空标签被 shouldDisplay 隐藏）。
+            // 【ItemLike 的真实包名是 world.level，不是 world.item】
+            // 用反编译源逐字核对过：net/minecraft/world/level/ItemLike.java。
+            // 写错包名时 getMethod 抛 NoSuchMethodException → 每个物品都
+            // "Cannot add" → 内容全空 → shouldDisplay false → 整页隐藏。
             Method accept = outputIface.getMethod("accept",
-                    Reflect.gameClass("net.minecraft.world.item.ItemLike"),
+                    Reflect.gameClass("net.minecraft.world.level.ItemLike"),
                     visibilityClass);
             accept.setAccessible(true);
             accept.invoke(output, item,
@@ -545,23 +549,20 @@ public final class ModCreativeTabs {
     /**
      * {@code new ItemStack(ItemLike)}。
      *
-     * <p>26.2 <b>没有</b> {@code ItemStack.getItemStack(Item)} 静态方法
-     * （已用字节码核实）—— 只能走构造器，{@code Item} 实现了 {@code ItemLike}。
+     * <p>26.2 没有 {@code ItemStack.getItemStack(Item)} 静态方法（已核实），
+     * 只能走构造器 {@code ItemStack(ItemLike)}（ItemStack.java:259）。
+     *
+     * <p>【不能按 item 的运行时类找构造器】{@code getConstructor(X)} 要求
+     * 参数类型<b>精确等于</b> X —— 传 {@code BlockItem.class} 或
+     * {@code Item.class} 都匹配不上声明为 {@code ItemLike} 的形参，
+     * 必然 {@code NoSuchMethodException}。必须显式按接口 {@code ItemLike}
+     * 查找，实例是它的实现类即可通过 invoke 的类型检查。
      */
     private static Object newItemStack(Object item) {
         Class<?> itemStackClass = Reflect.gameClass("net.minecraft.world.item.ItemStack");
         try {
-            return itemStackClass.getConstructor(item.getClass()).newInstance(item);
-        } catch (NoSuchMethodException e) {
-            try {
-                Class<?> itemClass = Reflect.gameClass("net.minecraft.world.item.Item");
-                return itemStackClass.getConstructor(itemClass).newInstance(item);
-            } catch (ReflectiveOperationException e2) {
-                throw new BridgeMismatchException(
-                        "ItemStack has no constructor accepting the game's Item type."
-                                + "\n  Real constructors: "
-                                + java.util.Arrays.toString(itemStackClass.getConstructors()), e2);
-            }
+            Class<?> itemLikeClass = Reflect.gameClass("net.minecraft.world.level.ItemLike");
+            return itemStackClass.getConstructor(itemLikeClass).newInstance(item);
         } catch (ReflectiveOperationException e) {
             throw new BridgeMismatchException("Cannot create ItemStack: " + e, e);
         }

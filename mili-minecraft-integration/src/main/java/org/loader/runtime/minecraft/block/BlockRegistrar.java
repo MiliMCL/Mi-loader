@@ -404,4 +404,93 @@ public final class BlockRegistrar {
         }
         return Object.class;
     }
+
+    // ── bootstrap 后的状态缓存补齐 ─────────────────────────────────────────
+
+    /**
+     * 给 Mod 方块的状态补跑原版 {@code initCache()} 与
+     * {@code BLOCK_STATE_REGISTRY} 登记。bootstrap 完成后调用一次。
+     *
+     * <h2>为什么需要</h2>
+     * 26.2 的状态缓存（{@code occlusionShapesByFace} 等）只在
+     * {@code Blocks.&lt;clinit&gt;} 尾部的静态循环里初始化：
+     * 遍历注册表 → 逐状态 {@code initCache()}。那个循环只覆盖
+     * <b>clinit 时刻已在注册表里</b>的方块 —— 若平台注册路径上有任何代码
+     * 提前触碰了 {@code Blocks} 类（类初始化时机不受我们控制），
+     * 循环就在 Mod 方块入册之前跑完且不再重跑。后果是状态对象字段为 null，
+     * 玩家把方块放进世界一渲染即崩
+     * （{@code NPE: occlusionShapesByFace is null}，tesselating block in world）。
+     *
+     * <p>原版循环还负责把状态登记进 {@code Block.BLOCK_STATE_REGISTRY}
+     * （全局 IdMapper，存档与网络同步按 id 找状态）—— 这里一并补齐。
+     *
+     * <h2>幂等与边界</h2>
+     * <ul>
+     *   <li>只处理命名空间非 {@code minecraft} 的方块，原版状态不碰。</li>
+     *   <li>{@code initCache()} 可重入：重复调用只是重算同样的值。</li>
+     *   <li>注册表此时已冻结，本方法只读注册表、写 IdMapper 与状态缓存
+     *       —— 均非注册表操作。</li>
+     *   <li>失败只记 SEVERE 不抛：启动照常，但日志会把根因钉在平台。</li>
+     * </ul>
+     */
+    public static void initModdedBlockStates() {
+        try {
+            Object blockRegistry = Reflect.staticField(
+                    BUILTIN_REGISTRIES_CLASS, "BLOCK");
+            Object stateRegistry = Reflect.staticField(
+                    "net.minecraft.world.level.block.Block", "BLOCK_STATE_REGISTRY");
+            if (blockRegistry == null || stateRegistry == null) {
+                LOG.severe("[Mili] Cannot init modded block states: registry missing");
+                return;
+            }
+            Class<?> registryClass = Reflect.gameClass(REGISTRY_CLASS);
+            Method getKey = registryClass.getMethod("getKey", Object.class);
+            Method getNamespace = Reflect.gameClass("net.minecraft.resources.Identifier")
+                    .getMethod("getNamespace");
+            Class<?> idMapperClass = Reflect.gameClass("net.minecraft.core.IdMapper");
+            Method getId = idMapperClass.getMethod("getId", Object.class);
+            Method byId = idMapperClass.getMethod("byId", int.class);
+            Method add = idMapperClass.getMethod("add", Object.class);
+            Method getPossibleStates = Reflect.gameClass(
+                            "net.minecraft.world.level.block.state.StateDefinition")
+                    .getMethod("getPossibleStates");
+
+            int cached = 0;
+            int registered = 0;
+            for (Object block : (Iterable<?>) blockRegistry) {
+                Object key = getKey.invoke(blockRegistry, block);
+                if (key == null) {
+                    continue;
+                }
+                String namespace = (String) getNamespace.invoke(key);
+                if ("minecraft".equals(namespace)) {
+                    continue;
+                }
+                Object definition = block.getClass()
+                        .getMethod("getStateDefinition").invoke(block);
+                for (Object state : (Iterable<?>) getPossibleStates.invoke(definition)) {
+                    int id = (Integer) getId.invoke(stateRegistry, state);
+                    Object roundTrip = byId.invoke(stateRegistry, id);
+                    if (roundTrip != state) {
+                        add.invoke(stateRegistry, state);
+                        registered++;
+                    }
+                    state.getClass().getMethod("initCache").invoke(state);
+                    cached++;
+                }
+            }
+            if (cached > 0) {
+                LOG.info("[Mili] initCache for " + cached + " modded block state(s)"
+                        + (registered > 0
+                                ? " (+" + registered + " newly added to BLOCK_STATE_REGISTRY)"
+                                : ""));
+            }
+        } catch (Throwable t) {
+            // 启动照常 —— 但渲染大概率会崩，这条日志把责任钉在平台而不是 Mod。
+            java.util.logging.Logger.getLogger("Mili/BlockRegistrar").log(
+                    java.util.logging.Level.SEVERE,
+                    "Cannot init modded block states; the world renderer will likely"
+                            + " crash on modded blocks", t);
+        }
+    }
 }
