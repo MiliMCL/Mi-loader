@@ -70,7 +70,16 @@ class MinecraftPipelineTest {
         assertTrue(a.matches("[0-9a-f]{64}"));
     }
 
+    /**
+     * 解压 26.2 的 10952 个 class 文件。
+     *
+     * <p>单测默认超时是 2 分钟（见根 build.gradle.kts 的统一兜底），
+     * 在慢速磁盘上这件事就会超时 —— 而超时与「解压逻辑坏了」看起来
+     * 是同一句话：「timed out」。这里的耗时完全取决于 I/O，
+     * 与正确性无关，因此单独放宽到 8 分钟。
+     */
     @Test
+    @org.junit.jupiter.api.Timeout(value = 8, unit = java.util.concurrent.TimeUnit.MINUTES)
     @DisplayName("Bundler / flat unpack produces class files")
     void unpackProducesClasses() throws Exception {
         File jar = findMinecraftJar();

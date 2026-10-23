@@ -72,6 +72,52 @@ public interface ModContext {
     Logger logger();
 
     /**
+     * Returns this mod's persistent key–value storage.
+     *
+     * <p>Backed by a properties file under
+     * {@code <gameDir>/config/mili/storage/<modId>.properties}. Intended for
+     * small state (a few dozen keys): window position, first-run flags,
+     * last scan results. Mods that need to persist bulk data should manage
+     * their own files instead — this store keeps everything in memory.
+     *
+     * <p>Writes are visible immediately but only guaranteed on disk after
+     * {@link org.loader.api.storage.ModStorage#flush()}; the platform
+     * flushes automatically when the mod's scope shuts down.
+     *
+     * @return the storage bound to this mod's id (same instance every call)
+     * @throws org.loader.api.storage.StorageUnavailableException if the
+     *         platform has not reached its runtime phase yet
+     */
+    default org.loader.api.storage.ModStorage storage() {
+        return org.loader.api.storage.StorageService.forMod(modId());
+    }
+
+    /**
+     * Returns a live snapshot of platform runtime metrics (heap, GC, threads).
+     *
+     * <p>Cheap enough to call once per second from a UI, but not per frame —
+     * sample it at a sensible interval and cache the result yourself.
+     * Returns a zeroed snapshot if the platform has not installed a provider.
+     */
+    default org.loader.api.diagnostics.PlatformMetrics metrics() {
+        return org.loader.api.diagnostics.MetricsService.current();
+    }
+
+    /**
+     * Returns a windowed TPS / tick-latency / FPS snapshot.
+     *
+     * <p>Unlike {@link #metrics()}, this is sampled every tick and answers
+     * "is the game stuttering right now". Both are cheap enough for a
+     * panel refreshing at 4 Hz; neither should be called per frame.
+     *
+     * <p>Returns an empty snapshot when the platform has no tick source
+     * (dedicated server without a world, tests, early startup).
+     */
+    default org.loader.api.diagnostics.PerformanceSnapshot performance() {
+        return org.loader.api.diagnostics.PerformanceService.current();
+    }
+
+    /**
      * Returns the environment type (CLIENT, SERVER, DEDICATED_SERVER).
      */
     Environment environment();

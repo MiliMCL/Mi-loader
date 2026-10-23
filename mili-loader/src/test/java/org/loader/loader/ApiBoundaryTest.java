@@ -56,6 +56,12 @@ class ApiBoundaryTest {
             "import org.loader.runtime.RuntimeEnvironment;",
             "import org.loader.runtime.error.",
             "import org.loader.runtime.mod.",
+            // Mod 列表快照是「loader 采集数据、集成层渲染」的跨模块契约。
+            // 它必须住在 runtime（两边都能看见），而采集方只能是 loader ——
+            // 只有它持有 ModClassLoaderManager 与 ModManifest。
+            // 与 TransformerPipeline 同类：白名单是具体包，loader 仍然
+            // 不能碰 ASM / registry / verifier 等实现件。
+            "import org.loader.runtime.modlist.",
             "import org.loader.runtime.kernel.Runtime;",
             "import org.loader.runtime.kernel.Scope;",
             "import org.loader.runtime.tick.TickContract;",

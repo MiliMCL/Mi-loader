@@ -71,10 +71,21 @@ public final class ModClassLoaderManager implements AutoCloseable {
      * 这样才能保证「Mod A 卸载不影响 Mod B 已经链接的类」。
      */
     public ModClassLoader create(ModManifest manifest) throws IOException {
+        return create(manifest, null);
+    }
+
+    /**
+     * 为单个 Mod 创建 ClassLoader，并显式指定其代码源。
+     *
+     * @param manifest 清单
+     * @param source   发现阶段定位到的 jar / 目录；null 时回退到文件名推断
+     */
+    public ModClassLoader create(ModManifest manifest, Path source) throws IOException {
         if (classLoaders.containsKey(manifest.id())) {
             return classLoaders.get(manifest.id());
         }
-        ModClassLoader mcl = new ModClassLoader(manifest, gameClassLoader, gameDir, modsDir);
+        ModClassLoader mcl = new ModClassLoader(
+                manifest, gameClassLoader, gameDir, modsDir, source);
         classLoaders.put(manifest.id(), mcl);
         creationOrder.add(manifest.id());
         return mcl;

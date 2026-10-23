@@ -51,8 +51,33 @@ public final class ApiModContext implements org.loader.api.ModContext {
 
     private final ModContext delegate;
 
+    /**
+     * 视图对象在构造时一次性创建并复用。
+     *
+     * <h2>为什么不是每次 getter 现造</h2>
+     * 这些视图的返回值会被 Mod 在<b>热路径</b>上访问 —— 典型的用法是
+     * {@code ctx.scheduler().submit(...)} 每 tick 调用，或者
+     * {@code ctx.events().subscribe(...)} 在事件里续订。
+     * 每次调用都 new 一个视图（{@code EventBusView} 还会连带创建一个
+     * {@code ConcurrentHashMap}）意味着每 tick 若干次分配，
+     * 一小时游戏下来是数百万个短命对象 —— 全部由 Young GC 买单，
+     * 表现为「明明没做什么，却每隔几秒掉一帧」。
+     *
+     * <p>视图本身无状态（只有对 delegate 的引用），复用不引入任何
+     * 语义变化。{@code metadata()} 的注释说「视图优于副本，因为清单
+     * 加载后不再变」—— 同一条理由在这里更强：视图连创建都可以省掉。
+     */
+    private final ModMetadata metadataView;
+    private final Lifecycle lifecycleView;
+    private final Scheduler schedulerView;
+    private final org.loader.api.event.EventBus eventsView;
+
     public ApiModContext(ModContext delegate) {
         this.delegate = java.util.Objects.requireNonNull(delegate, "delegate");
+        this.metadataView = new MetadataView(delegate.manifest());
+        this.lifecycleView = new LifecycleView(delegate.scope());
+        this.schedulerView = new SchedulerView(delegate);
+        this.eventsView = new EventBusView(delegate);
     }
 
     /** 底层 runtime 实现 —— 平台内部使用，Mod 不应触碰。 */
@@ -73,22 +98,22 @@ public final class ApiModContext implements org.loader.api.ModContext {
      */
     @Override
     public ModMetadata metadata() {
-        return new MetadataView(delegate.manifest());
+        return metadataView;
     }
 
     @Override
     public Lifecycle lifecycle() {
-        return new LifecycleView(delegate.scope());
+        return lifecycleView;
     }
 
     @Override
     public Scheduler scheduler() {
-        return new SchedulerView(delegate);
+        return schedulerView;
     }
 
     @Override
     public org.loader.api.event.EventBus events() {
-        return new EventBusView(delegate);
+        return eventsView;
     }
 
     /**

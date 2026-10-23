@@ -278,13 +278,28 @@ public class LoaderMain {
         validateVersionBindings(resolved);
 
         // ── 7. 创建 ModClassLoader（parent = gameCL） ──────────────────────
+        //
+        // 显式传入发现阶段定位到的代码源：Mod 的 jar 文件名与 mod id 之间
+        // 没有任何必然关系（`aurora-1.0.0.jar` 里装的是 `miliaurora`），
+        // 靠文件名猜会让 Mod「被发现但加载不了」。
+        Map<String, Path> modSources = modDiscovery.sources();
         for (ModManifest manifest : resolved) {
             Scope modScope = runtime.rootScope().createChild("mod:" + manifest.id());
-            ModClassLoader mcl = classLoaderManager.create(manifest);
+            ModClassLoader mcl = classLoaderManager.create(
+                    manifest, modSources.get(manifest.id()));
             Mod mod = new Mod(manifest, modScope, mcl);
             loadedMods.add(mod);
             modScope.registerResource(mod);
         }
+
+        // ── 7.5 装配运行时服务 ────────────────────────────────────────────
+        //
+        // 时序是硬约束：Mod 的 initialize() 里就会调用 storage()/metrics()，
+        // 因此这两个服务必须在 invokeModEntrypoints() **之前**装配。
+        // 之前把它们放在 MinecraftGameProvider.launch() 里 —— 那是 Mod
+        // 初始化之后，于是任何用存储的 Mod 都会以
+        // StorageUnavailableException 加载失败。
+        installRuntimeServices();
 
         // ── 8. 调用 Mod 入口 ─────────────────────────────────────────────
         invokeModEntrypoints();
@@ -293,10 +308,12 @@ public class LoaderMain {
         // MinecraftGameProvider 实例传递（见 mcProvider.declaredBlocks），
         // 不再走静态字段 —— 静态可变状态会让多次启动（测试/热重启）
         // 之间的清单互相泄漏。
-        if (!declaredBlocksByMod.isEmpty()) {
-            PlatformLog.info("Declared blocks: " + declaredBlocksByMod);
+        if (!declaredBlocksByMod.isEmpty() || !declaredItemsByMod.isEmpty()) {
+            PlatformLog.info("Declared content: blocks=" + declaredBlocksByMod
+                    + " items=" + declaredItemsByMod);
         }
         mcProvider().declaredBlocks(Map.copyOf(declaredBlocksByMod));
+        mcProvider().declaredItems(Map.copyOf(declaredItemsByMod));
 
         PlatformLog.info("ClassLoader 拓扑:\n" + classLoaderManager.diagnostics());
 
@@ -407,6 +424,11 @@ public class LoaderMain {
 
                 Object instance = clazz.getDeclaredConstructor().newInstance();
                 ModContext runtimeCtx = new ModContext(mod);
+                // 环境必须在 Mod 的 initialize() 之前注入。
+                // 旧实现让 runtime 自己兜底成 DEDICATED_SERVER，而构造时
+                // 没人设置 —— 结果每个客户端 Mod 都以为自己在服务器上，
+                // 静默跳过全部客户端功能。见 ModContext.setEnvironment。
+                runtimeCtx.setEnvironment(gameProvider.getEnvironment());
 
                 // 平台侧装入 Minecraft 注册表契约实现：这一步必须在 Mod
                 // 的 initialize() 之前完成，否则 Mod 调 registry() 只会拿到 null。
@@ -420,9 +442,10 @@ public class LoaderMain {
 
                 modContexts.put(mod.id(), runtimeCtx);
 
-                // 记下该 Mod 声明的方块路径 —— 创造栏标签需要它，
+                // 记下该 Mod 声明的方块/物品路径 —— 创造栏标签需要它，
                 // 且这是唯一能拿到确切清单的时刻（见字段注释）。
                 collectDeclaredBlocks(mod.id(), apiCtx);
+                collectDeclaredItems(mod.id(), apiCtx);
 
                 PlatformLog.info("Mod initialized: " + mod.id() + " -> " + entrypoint);
 
@@ -454,6 +477,56 @@ public class LoaderMain {
     /** 已装配的 runtime ModContext，供关闭阶段与诊断使用。 */
     private final Map<String, ModContext> modContexts = new LinkedHashMap<>();
 
+    /** per-mod 持久化存储；在 Mod 初始化之前装配，在关停时落盘。 */
+    private org.loader.runtime.storage.ModStorageService storageService;
+
+    /**
+     * 装配运行时服务（存储 + 指标）。
+     *
+     * <p>幂等：重复调用只会重新注册同一批 provider。
+     */
+    private void installRuntimeServices() {
+        storageService = org.loader.runtime.storage.ModStorageService.install(
+                gameDir.resolve("config").resolve("mili").resolve("storage"));
+        PlatformLog.info("[Mili] 存储服务: "
+                + (storageService.persistent()
+                ? storageService.directory().toString()
+                : "仅内存（目录不可写）"));
+
+        // 客户端服务（屏幕 / 按键）也必须在这里装配。
+        //
+        // 它们的消费方同样是 Mod 的 initialize()：一个 Mod 想在初始化阶段
+        // 注册快捷键或声明界面，调用点就在这里。之前这两个 bridge 装在
+        // MinecraftGameProvider.launch() 里 —— Mod 初始化之后，于是
+        // KeyBindingService 一直「未装配」，Mod 只看到一句
+        // 「当前环境没有客户端输入系统」。而那与事实完全不符：
+        // 环境检测早就确定了这是 CLIENT。
+        if (gameProvider.getEnvironment() == org.loader.runtime.RuntimeEnvironment.CLIENT) {
+            org.loader.runtime.minecraft.client.screen.ScreenServiceBridge.install();
+            org.loader.runtime.minecraft.client.input.KeyBindingServiceBridge.install();
+            PlatformLog.info("[Mili] 客户端服务已装配: Screen / KeyBinding");
+        }
+
+        org.loader.runtime.diagnostics.RuntimeMetrics.install(
+                () -> loadedMods.size(),
+                () -> {
+                    Map<String, Integer> counts = new LinkedHashMap<>();
+                    if (classLoaderManager != null) {
+                        for (ModClassLoader mcl : classLoaderManager.all()) {
+                            counts.put(mcl.modId(), mcl.loadedClasses().size());
+                        }
+                    }
+                    return counts;
+                },
+                // 以前这里是 () -> 0L / () -> 0d：指标服务装上了，但 tick 数据
+                // 永远是 0。Mod 在界面上显示「0 ticks / 0.00ms」，看起来像
+                // 「游戏没跑」，实际只是没人接线。TickEngine 把每个 tick 写进
+                // Runtime 的性能采样器，这里读同一份数据。
+                () -> runtime.performance().tickCount(),
+                () -> runtime.performance().averageTickMs());
+        PlatformLog.info("[Mili] 指标服务已装配");
+    }
+
     /**
      * 每个 Mod 声明的方块路径（相对其命名空间），供创造栏标签使用。
      *
@@ -463,6 +536,15 @@ public class LoaderMain {
      * 因为那里同时装着全部原版方块，无法区分来源。
      */
     private final Map<String, List<String>> declaredBlocksByMod = new LinkedHashMap<>();
+
+    /**
+     * 本次启动中各 Mod 声明的物品路径（modId → 相对命名空间的路径）。
+     *
+     * <p>与 {@link #declaredBlocksByMod} 分开收集：创造栏标签要同时填充
+     * 方块（自动补 BlockItem）与显式物品（如 Aurora 的 {@code aurora_shard}）。
+     * 只传方块会得到「页签里只有方块」的半成品。
+     */
+    private final Map<String, List<String>> declaredItemsByMod = new LinkedHashMap<>();
 
     /** 本次启动中各 Mod 声明的方块路径（modId → 相对命名空间的路径）。 */
     public Map<String, List<String>> declaredBlocksSnapshot() {
@@ -521,6 +603,32 @@ public class LoaderMain {
     }
 
     /**
+     * 从契约上下文里取出该 Mod 声明的物品路径（含方块物品）。
+     *
+     * <p>与方块清单同理：只用于创造栏标签，失败不阻断 Mod 加载。
+     */
+    private void collectDeclaredItems(String modId, org.loader.api.ModContext apiCtx) {
+        try {
+            org.loader.api.registry.MinecraftRegistry reg = apiCtx.registry();
+            if (reg == null) {
+                return;
+            }
+            List<String> paths = new ArrayList<>();
+            for (org.loader.api.registry.ItemHandle handle : reg.items()) {
+                if (modId.equals(handle.modId())) {
+                    paths.add(handle.path());
+                }
+            }
+            if (!paths.isEmpty()) {
+                declaredItemsByMod.put(modId, paths);
+            }
+        } catch (RuntimeException e) {
+            PlatformLog.warn("提示: 无法记录 " + modId
+                    + " 的物品清单（创造栏将缺少物品）: " + e);
+        }
+    }
+
+    /**
      * 逆序释放全部资源。单个失败不阻断其余清理。
      */
     private void shutdown() {
@@ -534,6 +642,13 @@ public class LoaderMain {
             }
         }
         loadedMods.clear();
+
+        // Mod 全部关闭后再落盘：此时 Mod 的 shutdown 钩子已经把最终状态写进内存。
+        if (storageService != null) {
+            int flushed = storageService.flushAll();
+            PlatformLog.info("[Mili] Mod 存储已落盘: " + flushed
+                    + "/" + storageService.size());
+        }
 
         if (classLoaderManager != null) {
             try {

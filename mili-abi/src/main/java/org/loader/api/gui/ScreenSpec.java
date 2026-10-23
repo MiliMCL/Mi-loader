@@ -65,14 +65,18 @@ public final class ScreenSpec {
     private final String title;
     private final int width;
     private final int height;
+    private final boolean pauseGame;
+    private final boolean hudMode;
     private final List<Widget> widgets;
 
     private ScreenSpec(String id, String title, int width, int height,
-                       List<Widget> widgets) {
+                       boolean pauseGame, boolean hudMode, List<Widget> widgets) {
         this.id = id;
         this.title = title;
         this.width = width;
         this.height = height;
+        this.pauseGame = pauseGame;
+        this.hudMode = hudMode;
         this.widgets = List.copyOf(widgets);
     }
 
@@ -101,6 +105,27 @@ public final class ScreenSpec {
         return widgets;
     }
 
+    /**
+     * 打开界面时是否暂停单人游戏。默认 {@code true}（与原版 Screen 一致）。
+     *
+     * <p>诊断类界面必须设为 {@code false}：暂停后 integrated server 停止 tick，
+     * TPS 会掉到 0 —— 一个「观察性能」的面板反而让被观察的对象停下，
+     * 读到的数字毫无意义。
+     */
+    public boolean pauseGame() {
+        return pauseGame;
+    }
+
+    /**
+     * 是否按「游戏内 HUD」方式绘制背景。默认 {@code false}。
+     *
+     * <p>{@code true} 时使用半透明渐变而不是模糊/全景背景，适合叠加在
+     * 游戏画面上看数据的诊断面板；{@code false} 保持原版菜单观感。
+     */
+    public boolean hudMode() {
+        return hudMode;
+    }
+
     public static Builder builder(String id, String title) {
         return new Builder(id, title);
     }
@@ -110,6 +135,8 @@ public final class ScreenSpec {
         private final String title;
         private int width = 256;
         private int height = 180;
+        private boolean pauseGame = true;
+        private boolean hudMode = false;
         private final List<Widget> widgets = new ArrayList<>();
         private final java.util.Set<String> ids = new java.util.HashSet<>();
 
@@ -160,8 +187,30 @@ public final class ScreenSpec {
             return add(new Checkbox(id, label, x, y, initial));
         }
 
+        /**
+         * 打开界面时是否暂停单人游戏。默认 {@code true}。
+         *
+         * <p>只有「看数据但不想中断游戏」的界面才应关闭 —— 配置界面暂停是
+         * 正确行为，诊断面板暂停则会让 TPS 读数归零。
+         */
+        public Builder pauseGame(boolean pause) {
+            this.pauseGame = pause;
+            return this;
+        }
+
+        /**
+         * 是否使用游戏内 HUD 背景。默认 {@code false}。
+         *
+         * <p>{@code true} 时背景是半透明渐变，不再绘制模糊的全景/菜单底图。
+         */
+        public Builder hudMode(boolean hud) {
+            this.hudMode = hud;
+            return this;
+        }
+
         public ScreenSpec build() {
-            return new ScreenSpec(id, title, width, height, widgets);
+            return new ScreenSpec(id, title, width, height,
+                    pauseGame, hudMode, widgets);
         }
 
         private Builder add(Widget widget) {

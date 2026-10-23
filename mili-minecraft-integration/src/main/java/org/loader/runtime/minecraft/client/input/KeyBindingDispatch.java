@@ -3,6 +3,8 @@ package org.loader.runtime.minecraft.client.input;
 import org.loader.api.input.KeyBinding;
 import org.loader.api.input.KeyEventType;
 import org.loader.api.input.KeyBindingSpec;
+import org.loader.runtime.kernel.Resource;
+import org.loader.runtime.kernel.Scope;
 import org.loader.runtime.minecraft.reflect.Reflect;
 
 import java.lang.reflect.Field;
@@ -10,6 +12,7 @@ import java.lang.reflect.Method;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -84,6 +87,27 @@ public final class KeyBindingDispatch {
 
     private static final List<Entry> bindings = new CopyOnWriteArrayList<>();
 
+    /**
+     * 客户端 tick 钩子 —— 帧率采样、面板注册这类「每客户端 tick 一次」
+     * 的平台逻辑挂在这里。
+     *
+     * <p>放在按键分发器里而不是再注入一个 {@code Minecraft#tick} 回调：
+     * 每个额外的字节码注入点都是一次与 Minecraft 签名的耦合，
+     * 而这个分发器已经在 tick 上，钩子只是同一条链上的后续步骤。
+     */
+    private static final List<Runnable> tickHooks = new CopyOnWriteArrayList<>();
+
+    /**
+     * 反射方法缓存。
+     *
+     * <p>旧实现每个客户端 tick、每个绑定都调用 {@code getMethod} ——
+     * 20 TPS × N 个绑定 × 2 次查找，每次都要遍历方法表并分配 Method 副本。
+     * 这不是「慢一点」，而是把渲染/游戏线程的时间花在查找一个永远不变的
+     * 方法上。方法签名在进程生命周期内不会变，缓存一次即可。
+     */
+    private static volatile Method consumeClickMethod;
+    private static volatile Method isDownMethod;
+
     private KeyBindingDispatch() {
     }
 
@@ -142,18 +166,46 @@ public final class KeyBindingDispatch {
     public static void tick() {
         try {
             tickCount.incrementAndGet();
-            for (Entry entry : bindings) {
-                poll(entry);
+            // 倒序遍历：回调里可能 unregister / removeTickHook —— 正序会
+            // 让被移除元素之后的条目整体左移，从而跳过下一个处理器。
+            // 倒序时「已遍历过的下标」不受左移影响。
+            for (int i = bindings.size() - 1; i >= 0; i--) {
+                try {
+                    poll(bindings.get(i));
+                } catch (Throwable t) {
+                    // 单个绑定失败不该让其余绑定与钩子全部停摆
+                    LOG.log(Level.WARNING, "[Mili] 按键轮询失败（该绑定已跳过）", t);
+                }
+            }
+            for (int i = tickHooks.size() - 1; i >= 0; i--) {
+                try {
+                    tickHooks.get(i).run();
+                } catch (Throwable t) {
+                    LOG.log(Level.WARNING, "[Mili] 客户端 tick 钩子抛出异常", t);
+                }
             }
         } catch (Throwable t) {
             LOG.log(Level.WARNING, "[Mili] 按键轮询失败", t);
         }
     }
 
+    /** 注册一个客户端 tick 钩子（幂等：同一实例不会被重复加入）。 */
+    public static void addTickHook(Runnable hook) {
+        if (hook != null && !tickHooks.contains(hook)) {
+            tickHooks.add(hook);
+        }
+    }
+
+    /** 移除客户端 tick 钩子。 */
+    public static void removeTickHook(Runnable hook) {
+        if (hook != null) {
+            tickHooks.remove(hook);
+        }
+    }
+
     private static void poll(Entry entry) throws Exception {
-        Class<?> mappingClass = Reflect.gameClass(KEY_MAPPING);
-        Method consumeClick = mappingClass.getMethod("consumeClick");
-        Method isDown = mappingClass.getMethod("isDown");
+        Method consumeClick = consumeClick();
+        Method isDown = isDown();
 
         // PRESS：原版点击计数 —— 可能积压多次，逐个派发。
         while ((boolean) consumeClick.invoke(entry.keyMapping)) {
@@ -166,6 +218,24 @@ public final class KeyBindingDispatch {
             fireEvent(entry, KeyEventType.RELEASE);
         }
         entry.down = down;
+    }
+
+    private static Method consumeClick() throws Exception {
+        Method method = consumeClickMethod;
+        if (method == null) {
+            method = Reflect.gameClass(KEY_MAPPING).getMethod("consumeClick");
+            consumeClickMethod = method;
+        }
+        return method;
+    }
+
+    private static Method isDown() throws Exception {
+        Method method = isDownMethod;
+        if (method == null) {
+            method = Reflect.gameClass(KEY_MAPPING).getMethod("isDown");
+            isDownMethod = method;
+        }
+        return method;
     }
 
     private static void fireEvent(Entry entry, KeyEventType type) {
@@ -276,5 +346,77 @@ public final class KeyBindingDispatch {
     /** 已注册绑定数（诊断）。 */
     public static int bindingCount() {
         return bindings.size();
+    }
+
+    /**
+     * 把「释放全部绑定」登记为 Scope 资源。
+     *
+     * <p>注册顺序很重要：本资源应在 Mod 与面板的绑定之后注册，
+     * 这样 Scope 逆序关闭时先让它们各自注销，最后由本资源兜底清空。
+     */
+    public static Resource lifecycle(Scope owner) {
+        return new Lifecycle(owner);
+    }
+
+    private static final class Lifecycle implements Resource {
+        private final Scope owner;
+        private final AtomicBoolean closed = new AtomicBoolean(false);
+
+        Lifecycle(Scope owner) {
+            this.owner = owner;
+        }
+
+        @Override
+        public String id() {
+            return "key-binding-dispatch";
+        }
+
+        @Override
+        public Scope owner() {
+            return owner;
+        }
+
+        @Override
+        public boolean isClosed() {
+            return closed.get();
+        }
+
+        @Override
+        public void close() {
+            if (closed.compareAndSet(false, true)) {
+                releaseAll();
+            }
+        }
+    }
+
+    /** 已注册客户端 tick 钩子数（诊断）。 */
+    public static int tickHookCount() {
+        return tickHooks.size();
+    }
+
+    /**
+     * 释放全部绑定与钩子 —— 由平台在 Scope 关闭时调用。
+     *
+     * <p>绑定持有的是 Mod 传进来的 {@code Consumer}: 不清空的话，
+     * 即使 Mod 的 ClassLoader 已经关闭，这条静态列表仍然握着它的
+     * lambda，整个 Mod 无法回收。症状不是崩溃，而是「换了 Mod 之后
+     * 旧版本的类还在堆里」。
+     */
+    public static void releaseAll() {
+        for (int i = 0; i < bindings.size(); i++) {
+            Entry entry = bindings.get(i);
+            try {
+                removeFromVanillaRegistry(entry.spec().id());
+            } catch (Throwable t) {
+                LOG.log(Level.FINE, "[Mili] 注销按键时移除原版注册失败: "
+                        + entry.spec().id(), t);
+            }
+        }
+        bindings.clear();
+        tickHooks.clear();
+        // 反射缓存指向游戏类，保留无害；显式清空是为了让测试能跨
+        // ClassLoader 重新解析。
+        consumeClickMethod = null;
+        isDownMethod = null;
     }
 }

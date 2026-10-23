@@ -1,11 +1,16 @@
 package org.loader.runtime.minecraft.resource;
 
+import org.loader.runtime.minecraft.client.creative.CreativeTabLayout;
 import org.loader.runtime.minecraft.reflect.BridgeMismatchException;
 import org.loader.runtime.minecraft.reflect.Reflect;
 
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -39,8 +44,22 @@ import java.util.logging.Logger;
  *
  * <h2>为什么按 mod id 就够了</h2>
  *
- * <p>标签 id = modId 小写化，标题 key = {@code itemGroup.<modId>.<modId>}。
- * 只要 Mod 有 id 就有自己的标签，<b>无需任何额外配置</b>。
+ * <p>标签 id = modId 小写化，<b>页名暂时直接使用 modId</b>（不再依赖
+ * {@code itemGroup.*} 的 lang 条目 —— 没有翻译键时原版会显示一串
+ * {@code itemGroup.miliaurora.miliaurora}，比直接显示 id 更难读）。
+ *
+ * <h2>页签放在哪里</h2>
+ *
+ * <p>原版创造栏只有 TOP/BOTTOM 两行、每行 7 个位置（0..6），且已全部
+ * 被原版页签占满。直接给 Mod 页签 `column = 7,8…` 会画到面板外面；
+ * 26.2 的 {@code getTabX} 是 {@code 27 * column}，没有任何换行逻辑。
+ *
+ * <p>因此 Mod 页签使用<b>哨兵列</b>（{@link CreativeTabLayout#MOD_COLUMN_BASE}
+ * 起），并由平台转换器 {@code MiliCreativeTabLayoutTransformer} 改写
+ * {@code CreativeModeInventoryScreen#getTabX}，把这些页签排到面板<b>右侧</b>：
+ * 偶数索引 TOP 行、奇数索引 BOTTOM 行，同一行内向右顺延。
+ * 同时修正 {@code extractTabButton} 里 {@code Mth.clamp(pos, 0, len)}
+ * 的越界（原版只在 0..6 下不会触发，哨兵列会触发 AIOOBE）。
  */
 public final class ModCreativeTabs {
 
@@ -59,32 +78,75 @@ public final class ModCreativeTabs {
      *
      * @param modId    Mod ID —— 标签 id 由它推导，无需额外配置
      * @param blockIds 该 Mod 声明的方块路径（相对其命名空间，如 {@code crops/amaranth}）
+     * @return 是否成功创建（已存在或参数为空时返回 false）
      */
-    public static void registerTab(String modId, java.util.List<String> blockIds) {
-        if (modId == null || modId.isBlank() || blockIds == null || blockIds.isEmpty()) {
-            return;
+    public static boolean registerTab(String modId, java.util.List<String> blockIds) {
+        return registerTab(modId, blockIds, List.of());
+    }
+
+    /**
+     * 为一个 Mod 创建创造栏标签，填入方块与显式注册的物品。
+     *
+     * <p><b>本方法不查物品注册表</b>：Mod 的注册动作是 defer 的，此刻
+     * 方块/物品尚未真正落地。内容在 {@code displayItems} 回调里按 id
+     * 解析 —— 那是创造栏首次打开时，注册表已经就绪。
+     *
+     * @param modId    Mod ID
+     * @param blockIds 方块路径（相对命名空间）；会按 id 自动补 BlockItem
+     * @param itemIds  显式注册的物品路径（相对命名空间）
+     * @return 是否成功创建
+     */
+    public static boolean registerTab(String modId,
+                                      java.util.List<String> blockIds,
+                                      java.util.List<String> itemIds) {
+        if (modId == null || modId.isBlank()) {
+            return false;
+        }
+        List<String> blocks = blockIds != null ? blockIds : List.of();
+        List<String> items = itemIds != null ? itemIds : List.of();
+        if (blocks.isEmpty() && items.isEmpty()) {
+            return false;
         }
         String tabId = sanitize(modId);
         if (tabId == null || CREATED.containsKey(tabId)) {
-            return;
+            return false;
         }
+
+        // 内容顺序：先方块（含自动补的 BlockItem），再显式物品；按 path 去重。
+        // 同一个 path 既声明 block 又声明 item 时只出现一次。
+        Set<String> content = new LinkedHashSet<>();
+        content.addAll(blocks);
+        content.addAll(items);
+        List<String> contentIds = new ArrayList<>(content);
+
         try {
-            Object tab = buildTab(modId, tabId, blockIds);
+            int index = CREATED.size();
+            // 偶数 TOP、奇数 BOTTOM：原版两行都已占满 0..6，
+            // 这里靠哨兵列把页签排到面板右侧（见 CreativeTabLayout）。
+            boolean top = (index % 2 == 0);
+            int column = CreativeTabLayout.MOD_COLUMN_BASE + index;
+
+            Object tab = buildTab(modId, tabId, top, column, contentIds);
             if (tab != null) {
                 CREATED.put(tabId, tabId);
                 LOG.info("Creative tab '" + tabId + "' created with "
-                        + blockIds.size() + " block item(s) for mod '" + modId + "'");
+                        + contentIds.size() + " item(s) for mod '" + modId + "'"
+                        + (top ? " (TOP)" : " (BOTTOM)") + " column=" + column);
+                return true;
             }
+            return false;
         } catch (RuntimeException e) {
-            // 创造栏是便利功能，失败不该影响游戏 —— 方块仍可 /give 获得。
+            // 创造栏是便利功能，失败不该影响游戏 —— 内容仍可 /give 获得。
             LOG.log(Level.WARNING,
                     "Cannot create creative tab for mod '" + modId
-                            + "'. Its blocks will still be obtainable via /give"
+                            + "'. Its content will still be obtainable via /give"
                             + " and the search tab.", e);
+            return false;
         }
     }
 
-    private static Object buildTab(String modId, String tabId, java.util.List<String> blockIds) {
+    private static Object buildTab(String modId, String tabId, boolean top,
+                                   int column, List<String> itemIds) {
         try {
             Class<?> tabClass = Reflect.gameClass("net.minecraft.world.item.CreativeModeTab");
             Class<?> rowClass = Reflect.gameClass("net.minecraft.world.item.CreativeModeTab$Row");
@@ -92,16 +154,14 @@ public final class ModCreativeTabs {
             Class<?> builderClass =
                     Reflect.gameClass("net.minecraft.world.item.CreativeModeTab$Builder");
 
-            // 标题：itemGroup.<modId>.<tabId>，交给 lang 翻译
+            // 页名暂时直接用 modId。等语言文件体系接上后再换成
+            // itemGroup.<modId> 的 translatable key。
             Object title = componentClass
-                    .getMethod("translatable", String.class)
-                    .invoke(null, "itemGroup." + modId + "." + tabId);
-
-            // 列位置：TOP 行从 8 起顺延，避开原版标签
-            int column = 8 + (CREATED.size() % 7);
+                    .getMethod("literal", String.class)
+                    .invoke(null, modId);
 
             Object builder = tabClass.getMethod("builder", rowClass, int.class)
-                    .invoke(null, enumOf(rowClass, "TOP"), column);
+                    .invoke(null, enumOf(rowClass, top ? "TOP" : "BOTTOM"), column);
 
             builderClass.getMethod("title", componentClass).invoke(builder, title);
 
@@ -114,7 +174,7 @@ public final class ModCreativeTabs {
             // 若某个版本改了默认值，才需要用 getDeclaredMethod + setAccessible 兜底。
             setTabTypeIfNeeded(builderClass, builder);
 
-            // 图标：第一个方块的物品形式。
+            // 图标：第一个内容物品（方块会由 ensureBlockItems 自动补 BlockItem）。
             // icon 的形参类型是 Supplier<ItemStack>（26.2 实测），不是 Supplier<Object>。
             //
             // 【为什么要用 Proxy 而不是 lambda】泛型擦除后
@@ -126,9 +186,9 @@ public final class ModCreativeTabs {
             //
             // 延迟解析：标签首次显示时才调用，那时物品注册表已完全就绪。
             builderClass.getMethod("icon", java.util.function.Supplier.class)
-                    .invoke(builder, newIconSupplier(modId, blockIds.get(0)));
+                    .invoke(builder, newIconSupplier(modId, itemIds.get(0)));
 
-            // displayItems：把所有方块物品加进这个标签
+            // displayItems：把方块物品与显式物品加进这个标签
             //
             // 【同 icon，必须用 Proxy 而非 lambda】
             // DisplayItemsGenerator 是双参函数式接口，形参类型是
@@ -138,7 +198,7 @@ public final class ModCreativeTabs {
             builderClass.getMethod("displayItems",
                             Reflect.gameClass(
                                     "net.minecraft.world.item.CreativeModeTab$DisplayItemsGenerator"))
-                    .invoke(builder, newDisplayItemsGenerator(modId, blockIds));
+                    .invoke(builder, newDisplayItemsGenerator(modId, itemIds));
 
             Object tab = builderClass.getMethod("build").invoke(builder);
             return registerIntoRegistry(modId, tabId, tab);
@@ -234,12 +294,13 @@ public final class ModCreativeTabs {
     }
 
     /**
-     * 把 {@code modId:path} 解析为 ItemStack 并加入标签输出。
+     * 把 {@code modId:path} 解析为 Item 并加入标签输出。
      *
-     * <p>方块的物品形式即「该 id 对应的 BlockItem」：26.2 的物品注册表为每个
-     * Block 都提供了一个同名 {@code BlockItem}，按同一 id 查物品即可。
+     * <p>方块会在注册阶段由 {@link #ensureBlockItems} 自动补一个同 id 的
+     * {@code BlockItem}；显式物品由 {@code ItemRegistrar} 注册。两者都走
+     * 同一条「按 id 查物品」的路径。
      */
-    private static void addBlockItem(String modId, String path, Object output) {
+    private static void addItem(String modId, String path, Object output) {
         try {
             Object item = lookupItem(modId, path);
             if (item == null) {
@@ -259,11 +320,15 @@ public final class ModCreativeTabs {
             // output 的运行时类是游戏为lambda 生成的合成类，
             // 对它 getMethod("accept", ...) 虽然能拿到，但合成类的可见性
             // 不受我们控制；接口上的方法签名是稳定的定义。
-            // 另用 Output.accept(ItemLike, TabVisibility) 重载 ——
-            // 它内部自己 new ItemStack，省一层手工构造。
+            //
+            // 【必须 setAccessible】26.2 的 Output 是
+            // `protected static interface`，方法本身 public，但声明类不是
+            // public —— 直接 invoke 会抛 IllegalAccessException，表现为
+            // 「标签创建成功但内容永远为空」（空标签被 shouldDisplay 隐藏）。
             Method accept = outputIface.getMethod("accept",
                     Reflect.gameClass("net.minecraft.world.item.ItemLike"),
                     visibilityClass);
+            accept.setAccessible(true);
             accept.invoke(output, item,
                     enumOf(visibilityClass, "PARENT_AND_SEARCH_TABS"));
         } catch (ReflectiveOperationException | RuntimeException e) {
@@ -272,8 +337,8 @@ public final class ModCreativeTabs {
         }
     }
 
-    /** 延迟图标：取第一个方块的 ItemStack，取不到返回 null（游戏画默认图标）。 */
-    private static Object blockItemStack(String modId, String path) {
+    /** 延迟图标：取第一个内容的 ItemStack，取不到返回 null（游戏画默认图标）。 */
+    private static Object itemStack(String modId, String path) {
         try {
             Object item = lookupItem(modId, path);
             return item == null ? null : newItemStack(item);
@@ -284,13 +349,108 @@ public final class ModCreativeTabs {
         }
     }
 
-    /** 按 {@code modId:path} 从物品注册表取 {@code Item}。 */
-    private static Object lookupItem(String modId, String path)
+    // ── 自动 BlockItem ─────────────────────────────────────────────────────
+
+    /**
+     * 为「只有 Block、没有对应 Item」的方块补一个同 id 的 {@code BlockItem}。
+     *
+     * <h2>为什么必须补</h2>
+     * 26.2 的 {@code Block} 不等于 {@code Item}。原版每个方块物品都是
+     * {@code Items.registerBlock(...)} 显式注册的；一个只有 Block 的 id
+     * 在物品注册表里<b>不存在</b>，创造栏自然查不到它 —— 标签内容为空，
+     * {@code shouldDisplay()} 返回 false，整个标签被隐藏。
+     * 这正是「两个 Mod 都没有独立物品页」的直接原因。
+     *
+     * <h2>为什么放在 deferred 注册的末尾</h2>
+     * 必须在所有 Mod 的 block/item 注册动作之后、注册表 freeze 之前执行。
+     * 调用点（{@code EntryPointHook.registerCreativeTabs}）通过
+     * {@code RegistrationPhase.defer(...)} 把它排在队列尾部 —— 顺序由
+     * 注册队列保证，不依赖调用时刻。
+     *
+     * <p>若 Mod 已经显式注册了同 id 的物品（例如带自定义组件的 BlockItem），
+     * 这里检测到已存在就跳过，绝不覆盖。
+     */
+    public static void ensureBlockItems(String modId, java.util.List<String> blockIds) {
+        if (modId == null || modId.isBlank() || blockIds == null || blockIds.isEmpty()) {
+            return;
+        }
+        for (String path : blockIds) {
+            try {
+                if (lookupItem(modId, path) != null) {
+                    continue; // Mod 已显式提供同 id 物品
+                }
+                Object block = lookupBlock(modId, path);
+                if (block == null) {
+                    LOG.warning("[Mili] auto BlockItem skipped: block not found for "
+                            + modId + ":" + path);
+                    continue;
+                }
+                registerBlockItem(modId, path, block);
+                LOG.info("[Mili] auto BlockItem " + modId + ":" + path);
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                LOG.log(Level.WARNING,
+                        "[Mili] auto BlockItem failed for " + modId + ":" + path, e);
+            }
+        }
+    }
+
+    private static Object lookupBlock(String modId, String path)
+            throws ReflectiveOperationException {
+        Object blockRegistry = Reflect.staticField(
+                "net.minecraft.core.registries.BuiltInRegistries", "BLOCK");
+        if (blockRegistry == null) {
+            return null;
+        }
+        Object key = registryKeyOf(blockRegistry, modId, path);
+        return Reflect.gameClass("net.minecraft.core.Registry")
+                .getMethod("getValue", Reflect.gameClass("net.minecraft.resources.ResourceKey"))
+                .invoke(blockRegistry, key);
+    }
+
+    /** {@code new BlockItem(block, new Item.Properties().setId(key))} 并注册。 */
+    private static void registerBlockItem(String modId, String path, Object block)
+            throws ReflectiveOperationException {
+        Class<?> registryClass = Reflect.gameClass("net.minecraft.core.Registry");
+        Class<?> keyClass = Reflect.gameClass("net.minecraft.resources.ResourceKey");
+        Class<?> propsClass = Reflect.gameClass("net.minecraft.world.item.Item$Properties");
+        Class<?> blockItemClass = Reflect.gameClass("net.minecraft.world.item.BlockItem");
+        Class<?> blockClass = Reflect.gameClass("net.minecraft.world.level.block.Block");
+
+        Object itemRegistry = Reflect.staticField(
+                "net.minecraft.core.registries.BuiltInRegistries", "ITEM");
+        if (itemRegistry == null) {
+            throw new BridgeMismatchException(
+                    "BuiltInRegistries.ITEM is null — cannot create BlockItem for "
+                            + modId + ":" + path);
+        }
+        Object key = registryKeyOf(itemRegistry, modId, path);
+
+        Object properties = propsClass.getDeclaredConstructor().newInstance();
+        propsClass.getMethod("setId", keyClass).invoke(properties, key);
+        Object item = blockItemClass.getConstructor(blockClass, propsClass)
+                .newInstance(block, properties);
+
+        registryClass.getMethod("register", registryClass, keyClass, Object.class)
+                .invoke(null, itemRegistry, key, item);
+    }
+
+    /** 生成 {@code ResourceKey<V>}：{@code ResourceKey.create(registry.key(), id)}。 */
+    private static Object registryKeyOf(Object registry, String modId, String path)
             throws ReflectiveOperationException {
         Class<?> idClass = Reflect.gameClass("net.minecraft.resources.Identifier");
         Class<?> keyClass = Reflect.gameClass("net.minecraft.resources.ResourceKey");
         Class<?> registryClass = Reflect.gameClass("net.minecraft.core.Registry");
 
+        Object id = idClass.getMethod("fromNamespaceAndPath", String.class, String.class)
+                .invoke(null, modId, path);
+        Object registryKey = registryClass.getMethod("key").invoke(registry);
+        return keyClass.getMethod("create", keyClass, idClass)
+                .invoke(null, registryKey, id);
+    }
+
+    /** 按 {@code modId:path} 从物品注册表取 {@code Item}。 */
+    private static Object lookupItem(String modId, String path)
+            throws ReflectiveOperationException {
         Object itemRegistry = Reflect.staticField(
                 "net.minecraft.core.registries.BuiltInRegistries", "ITEM");
         if (itemRegistry == null) {
@@ -299,19 +459,16 @@ public final class ModCreativeTabs {
         // key 用【注册表自己的 key 工厂】生成：
         //   ResourceKey.create(registry.key(), id)
         // 不能用 Registries.ITEM —— 那是 ResourceKey<Registry<Item>>，
-        // 把它当"key 的第一参数"传给create 会在运行期抛异常/返回错键。
-        // 同 registerIntoRegistry 里的修正。
-        Object id = idClass.getMethod("fromNamespaceAndPath", String.class, String.class)
-                .invoke(null, modId, path);
-        Object registryKeyObj = registryClass.getMethod("key").invoke(itemRegistry);
-        Object key = keyClass.getMethod("create", keyClass, idClass)
-                .invoke(null, registryKeyObj, id);
-        return registryClass.getMethod("getValue", keyClass).invoke(itemRegistry, key);
+        // 把它当"key 的第一参数"传给 create 会在运行期抛异常/返回错键。
+        Object key = registryKeyOf(itemRegistry, modId, path);
+        return Reflect.gameClass("net.minecraft.core.Registry")
+                .getMethod("getValue", Reflect.gameClass("net.minecraft.resources.ResourceKey"))
+                .invoke(itemRegistry, key);
     }
 
     /** 造出实现游戏 {@code DisplayItemsGenerator} 的代理。 */
     private static Object newDisplayItemsGenerator(String modId,
-                                                   java.util.List<String> blockIds) {
+                                                   java.util.List<String> itemIds) {
         Class<?> genClass = Reflect.gameClass(
                 "net.minecraft.world.item.CreativeModeTab$DisplayItemsGenerator");
         return java.lang.reflect.Proxy.newProxyInstance(
@@ -324,9 +481,9 @@ public final class ModCreativeTabs {
                         // 「标签不显示」时无从下手：究竟 generator 没被调、
                         // 还是 lookupItem 拿不到物品，日志里完全一样。
                         LOG.info("[Mili] creative tab content build for '"
-                                + modId + "' (" + blockIds.size() + " blocks)");
-                        for (String path : blockIds) {
-                            addBlockItem(modId, path, args[1]);
+                                + modId + "' (" + itemIds.size() + " items)");
+                        for (String path : itemIds) {
+                            addItem(modId, path, args[1]);
                         }
                         return null;
                     }
@@ -340,12 +497,12 @@ public final class ModCreativeTabs {
     }
 
     /** 造出实现游戏 {@code Supplier} 的代理对象。 */
-    private static Object newIconSupplier(String modId, String blockPath) {
+    private static Object newIconSupplier(String modId, String itemPath) {
         ClassLoader gameCl = Reflect.gameClassLoader();
         return java.lang.reflect.Proxy.newProxyInstance(
                 gameCl,
                 new Class<?>[]{Reflect.gameClass("java.util.function.Supplier")},
-                new IconSupplier(modId, blockPath));
+                new IconSupplier(modId, itemPath));
     }
 
     /**
@@ -366,18 +523,18 @@ public final class ModCreativeTabs {
     private static final class IconSupplier implements java.lang.reflect.InvocationHandler {
 
         private final String modId;
-        private final String blockPath;
+        private final String itemPath;
 
-        IconSupplier(String modId, String blockPath) {
+        IconSupplier(String modId, String itemPath) {
             this.modId = modId;
-            this.blockPath = blockPath;
+            this.itemPath = itemPath;
         }
 
         @Override
         public Object invoke(Object proxy, Method method, Object[] args) {
             return switch (method.getName()) {
-                case "get" -> blockItemStack(modId, blockPath);
-                case "toString" -> "MiliCreativeTabIcon(" + modId + ":" + blockPath + ")";
+                case "get" -> itemStack(modId, itemPath);
+                case "toString" -> "MiliCreativeTabIcon(" + modId + ":" + itemPath + ")";
                 case "hashCode" -> System.identityHashCode(proxy);
                 case "equals" -> proxy == (args != null ? args[0] : null);
                 default -> null;

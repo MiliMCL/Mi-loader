@@ -42,6 +42,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>没有 MC JAR 时整类跳过。
  */
 @DisplayName("WorldView 在真实 Minecraft 上的落地")
+/**
+ * 打上 {@code registry-e2e} 标记：本类直接操作 Minecraft 的方块注册表，
+ * 前提是「本 JVM 从未 bootstrap 过注册表」。而 {@code bootStrap()} 是
+ * 进程级不可逆的，所以这类测试在共享 JVM 的单元测试套件里必然互相污染。
+ *
+ * <p>默认构建按 tag 排除；需要时显式开启：
+ * <pre>./gradlew :mili-minecraft-integration:test -Pmili.registryTests=true</pre>
+ */
+@org.junit.jupiter.api.Tag("registry-e2e")
 class ReflectiveWorldViewRealMinecraftTest {
 
     private static GameTestClassLoader gameLoader;

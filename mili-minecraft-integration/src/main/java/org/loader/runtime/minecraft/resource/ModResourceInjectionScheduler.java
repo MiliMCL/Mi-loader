@@ -174,22 +174,63 @@ public final class ModResourceInjectionScheduler {
         try {
             Class<?> minecraftClass =
                     Reflect.gameClass("net.minecraft.client.Minecraft");
-            java.lang.reflect.Field gui = null;
-            for (Class<?> c = minecraftClass; c != null && gui == null; c = c.getSuperclass()) {
+            java.lang.reflect.Field guiField = null;
+            for (Class<?> c = minecraftClass; c != null && guiField == null; c = c.getSuperclass()) {
                 for (java.lang.reflect.Field f : c.getDeclaredFields()) {
                     if (f.getName().equals("gui")) {
-                        gui = f;
+                        guiField = f;
                         break;
                     }
                 }
             }
+            if (guiField == null) {
+                return false;
+            }
+            guiField.setAccessible(true);
+            Object gui = guiField.get(mc);
             if (gui == null) {
                 return false;
             }
-            gui.setAccessible(true);
-            return gui.get(mc) != null;
+
+            // ── 第二道门槛：启动遮罩必须已经消失 ──────────────────────────
+            //
+            // 「gui 已赋值」只保证 Minecraft 构造完了，不保证加载画面结束。
+            // 而 ResourcePack reload 会重建 Panorama 的纹理；如果此刻
+            // LoadingOverlay 正在用旧引用画全景图，就会崩在
+            //   IllegalStateException: Texture view does not exist
+            //     at Panorama.extractRenderState
+            // 这不是理论风险 —— 它已经真实发生过一次（23:31 的 crash report），
+            // 而且因为是竞态，重跑十次可能只崩一次。
+            //
+            // 判据：{@code Gui.overlay() == null} 且已有 screen。
+            // 两者同时成立意味着启动遮罩已卸下、主界面已经在渲染，
+            // 此时 reload 走的是与原版 F3+T 相同的安全路径。
+            Object overlay = invokeNoArg(gui, "overlay");
+            if (overlay != null) {
+                return false;
+            }
+            Object screen = invokeNoArg(gui, "screen");
+            if (screen == null) {
+                return false;
+            }
+            // 启动遮罩期间 screen 是 GenericMessageScreen —— 即便 overlay
+            // 反射失败（方法改名），这一条也能独立挡住过早注入。
+            return !screen.getClass().getName().contains("GenericMessageScreen");
         } catch (ReflectiveOperationException | RuntimeException e) {
             return false;
+        }
+    }
+
+    /** 反射调用无参方法；失败返回 null（就绪判定只会因此更保守）。 */
+    private static Object invokeNoArg(Object target, String method) {
+        if (target == null) {
+            return null;
+        }
+        try {
+            java.lang.reflect.Method m = target.getClass().getMethod(method);
+            return m.invoke(target);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            return null;
         }
     }
 
@@ -211,16 +252,26 @@ public final class ModResourceInjectionScheduler {
         int failed = 0;
         for (Map.Entry<String, Path> e : snapshot.entrySet()) {
             try {
-                ModResourcePacks.inject(e.getKey(), e.getValue(), minecraft);
-                ok++;
+                // 只登记，不重载 —— 重载一次就是一次完整的 Mojang 红界面。
+                // 原来每个 Mod 各重载一次，两个 Mod 启动时闪两次。
+                if (ModResourcePacks.registerSource(e.getKey(), e.getValue(), minecraft)) {
+                    ok++;
+                }
             } catch (RuntimeException ex) {
                 failed++;
                 LOG.log(Level.WARNING, "Resource injection failed for mod "
                         + e.getKey() + " (its models/textures will be missing)", ex);
             }
         }
+
+        // 所有源登记完之后，只请求一次重载。
+        if (ok > 0) {
+            ModResourcePacks.reloadOnce(minecraft);
+        }
+
         LOG.info("Mod resource injection finished: " + ok + " ok, "
-                + failed + " failed, " + snapshot.size() + " total");
+                + failed + " failed, " + snapshot.size() + " total"
+                + (ok > 0 ? " (1 reload)" : ""));
         if (ok > 0) {
             LOG.info("Mods with resources injected: " + String.join(", ", snapshot.keySet()));
         }

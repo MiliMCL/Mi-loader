@@ -247,14 +247,22 @@ public final class TickContract {
     public TickMetrics complete() {
         completed.set(true);
         long now = System.nanoTime();
-        int done = (int) tasks.stream().filter(TickTask::isFinished).count();
+        // 不用 stream：complete() 每个 tick 都会走一次，而 stream 管线
+        // 每次至少分配 2~3 个对象。这里只数两个整数，循环更便宜。
+        int total = tasks.size();
+        int done = 0;
+        for (int i = 0; i < total; i++) {
+            if (tasks.get(i).isFinished()) {
+                done++;
+            }
+        }
         boolean missed = now > deadlineNanos;
         return new TickMetrics(
                 tickId,
                 startTimeNanos,
                 now - startTimeNanos,
                 phase.get(),
-                tasks.size(),
+                total,
                 done,
                 missed,
                 error.get());

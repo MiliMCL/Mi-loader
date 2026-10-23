@@ -96,18 +96,36 @@ public final class ModResourcePacks {
      * @param modJar     Mod JAR 路径
      * @param minecraft  {@code net.minecraft.client.Minecraft} 实例
      */
+    /**
+     * 注入单个 Mod 的资源并请求一次重载。
+     *
+     * <p><b>批处理时不要用这个</b>：它内部会触发 {@code reloadResourcePacks()}，
+     * 而每次重载都会让玩家看一遍 Mojang 红界面。多个 Mod 请用
+     * {@link #registerSource} 逐个登记，最后统一调一次 {@link #reloadOnce}。
+     */
     public static void inject(String modId, Path modJar, Object minecraft) {
+        if (registerSource(modId, modJar, minecraft)) {
+            reloadOnce(minecraft);
+        }
+    }
+
+    /**
+     * 只登记资源源，不触发重载。
+     *
+     * @return 是否真的登记了新源（已登记过、无 assets、jar 缺失都返回 false）
+     */
+    public static boolean registerSource(String modId, Path modJar, Object minecraft) {
         if (!injected.add(modId)) {
-            return;
+            return false;
         }
         try {
             if (!Files.isRegularFile(modJar)) {
                 LOG.warning("Mod JAR missing, cannot inject resources: " + modJar);
-                return;
+                return false;
             }
             if (!hasAssets(modJar)) {
                 LOG.info("Mod " + modId + " has no assets/ in its JAR — nothing to inject");
-                return;
+                return false;
             }
             Object repository = repositoryOf(minecraft);
             if (repository == null) {
@@ -118,24 +136,9 @@ public final class ModResourcePacks {
                                 + " Mod.initialize().");
             }
             addRepositorySource(repository, modId, modJar);
-            // 让游戏重新加载资源：PackRepository 变更后必须显式 reload，
-            // 否则新资源包不会进入 ReloadableResourceManager。
-            // 【必须先等稳态】启动首轮 reload 还挂在前台时请求 reload 会崩游戏，
-            // 见 awaitReloadSafePoint 的说明。
-            awaitReloadSafePoint(minecraft);
-            reloadResources(minecraft);
-
-            // 【如实报告，不做过度承诺】
-            // 上面两步只保证"源已注册"和"已请求重载"，
-            // 并不保证包真的被打开 —— 那要等游戏在 reload 里
-            // discoverAvailable → rebuildSelected → openAllSelected 走完。
-            // 上一版在这里打 "Injected resources ..." 让人以为成功了，
-            // 而实际上 newPack 可能返回 null（连一个包都没产出）。
-            // 真正的判据是下一次 loadPacks 里打出 "produced 1 pack"。
-            LOG.info("Registered resource source for mod '" + modId
-                    + "' and requested a resource reload. Confirm it took effect by"
-                    + " looking for \"loadPacks produced 1 pack for '" + modId + "'\""
-                    + " and the ABSENCE of any Missing model warnings.");
+            LOG.info("Registered resource source for mod '" + modId + "'"
+                    + " (reload deferred to batch end)");
+            return true;
         } catch (ReflectiveOperationException | RuntimeException e) {
             // 资源注入失败不该阻止游戏启动 —— 游戏能跑，只是 Mod 缺贴图。
             //
@@ -145,6 +148,31 @@ public final class ModResourcePacks {
             LOG.log(Level.WARNING,
                     "Resource injection failed for mod '" + modId + "'. The game will run"
                             + " but this mod's models/textures will be missing.", e);
+            return false;
+        }
+    }
+
+    /**
+     * 请求一次资源重载 —— 一批 Mod 只需要一次。
+     *
+     * <h2>为什么必须合并</h2>
+     * 每次 {@code reloadResourcePacks()} 都会让玩家完整看一遍 Mojang 红界面
+     * （LoadingOverlay + 进度条）。两个 Mod 各请求一次 = 启动时闪两次红屏，
+     * 三个 Mod 闪三次。玩家看到的是「这游戏怎么一直在加载」，
+     * 而实际上每次都是同一个 20 秒的重载在重复。
+     *
+     * <p>PackRepository 的变更可以累积 —— 登记完所有源再重载一次，
+     * 与原版「切资源包」是同一语义。
+     */
+    public static void reloadOnce(Object minecraft) {
+        try {
+            awaitReloadSafePoint(minecraft);
+            reloadResources(minecraft);
+            LOG.info("Requested a single resource reload for all injected mods");
+        } catch (RuntimeException e) {
+            LOG.log(Level.WARNING,
+                    "Resource reload request failed. Injected mod resources will only"
+                            + " take effect after a manual resource reload (F3+T).", e);
         }
     }
 

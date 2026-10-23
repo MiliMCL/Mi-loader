@@ -1,5 +1,7 @@
 package org.loader.runtime.kernel;
 
+import org.loader.api.diagnostics.PerformanceService;
+import org.loader.runtime.diagnostics.PerformanceMonitor;
 import org.loader.runtime.scheduler.Scheduler;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -19,6 +21,7 @@ public class Runtime implements AutoCloseable {
     private final ResourceRegistry resourceRegistry;
     private final DependencyResolver dependencyResolver;
     private final Scheduler scheduler;
+    private final PerformanceMonitor performance;
     private final AtomicBoolean started = new AtomicBoolean(false);
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
@@ -31,6 +34,7 @@ public class Runtime implements AutoCloseable {
         this.resourceRegistry = new ResourceRegistry(id + ":resources", rootScope);
         this.dependencyResolver = new DependencyResolver();
         this.scheduler = new Scheduler(id + "-scheduler", rootScope);
+        this.performance = new PerformanceMonitor(id + ":performance", rootScope);
 
         // Register kernel components as resources
         rootScope.registerResource(lifecycleManager);
@@ -38,6 +42,11 @@ public class Runtime implements AutoCloseable {
         rootScope.registerResource(permissionManager);
         rootScope.registerResource(resourceRegistry);
         rootScope.registerResource(scheduler);
+        rootScope.registerResource(performance);
+
+        // TPS/FPS 是可选的诊断能力：装配失败不该阻断运行时启动。
+        // 读取方拿不到数据时得到的是空快照，而不是异常。
+        PerformanceService.registerProvider(performance);
     }
 
     /**
@@ -83,6 +92,13 @@ public class Runtime implements AutoCloseable {
     }
 
     /**
+     * 本 Runtime 的性能采样器 —— tick 引擎与客户端帧采样共同写入。
+     */
+    public PerformanceMonitor performance() {
+        return performance;
+    }
+
+    /**
      * Starts the Runtime.
      */
     public void start() {
@@ -110,9 +126,20 @@ public class Runtime implements AutoCloseable {
     @Override
     public void close() {
         if (closed.compareAndSet(false, true)) {
-            lifecycleManager.close();
-            rootScope.shutdown();
-            scheduler.close();
+            // 先摘掉全局 provider，避免关闭中的实例继续被读到；
+            // 按身份撤销，多个 Runtime 并存时不会误伤仍在运行的那个。
+            PerformanceService.clearProvider(performance);
+            try {
+                lifecycleManager.close();
+            } finally {
+                // 即使生命周期管理器关闭失败，Scope 与调度器也必须尝试释放 ——
+                // 否则一次异常会让线程池与资源图一直活到进程结束。
+                try {
+                    rootScope.shutdown();
+                } finally {
+                    scheduler.close();
+                }
+            }
         }
     }
 }

@@ -305,6 +305,40 @@ public final class MinecraftClassLoader extends URLClassLoader {
     private static final java.util.concurrent.ConcurrentHashMap<String, java.util.jar.JarFile>
             SHARED_JARS = new java.util.concurrent.ConcurrentHashMap<>();
 
+    /**
+     * 释放全部共享 JarFile 句柄。
+     *
+     * <h2>什么时候需要它</h2>
+     * 生产环境<b>不需要</b>：jar 在进程生命周期内保持打开是与官方启动器
+     * 一致的语义，进程退出时由操作系统回收。
+     *
+     * <p>但有两种场景它必须存在：
+     * <ul>
+     *   <li><b>测试</b>：临时目录里的 jar 被共享缓存锁住，{@code @TempDir}
+     *       清理失败会报一句与根因毫无关系的
+     *       "Failed to close extension context"；</li>
+     *   <li><b>热重载</b>：替换 jar 之前必须先放掉旧句柄，否则 Windows 上
+     *       文件根本删不掉 —— 这正是「热重载在 Windows 上不工作」的底层原因。</li>
+     * </ul>
+     * 调用方必须保证：释放之后不会再从旧的 jar 里加载类（会得到
+     * {@code ClosedJarFileException}）。
+     */
+    public static void releaseSharedJars() {
+        for (java.util.jar.JarFile jar : SHARED_JARS.values()) {
+            try {
+                jar.close();
+            } catch (java.io.IOException ignored) {
+                // 已经关闭或句柄失效 —— 目标状态已经达成
+            }
+        }
+        SHARED_JARS.clear();
+    }
+
+    /** 当前共享 jar 数量（诊断/测试用）。 */
+    public static int sharedJarCount() {
+        return SHARED_JARS.size();
+    }
+
     /** 取（或打开）与 jar URL 对应的共享 JarFile；多线程竞争时复用先到者。 */
     private static java.util.jar.JarFile sharedJar(URL jarFileUrl) throws java.io.IOException {
         String key = jarFileUrl.toString();

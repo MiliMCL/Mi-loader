@@ -2,10 +2,13 @@ package org.loader.runtime.minecraft;
 
 import org.loader.runtime.RuntimeEnvironment;
 import org.loader.runtime.client.ClientCapabilities;
+import org.loader.runtime.diagnostics.PerformanceMonitor;
 import org.loader.runtime.kernel.LifecycleState;
 import org.loader.runtime.kernel.Resource;
 import org.loader.runtime.kernel.Runtime;
 import org.loader.runtime.kernel.Scope;
+import org.loader.runtime.minecraft.client.ClientFrameSampler;
+import org.loader.runtime.minecraft.client.screen.PerformancePanel;
 import org.loader.runtime.scheduler.Scheduler;
 import org.loader.runtime.service.EventBus;
 import org.loader.runtime.tick.TickEngine;
@@ -52,6 +55,7 @@ public final class MinecraftBootstrap {
     private final Scope renderScope;
     private final RuntimeEnvironment environment;
     private final Scheduler scheduler;
+    private final PerformanceMonitor performance;
     private final TickEngine tickEngine;
     private final TickBridge tickBridge;
     private final MinecraftLifecycle lifecycle;
@@ -89,7 +93,10 @@ public final class MinecraftBootstrap {
         }
 
         this.scheduler = new Scheduler("minecraft-scheduler", minecraftScope);
-        this.tickEngine = new TickEngine("minecraft-tick-engine", minecraftScope);
+        // tick 与帧率进入同一份窗口数据：面板上的 TPS 与 FPS 必须来自
+        // 同一个采样器，否则两行数字的窗口长度不同，无法互相解释。
+        this.performance = runtime.performance();
+        this.tickEngine = new TickEngine("minecraft-tick-engine", minecraftScope, performance);
         this.lifecycle = new MinecraftLifecycle(minecraftScope);
         this.tickBridge = new TickBridge(minecraftScope, tickEngine);
         this.eventBridge = new MinecraftEventBridge(minecraftScope);
@@ -106,6 +113,23 @@ public final class MinecraftBootstrap {
         minecraftScope.registerResource(worldBridge);
 
         minecraftScope.grantCapability(RuntimeEnvironment.class, env);
+
+        // 客户端诊断能力：帧采样与 K 键面板。
+        //
+        // 二者都把自己登记为 minecraftScope 的资源 —— 游戏退出时按
+        // Scope 的逆序释放协议移除 tick 钩子、注销按键绑定、关闭面板。
+        // 不这么做的话，静态的 tickHooks / bindings 列表会握着
+        // Runtime 与 Mod 的对象图，跨实例（测试、热重载）持续泄漏。
+        if (env.isClient()) {
+            // 先登记兜底释放器，再登记使用者 —— Scope 逆序关闭时，
+            // 面板/采样器先各自清理，最后由两个分发器统一清空静态表。
+            minecraftScope.registerResource(
+                    org.loader.runtime.minecraft.client.input.KeyBindingDispatch.lifecycle(minecraftScope));
+            minecraftScope.registerResource(
+                    org.loader.runtime.minecraft.client.screen.ScreenHostDispatch.lifecycle(minecraftScope));
+            ClientFrameSampler.install(performance, minecraftScope);
+            PerformancePanel.install(performance, minecraftScope);
+        }
 
         // 把 tick 桥接安装到注入分发器 —— 这是 tick 链闭合的最后一步。
         //

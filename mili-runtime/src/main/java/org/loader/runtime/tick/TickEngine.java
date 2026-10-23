@@ -1,11 +1,12 @@
 package org.loader.runtime.tick;
 
+import org.loader.runtime.diagnostics.PerformanceMonitor;
 import org.loader.runtime.kernel.Resource;
 import org.loader.runtime.kernel.Scope;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Collections;
+import java.util.Arrays;
 import java.util.Deque;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -63,12 +64,24 @@ public final class TickEngine implements Resource {
     private final AtomicLong missedDeadlineCount = new AtomicLong(0);
     private final AtomicLong failedTickCount = new AtomicLong(0);
     private final AtomicLong maxTickDurationMs = new AtomicLong(0);
-    private volatile long totalTickDurationMs = 0;
+    /** 累计 tick 耗时（纳秒）。用原子量而不是裸 long：读取方可能在别的线程。 */
+    private final AtomicLong totalTickDurationNanos = new AtomicLong(0);
 
     /** 最近若干 tick 的指标环形缓冲，供诊断使用。 */
-    private final List<TickContract.TickMetrics> recentMetrics =
-            Collections.synchronizedList(new ArrayList<>());
     private static final int METRICS_HISTORY = 200;
+    private final TickContract.TickMetrics[] metricRing =
+            new TickContract.TickMetrics[METRICS_HISTORY];
+    private int metricWrite;
+    private int metricFilled;
+
+    /**
+     * 性能采样器 —— 可选。
+     *
+     * <p>为空时引擎照常工作：TPS 是诊断能力，不是 tick 正确性的前提。
+     * 由 {@code MinecraftBootstrap} 注入 Runtime 持有的同一个实例，
+     * 这样 tick 与帧率进入同一份窗口数据。
+     */
+    private final PerformanceMonitor performance;
 
     /** 驱动线程（= Minecraft 主线程），用于校验阶段推进的线程归属。 */
     private volatile Thread driverThread;
@@ -76,13 +89,23 @@ public final class TickEngine implements Resource {
     private final long startedAtNanos = System.nanoTime();
 
     public TickEngine(String id, Scope owner) {
-        this(id, owner, TickContract.DEFAULT_TICK_PERIOD_MS);
+        this(id, owner, TickContract.DEFAULT_TICK_PERIOD_MS, null);
     }
 
     public TickEngine(String id, Scope owner, long tickPeriodMs) {
+        this(id, owner, tickPeriodMs, null);
+    }
+
+    public TickEngine(String id, Scope owner, PerformanceMonitor performance) {
+        this(id, owner, TickContract.DEFAULT_TICK_PERIOD_MS, performance);
+    }
+
+    public TickEngine(String id, Scope owner, long tickPeriodMs,
+                      PerformanceMonitor performance) {
         this.id = id;
         this.owner = owner;
         this.tickPeriodMs = tickPeriodMs;
+        this.performance = performance;
     }
 
     // ── Resource ───────────────────────────────────────────────────────────
@@ -109,11 +132,30 @@ public final class TickEngine implements Resource {
                 nextTickQueue.clear();
                 delayedQueue.clear();
             }
-            TickContract c = currentContract.get();
+            TickContract c = currentContract.getAndSet(null);
             if (c != null && !c.isCompleted()) {
                 c.cancel();
             }
+            // 监听器是 Mod 传进来的 lambda，持有它的类加载器与对象图。
+            // 不清空的话，引擎（作为 Scope 资源）关闭后仍可通过这些引用
+            // 把整个 Mod 留在堆上 —— 这正是 ClassLoaderLeakTest 守的那类泄漏，
+            // 只是入口从「类引用」换成了「事件回调」。
+            clearListeners();
+            synchronized (this) {
+                Arrays.fill(metricRing, null);
+                metricWrite = 0;
+                metricFilled = 0;
+            }
         }
+    }
+
+    private void clearListeners() {
+        preTickListeners.clear();
+        scheduleListeners.clear();
+        coreTickListeners.clear();
+        asyncCompletionListeners.clear();
+        postTickListeners.clear();
+        tickEndListeners.clear();
     }
 
     // ── 核心：tick 生命周期 ────────────────────────────────────────────────
@@ -348,19 +390,24 @@ public final class TickEngine implements Resource {
     // ── 指标与诊断 ─────────────────────────────────────────────────────────
 
     private void record(TickContract.TickMetrics m) {
-        synchronized (recentMetrics) {
-            recentMetrics.add(m);
-            while (recentMetrics.size() > METRICS_HISTORY) {
-                recentMetrics.remove(0);
+        synchronized (this) {
+            metricRing[metricWrite] = m;
+            metricWrite = (metricWrite + 1) % METRICS_HISTORY;
+            if (metricFilled < METRICS_HISTORY) {
+                metricFilled++;
             }
         }
-        totalTickDurationMs += m.durationMs();
+        totalTickDurationNanos.addAndGet(m.durationNanos());
         maxTickDurationMs.updateAndGet(prev -> Math.max(prev, m.durationMs()));
         if (m.missedDeadline()) {
             missedDeadlineCount.incrementAndGet();
         }
         if (m.error() != null) {
             failedTickCount.incrementAndGet();
+        }
+        if (performance != null) {
+            performance.recordTick(m.startTimeNanos(),
+                    m.startTimeNanos() + m.durationNanos());
         }
     }
 
@@ -379,7 +426,7 @@ public final class TickEngine implements Resource {
     /** 平均 tick 耗时（毫秒）。 */
     public double averageTickMs() {
         long count = tickCounter.get();
-        return count == 0 ? 0.0 : (double) totalTickDurationMs / count;
+        return count == 0 ? 0.0 : totalTickDurationNanos.get() / (double) count / 1_000_000.0;
     }
 
     /** 实际 TPS（基于 tick 计数与真实墙钟耗时）。 */
@@ -406,9 +453,29 @@ public final class TickEngine implements Resource {
 
     /** 最近指标快照（按时间正序）。 */
     public List<TickContract.TickMetrics> recentMetrics() {
-        synchronized (recentMetrics) {
-            return List.copyOf(recentMetrics);
+        synchronized (this) {
+            if (metricFilled == 0) {
+                return List.of();
+            }
+            List<TickContract.TickMetrics> copy = new ArrayList<>(metricFilled);
+            int start = metricFilled == METRICS_HISTORY ? metricWrite : 0;
+            for (int i = 0; i < metricFilled; i++) {
+                copy.add(metricRing[(start + i) % METRICS_HISTORY]);
+            }
+            return List.copyOf(copy);
         }
+    }
+
+    /** 性能采样器；未接入时为 {@code null}。 */
+    public PerformanceMonitor performance() {
+        return performance;
+    }
+
+    /** 已注册的阶段监听器总数（诊断 / 测试用）。 */
+    public int listenerCount() {
+        return preTickListeners.size() + scheduleListeners.size()
+                + coreTickListeners.size() + asyncCompletionListeners.size()
+                + postTickListeners.size() + tickEndListeners.size();
     }
 
     /** 人类可读的诊断摘要。 */
@@ -421,8 +488,10 @@ public final class TickEngine implements Resource {
         sb.append("  max=").append(maxTickDurationMs.get()).append("ms\n");
         sb.append("  missedDeadline=").append(missedDeadlineCount.get());
         sb.append("  failed=").append(failedTickCount.get()).append('\n');
-        sb.append("  queuedNext=").append(nextTickQueue.size());
-        sb.append("  queuedDelayed=").append(delayedQueue.size()).append('\n');
+        synchronized (nextTickQueue) {
+            sb.append("  queuedNext=").append(nextTickQueue.size());
+            sb.append("  queuedDelayed=").append(delayedQueue.size()).append('\n');
+        }
         return sb.toString();
     }
 

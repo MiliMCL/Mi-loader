@@ -1,6 +1,7 @@
 package org.loader.runtime.minecraft.reflect;
 
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -33,6 +34,21 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 「另一个线程能不能看到它」。
  */
 class ReflectGameClassLoaderVisibilityTest {
+
+    /**
+     * 每个测试都从「没有安装游戏 CL」这个已知状态开始。
+     *
+     * <p>只写 {@code @AfterEach} 是不够的：同一个 JVM 里，别的测试类
+     * 可能通过 {@code GameTestClassLoader.install} 装了一个游戏 CL 却
+     * 在 {@code @AfterAll} 之前被跳过/失败，于是这里看到的初始状态
+     * 取决于「谁先跑」—— 也就是测试顺序决定成败。
+     *
+     * <p>「未设置时回落到平台 CL」这条断言语义上要求先真的「未设置」。
+     */
+    @BeforeEach
+    void resetGameClassLoader() {
+        Reflect.useGameClassLoader(null);
+    }
 
     @AfterEach
     void tearDown() {

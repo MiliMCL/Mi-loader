@@ -75,11 +75,29 @@ public final class ModClassLoader extends URLClassLoader {
      */
     public ModClassLoader(ModManifest manifestMod, MinecraftClassLoader gameCL,
                           Path gameDir, Path modsDir) {
+        this(manifestMod, gameCL, gameDir, modsDir, null);
+    }
+
+    /**
+     * @param manifestMod    Mod 清单
+     * @param gameCL         全局唯一的 Minecraft ClassLoader（parent）
+     * @param gameDir        游戏目录（诊断用）
+     * @param modsDir        Mod 目录（回退扫描用）
+     * @param explicitSource 发现阶段确定的本 Mod 代码源（jar 或目录）。
+     *                       <b>优先于任何文件名推断</b> —— Mod 的 jar 名与
+     *                       mod id 没有任何必然关系，靠
+     *                       {@code <modId>.jar} 猜是本仓库踩过的真实坑：
+     *                       Mod 被列出却加载不了，报 ClassNotFoundException。
+     *                       null 时回退到旧的文件名推断，仅为兼容目录布局。
+     */
+    public ModClassLoader(ModManifest manifestMod, MinecraftClassLoader gameCL,
+                          Path gameDir, Path modsDir, Path explicitSource) {
         super("mili-mod-" + manifestMod.id(), new URL[0], gameCL);
         this.manifest = manifestMod;
         this.modId = manifestMod.id();
         this.gameClassLoader = gameCL;
         this.modsDir = modsDir != null ? modsDir : Path.of("mods");
+        this.explicitSource = explicitSource;
 
         // 仅本 Mod 自己的代码进入 classpath —— 不再把整个 Minecraft classpath
         // 平铺进每个 Mod，那会导致 MC 类被重复定义。
@@ -93,19 +111,29 @@ public final class ModClassLoader extends URLClassLoader {
         }
     }
 
+    /** 发现阶段确定的代码源；null 表示按文件名推断。 */
+    private final Path explicitSource;
+
     /**
-     * 定位 Mod 自身的代码源：{@code <modsDir>/<id>.jar} 或 {@code <modsDir>/<id>/}。
+     * 定位 Mod 自身的代码源。
+     *
+     * <p>顺序：显式来源 → {@code <modsDir>/<id>.jar} →
+     * {@code <modsDir>/<id>/}（开发态展开布局）。
      */
     private List<Path> locateModSources() {
         List<Path> found = new ArrayList<>();
         Path base = modsDir;
 
+        if (explicitSource != null && Files.exists(explicitSource)) {
+            found.add(explicitSource);
+        }
+
         Path jar = base.resolve(modId + ".jar");
-        if (Files.exists(jar)) {
+        if (Files.exists(jar) && !found.contains(jar)) {
             found.add(jar);
         }
         Path dir = base.resolve(modId);
-        if (Files.isDirectory(dir)) {
+        if (Files.isDirectory(dir) && !found.contains(dir)) {
             found.add(dir);
             // 开发态：展开 Gradle 输出，便于本地调试
             Path classes = dir.resolve("build/classes/java/main");

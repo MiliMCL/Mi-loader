@@ -14,6 +14,9 @@ import org.loader.loader.transform.ClassTransformInterceptor;
 import org.loader.runtime.RuntimeEnvironment;
 import org.loader.runtime.kernel.Runtime;
 import org.loader.runtime.minecraft.client.TitleScreenDispatch;
+import org.loader.runtime.minecraft.client.screen.ModListScreenDispatch;
+import org.loader.runtime.modlist.ModEntry;
+import org.loader.runtime.modlist.ModListSnapshot;
 import org.loader.runtime.minecraft.transform.MiliClientBrandTransformer;
 import org.loader.runtime.minecraft.transform.MiliTickTransformer;
 import org.loader.runtime.minecraft.transform.MiliTitleScreenTransformer;
@@ -61,11 +64,26 @@ public class MinecraftGameProvider implements GameProvider {
             java.util.Map.of();
 
     /**
+     * 各 Mod 声明的物品清单 —— 创造栏标签的第二类内容（第一类是方块）。
+     *
+     * <p>只传方块会让「纯物品 Mod」没有页签，也会让 Aurora 的
+     * {@code aurora_shard} 不出现在自己的页里。
+     */
+    private volatile java.util.Map<String, java.util.List<String>> declaredItems =
+            java.util.Map.of();
+
+    /**
      * 注入各 Mod 声明的方块清单。必须在 {@link #launch} 之前调用；
      * null 视为空映射。
      */
     public void declaredBlocks(java.util.Map<String, java.util.List<String>> byMod) {
         this.declaredBlocks = byMod == null
+                ? java.util.Map.of() : java.util.Map.copyOf(byMod);
+    }
+
+    /** 注入各 Mod 声明的物品清单。必须在 {@link #launch} 之前调用。 */
+    public void declaredItems(java.util.Map<String, java.util.List<String>> byMod) {
+        this.declaredItems = byMod == null
                 ? java.util.Map.of() : java.util.Map.copyOf(byMod);
     }
 
@@ -252,15 +270,16 @@ public class MinecraftGameProvider implements GameProvider {
         // 主界面 mod 列表的数据源 —— 必须在主界面显示之前设置
         armModListProvider(classLoaderManager);
 
-        // 客户端服务装配（屏幕 / 按键）—— 必须在任何 Mod 代码运行前。
-        // 服务端环境不装配：两个服务的 register 保持显式不可用，
-        // 在服务器上调 open()/register() 会得到清晰报错而非静默无效。
-        if (detectedEnvironment == RuntimeEnvironment.CLIENT) {
-            org.loader.runtime.minecraft.client.screen.ScreenServiceBridge.install();
-            org.loader.runtime.minecraft.client.input.KeyBindingServiceBridge.install();
-        }
+        // 客户端服务 / 配置服务 / 存储服务 / 指标服务的装配统一上移到
+        // LoaderMain.installRuntimeServices() —— 它们全部在 Mod 的
+        // initialize() 之前就必须可用。放在 launch() 里（Mod 初始化之后）
+        // 会让 Mod 看到「服务未装配」，而那不是环境问题，是装配时序错误。
 
         // 配置服务 —— 无 MC 依赖，客户端与服务端都可用。
+        //
+        // 存储服务与指标服务不在这里装配：它们的消费方是 Mod 的
+        // initialize()，而 initialize() 发生在 launch() 之前。
+        // 装配已上移到 LoaderMain.installRuntimeServices()。
         org.loader.api.config.ConfigService.registerProvider(
                 new org.loader.runtime.config.PropertiesConfigStore());
 
@@ -273,8 +292,9 @@ public class MinecraftGameProvider implements GameProvider {
         // 注册为 bootstrap 的外部资源 —— 失败/停止时随之释放
         EntryPointHook hook = new EntryPointHook();
         hook.install(gameClassLoader, runtime, classLoaderManager, detectedEnvironment);
-        // 方块清单在游戏 main 之前注入 —— 创造栏标签与资源注入都依赖它。
+        // 方块/物品清单在游戏 main 之前注入 —— 创造栏标签与资源注入都依赖它。
         hook.declaredBlocks(declaredBlocks);
+        hook.declaredItems(declaredItems);
         hook.invokeMinecraftMain(gameClassLoader, args != null ? args : new String[0]);
     }
 
@@ -296,6 +316,14 @@ public class MinecraftGameProvider implements GameProvider {
             registry.register(new org.loader.runtime.minecraft.transform.MiliClientTickTransformer(),
                     null);
             registry.indexClass(MiliSymbol.CLIENT_TICK.owner());
+
+            // 创造栏页签布局：把 Mod 的哨兵列排到面板右侧，
+            // 并修正 extractTabButton 的 clamp 越界。
+            registry.register(
+                    new org.loader.runtime.minecraft.transform.MiliCreativeTabLayoutTransformer(),
+                    null);
+            registry.indexClass(
+                    org.loader.runtime.minecraft.transform.MiliCreativeTabLayoutTransformer.SCREEN);
         }
         registry.indexClass(MiliSymbol.SERVER_TICK.owner());
         registry.indexClass(MiliSymbol.CLIENT_BRAND.owner());
@@ -336,6 +364,7 @@ public class MinecraftGameProvider implements GameProvider {
      * 列表在按钮被点击时才读取 —— 此处只装配数据源。
      */
     private void armModListProvider(ModClassLoaderManager classLoaderManager) {
+        // 旧路径：AlertScreen 的纯文本列表。保留给自绘界面失败时的降级。
         TitleScreenDispatch.setModListProvider(() -> {
             List<String> lines = new ArrayList<>();
             try {
@@ -354,5 +383,78 @@ public class MinecraftGameProvider implements GameProvider {
             }
             return lines;
         });
+
+        // 主路径：结构化快照，供自绘列表界面使用。
+        //
+        // 快照在「点击按钮」这一刻构建一次 —— 因此这里不需要缓存，
+        // 也不需要担心 loadClass 统计的并发一致性：调用点在客户端主线程，
+        // 此刻没有类加载正在进行。
+        ModListScreenDispatch.setSource(
+                () -> buildModListSnapshot(classLoaderManager));
+    }
+
+    /**
+     * 构建一次 Mod 列表快照。
+     *
+     * <p>刻意做成「每次点击构建」而不是「启动时构建后缓存」：
+     * 类加载数量、堆占用、生命周期状态都是<b>会变的</b>，
+     * 一张启动时的快照会让玩家看到过时数据，而这恰恰是诊断界面
+     * 最不该出现的错误 —— 用户拿它来判断「我的 mod 到底怎么了」。
+     */
+    private ModListSnapshot buildModListSnapshot(ModClassLoaderManager classLoaderManager) {
+        List<ModEntry> entries = new ArrayList<>();
+        try {
+            for (ModClassLoader mcl : classLoaderManager.all()) {
+                org.loader.runtime.mod.ModManifest m = mcl.manifest();
+                String source = "";
+                for (Path p : mcl.modSources()) {
+                    if (p != null && p.toString().endsWith(".jar")) {
+                        source = p.getFileName().toString();
+                        break;
+                    }
+                }
+                String state = mcl.isClosed() ? "UNLOADED" : "ACTIVE";
+                int blocks = declaredBlocks
+                        .getOrDefault(mcl.modId(), List.of()).size();
+                entries.add(new ModEntry(
+                        m.id(),
+                        m.name(),
+                        m.version(),
+                        m.description(),
+                        m.author(),
+                        source,
+                        state,
+                        mcl.loadedClasses().size(),
+                        blocks,
+                        false));
+            }
+        } catch (Throwable t) {
+            PlatformLog.warn("[Mili] 构建 mod 快照失败（列表可能不完整）: " + t);
+        }
+
+        java.lang.Runtime rt = java.lang.Runtime.getRuntime();
+        long used = rt.totalMemory() - rt.freeMemory();
+        long max = rt.maxMemory();
+        int threads = java.lang.management.ManagementFactory
+                .getThreadMXBean().getThreadCount();
+
+        return new ModListSnapshot(
+                VersionInfo.CURRENT_VERSION,
+                VersionInfo.ABI_VERSION,
+                VersionInfo.TARGET_MINECRAFT,
+                String.valueOf(VersionInfo.TARGET_JAVA),
+                detectedEnvironment != null ? detectedEnvironment.name() : "UNKNOWN",
+                used,
+                max,
+                threads,
+                uptimeMillis(),
+                entries);
+    }
+
+    /** 平台启动时刻 —— 用于列表底栏展示运行时长。 */
+    private static final long START_NANOS = System.nanoTime();
+
+    private static long uptimeMillis() {
+        return (System.nanoTime() - START_NANOS) / 1_000_000L;
     }
 }

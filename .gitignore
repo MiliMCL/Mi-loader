@@ -24,3 +24,8 @@ dist-out
 # 属于每个用户自己的凭据，既不该提交也不该随分发包分发。
 mili-loader/distribution/bin/mili-loader.cfg
 .workbuddy
+run/
+demo-mod
+demo-mod2
+diag-tmp
+docs/evidence

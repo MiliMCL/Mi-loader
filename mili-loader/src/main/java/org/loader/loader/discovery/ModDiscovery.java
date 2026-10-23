@@ -21,6 +21,23 @@ public class ModDiscovery {
     private final List<ModManifest> discovered = new ArrayList<>();
     private final Map<String, ModManifest> byId = new LinkedHashMap<>();
 
+    /**
+     * modId → 实际来源（jar 文件或目录）。
+     *
+     * <h2>为什么必须记下来</h2>
+     * 旧实现让 {@code ModClassLoader} 按 {@code <modsDir>/<modId>.jar}
+     * 猜自己的代码源。这条约定在现实中完全站不住：Maven/Gradle 产物叫
+     * {@code aurora-1.0.0.jar}，从 Modrinth 下载的叫
+     * {@code aurora-crystal-1.0.0+mc26.2.jar}，而 mod.json 里的 id 是
+     * {@code miliaurora}。三者永远对不上，结果是
+     * <b>Mod 被发现、被列出，但类加载不了</b> —— 报错还是
+     * {@code ClassNotFoundException}，看起来像 Mod 自己的问题。
+     *
+     * <p>发现阶段是唯一知道「这个 id 来自哪个文件」的地方。记下来，
+     * 传给 ClassLoader，猜文件名这条路就彻底不需要了。
+     */
+    private final Map<String, Path> sourcePaths = new LinkedHashMap<>();
+
     public ModDiscovery(LoaderConfig config) {
         this.config = config;
     }
@@ -45,16 +62,36 @@ public class ModDiscovery {
         } catch (IOException e) { /* ignore */ }
     }
 
+    /**
+     * 扫描一个 Mod JAR。
+     *
+     * <h2>为什么要 try-with-resources</h2>
+     * 旧实现直接 {@code new ZipFile(...)} 且从不关闭。在 Windows 上
+     * 这是一个**实打实的资源泄漏**：ZipFile 持有文件句柄并带
+     * {@code FILE_SHARE_DELETE} 之外的共享模式，于是扫描过一次之后：
+     * <ul>
+     *   <li>玩家无法删除、重命名、覆盖 mods 目录里的 JAR ——
+     *       系统提示「文件正在被另一个程序使用」，而那个程序就是自己；</li>
+     *   <li>{@code docs} 里承诺的热重载不可能工作 ——
+     *       旧 JAR 根本没被释放；</li>
+     *   <li>测试里 {@code @TempDir} 清理失败，报的是一句与根因无关的
+     *       "Failed to close extension context"。</li>
+     * </ul>
+     * 三种症状看起来毫不相干，根因都是同一个没关的句柄。
+     */
     private void scanModJar(Path jarPath) {
-        try {
-            java.util.zip.ZipFile zip = new java.util.zip.ZipFile(jarPath.toFile());
+        try (java.util.zip.ZipFile zip = new java.util.zip.ZipFile(jarPath.toFile())) {
             java.util.zip.ZipEntry entry = zip.getEntry("mod.json");
             if (entry == null) entry = zip.getEntry("META-INF/mod.json");
             if (entry != null) {
-                String content = new String(zip.getInputStream(entry).readAllBytes());
+                String content;
+                try (java.io.InputStream in = zip.getInputStream(entry)) {
+                    content = new String(in.readAllBytes());
+                }
                 ModManifest manifest = parseManifest(content, jarPath);
                 discovered.add(manifest);
                 byId.put(manifest.id(), manifest);
+                sourcePaths.put(manifest.id(), jarPath);
             }
         } catch (IOException e) { /* skip bad jar */ }
     }
@@ -67,6 +104,7 @@ public class ModDiscovery {
                 ModManifest manifest = parseManifest(content, dir);
                 discovered.add(manifest);
                 byId.put(manifest.id(), manifest);
+                sourcePaths.put(manifest.id(), dir);
             } catch (IOException e) { /* skip bad dir */ }
         }
     }
@@ -141,6 +179,16 @@ public class ModDiscovery {
     private String diagnostic(Path source, String detail, String code) {
         return "[ModSource: " + source.getFileName() + "] " + detail + "\n" +
                "  ErrorCode: " + code;
+    }
+
+    /**
+     * modId → 来源路径（jar 或目录）。只读快照。
+     *
+     * <p>返回给 loader 用于装配 {@code ModClassLoader}，见
+     * {@code sourcePaths} 字段的注释。
+     */
+    public Map<String, Path> sources() {
+        return Map.copyOf(sourcePaths);
     }
 
     public List<ModManifest> discover() {

@@ -1,5 +1,6 @@
 package org.loader.loader.classloader;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -54,6 +55,20 @@ class MinecraftClassLoaderCodeSourceTest {
 
     @TempDir
     Path tmp;
+
+    /**
+     * 放掉共享 JarFile 句柄。
+     *
+     * <p>{@code MinecraftClassLoader} 为了性能会在进程内强持有 classpath
+     * jar（见其 {@code SHARED_JARS} 注释）。这在生产里是对的，
+     * 但会让 {@code @TempDir} 清理失败 —— 报错文本是
+     * "Failed to close extension context"，与真正的原因（jar 被锁）
+     * 相隔甚远，很容易被误判成测试框架的问题。
+     */
+    @AfterEach
+    void releaseJarHandles() {
+        MinecraftClassLoader.releaseSharedJars();
+    }
 
     @Test
     @DisplayName("拦截路径与标准路径的 CodeSource 必须完全一致")

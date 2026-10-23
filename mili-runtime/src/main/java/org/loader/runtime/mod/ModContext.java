@@ -147,7 +147,16 @@ public class ModContext {
         if (modScheduler == null) {
             synchronized (this) {
                 if (modScheduler == null) {
-                    modScheduler = new Scheduler(mod.id() + "-scheduler", scope());
+                    // 每个 Mod 的调度器只给 2 个线程，而不是 CPU 核数。
+                    //
+                    // 旧默认值是 availableProcessors()：10 个 Mod 就是
+                    // 80 个池线程（每个都有栈与调度开销），在 8G 内存的
+                    // 机器上会把 liveThreads 推到一个看起来像泄漏的数字。
+                    // Mod 的异步工作通常是 IO / 短任务，2 个线程足够；
+                    // 真要并行计算，应该由平台统一调度，而不是每个 Mod
+                    // 各开一个与核数相等的池。
+                    modScheduler = new Scheduler(mod.id() + "-scheduler", scope(),
+                            Math.min(2, java.lang.Runtime.getRuntime().availableProcessors()));
                     scope().registerResource(modScheduler);
                 }
             }
@@ -230,6 +239,34 @@ public class ModContext {
      *
      * @return the RuntimeEnvironment, defaults to DEDICATED_SERVER
      */
+    /**
+     * 显式注入运行环境。
+     *
+     * <h2>为什么必须由 loader 注入</h2>
+     * 旧实现的兜底是 {@code DEDICATED_SERVER}，而 {@code ModContext}
+     * 构造时并没有人设置环境 —— 于是<b>每一个客户端 Mod 都被告知
+     * 「你在专用服务器上」</b>，全部客户端功能被 Mod 自己跳过。
+     * 症状是「Mod 加载成功、日志正常、但游戏里什么都没有」，
+     * 排查方向会被彻底带偏。
+     *
+     * <p>环境是装载方（loader）才知道的事实：它刚刚决定加载客户端
+     * 还是服务端 JAR。把它作为构造后的一次显式设置，比让 runtime
+     * 猜一个默认值可靠得多。
+     *
+     * @throws IllegalStateException 已经取过环境值后再设置
+     */
+    public void setEnvironment(RuntimeEnvironment env) {
+        if (env == null) {
+            return;
+        }
+        RuntimeEnvironment current = environment;
+        if (current != null && current != env) {
+            throw new IllegalStateException(
+                    "运行环境已经确定为 " + current + "，不能再改为 " + env);
+        }
+        environment = env;
+    }
+
     public RuntimeEnvironment environment() {
         if (environment == null) {
             // Walk up the scope chain looking for a registered RuntimeEnvironment capability
@@ -242,7 +279,11 @@ public class ModContext {
                 }
                 current = current.parent();
             }
-            environment = RuntimeEnvironment.DEDICATED_SERVER;
+            // 兜底：客户端是绝大多数运行场景，且两种误判的代价不对称 ——
+            // 误判为客户端时，服务器上的 UI 调用会得到明确的
+            // Unavailable 异常；误判为服务器时，客户端 Mod 会静默跳过
+            // 全部客户端功能，玩家只看到「装了 Mod 但什么也没有」。
+            environment = RuntimeEnvironment.CLIENT;
         }
         return environment;
     }

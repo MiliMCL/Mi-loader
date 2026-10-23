@@ -441,9 +441,35 @@ Loader 会自动隔离并返回空结果并记录安全警告。`resources.list(
 
 ## 构建与分发
 
-模组最终产物是一个包含编译后类文件、META-INF 目录与资源文件的 JAR 包，文件名应为 `{modId}.jar`，
-与元数据中声明的 id 完全一致。在 Gradle 构建脚本中可以通过在 `jar` 任务的 `archiveFileName` 配
-置中引用 `mod.json` 中的 `id` 字段实现文件名与元数据的自动同步。构建时应在 `build.gradle` 中声
+模组最终产物是一个包含编译后类文件、META-INF 目录与资源文件的 JAR 包。**文件名不重要**：
+Loader 以 JAR 内 `mod.json` 的 `id` 为唯一身份，扫描阶段会记录 `id → 实际路径` 的映射并传给
+ClassLoader。`aurora-1.0.0.jar` 里装 `miliaurora` 是合法的，带 `+mc26.2` 后缀的下载产物同理。
+（早期实现要求文件名严格等于 `{modId}.jar`，这条约束在现实里从未成立过 —— Maven 产物、
+Modrinth 下载名、人工重命名三者永远对不上，症状是 `ClassNotFoundException`，
+看起来像模组自己的问题。）
+
+### 方块与物品必须自带资源文件
+
+平台只负责把模组 JAR 里的 `assets/` 挂进 `PackRepository`，**不代生成模型**。
+声明一个 `crystal/aurora_crystal` 方块，JAR 里必须有：
+
+```
+assets/<modid>/blockstates/crystal/aurora_crystal.json
+assets/<modid>/models/block/crystal/aurora_crystal.json
+assets/<modid>/models/item/crystal/aurora_crystal.json      # 方块物品
+assets/<modid>/textures/block/aurora_crystal.png            # 16x16
+assets/<modid>/lang/en_us.json                              # 可选，翻译
+```
+
+缺 `blockstates` 的症状是日志里一行
+`Missing model for variant: 'Block{<modid>:<path>}'`，方块在游戏里显示为紫黑格。
+这条警告**不在**平台日志里，而在 `logs/latest.log` —— 排查时容易看错文件。
+
+普通物品（非方块）需要 `models/item/<path>.json`，`parent` 用 `minecraft:item/generated`。
+
+在 Gradle 构建脚本中可以通过在 `jar` 任务的 `archiveFileName` 配置
+中引用 `mod.json` 中的 `id` 字段实现文件名与元数据的自动同步（可选，不是要求）。
+构建时应在 `build.gradle` 中声
 明对 Mili `api` 子项目的编译期依赖，将 Java 兼容性目标设置为 Java 25。混淆配置需要保留入口点
 类与 `initialize` 方法签名不被重命名，同时保留所有被 Loader 反射解析的注解类，建议使用平台提
 供的混淆规则模板并仅对内部实现类进行混淆。开发者可以在开发环境中使用 Gradle 的 `prepareMods` 

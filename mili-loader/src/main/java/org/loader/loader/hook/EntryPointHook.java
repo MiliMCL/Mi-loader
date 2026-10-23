@@ -61,6 +61,10 @@ public class EntryPointHook {
     private volatile java.util.Map<String, java.util.List<String>> declaredBlocks =
             java.util.Map.of();
 
+    /** 各 Mod 声明的物品路径；与方块清单一同用于创造栏标签。 */
+    private volatile java.util.Map<String, java.util.List<String>> declaredItems =
+            java.util.Map.of();
+
     /**
      * 设置各 Mod 声明的方块清单。必须在游戏启动前调用。
      *
@@ -68,6 +72,11 @@ public class EntryPointHook {
      */
     public void declaredBlocks(java.util.Map<String, java.util.List<String>> byMod) {
         this.declaredBlocks = byMod == null ? java.util.Map.of() : java.util.Map.copyOf(byMod);
+    }
+
+    /** 设置各 Mod 声明的物品清单。必须在游戏启动前调用。 */
+    public void declaredItems(java.util.Map<String, java.util.List<String>> byMod) {
+        this.declaredItems = byMod == null ? java.util.Map.of() : java.util.Map.copyOf(byMod);
     }
 
     /**
@@ -272,22 +281,39 @@ public class EntryPointHook {
      * <p>失败只记警告：创造栏是便利功能，缺了方块仍可用 {@code /give} 获得。
      */
     private void registerCreativeTabs() {
-        java.util.Map<String, java.util.List<String>> blocks = declaredBlocks;
-        if (blocks.isEmpty()) {
+        // 取方块与物品清单的并集：只有物品的 Mod 也应当有自己的页签。
+        java.util.Set<String> modIds = new java.util.LinkedHashSet<>();
+        modIds.addAll(declaredBlocks.keySet());
+        modIds.addAll(declaredItems.keySet());
+        if (modIds.isEmpty()) {
             return;
         }
+
         int created = 0;
-        for (java.util.Map.Entry<String, java.util.List<String>> e : blocks.entrySet()) {
-            java.util.List<String> paths = e.getValue();
-            if (paths == null || paths.isEmpty()) {
+        for (String modId : modIds) {
+            java.util.List<String> blocks =
+                    declaredBlocks.getOrDefault(modId, java.util.List.of());
+            java.util.List<String> items =
+                    declaredItems.getOrDefault(modId, java.util.List.of());
+            if (blocks.isEmpty() && items.isEmpty()) {
                 continue;
             }
             try {
-                org.loader.runtime.minecraft.resource.ModCreativeTabs
-                        .registerTab(e.getKey(), paths);
-                created++;
+                if (org.loader.runtime.minecraft.resource.ModCreativeTabs
+                        .registerTab(modId, blocks, items)) {
+                    created++;
+                }
+
+                // 自动补 BlockItem —— 顺序是硬约束：
+                // 各 Mod 的 block/item 注册动作已经在队列里（Mod.initialize 时
+                // defer 的），这里追加到队尾，保证在执行时方块已经存在、
+                // 显式物品已经注册；随后 ensureBootstrapped 才 freeze 注册表。
+                org.loader.runtime.minecraft.RegistrationPhase.defer(
+                        () -> org.loader.runtime.minecraft.resource.ModCreativeTabs
+                                .ensureBlockItems(modId, blocks));
             } catch (RuntimeException ex) {
-                PlatformLog.warn("创造栏标签创建失败: " + e.getKey() + "（方块仍可用 /give 获得）", ex);
+                PlatformLog.warn("创造栏标签创建失败: " + modId
+                        + "（内容仍可用 /give 获得）", ex);
             }
         }
         if (created > 0) {

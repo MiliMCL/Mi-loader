@@ -205,6 +205,29 @@ engine.recentMetrics();        // 最近 200 次指标
 engine.diagnostics();          // 人类可读摘要
 ```
 
+### 滑动窗口（TPS 面板的数据源）
+
+上面的 `currentTps()` 是**从启动到现在的累计平均** —— 开局卡 20 秒会被
+后面两小时的好数据稀释到看不见。需要判断「现在卡不卡」时读
+`PerformanceService`：
+
+```java
+PerformanceSnapshot p = PerformanceService.current();
+p.tps1s();      // 最近 1 秒
+p.tps5s();      // 最近 5 秒
+p.p95TickMs();  // 最近 300 tick 的 95 分位
+p.health();     // GOOD / DEGRADED / POOR / UNKNOWN
+```
+
+`TickEngine.endTick` 会把每次 tick 的起止时间写入
+`Runtime.performance()` 持有的 `PerformanceMonitor`（两个 `long[]` 环形缓冲，
+稳态零分配）。客户端帧率由 `ClientFrameSampler` 在客户端 tick 上采样，
+与 tick 数据进入同一个窗口 —— 面板上的两行数字因此可以互相解释。
+
+> 读 `PerformanceSnapshot` 不等于「实时」：它最多滞后 250ms，
+> 且需要 tick 循环真的在跑。世界未加载或游戏暂停时 `hasTickData()`
+> 为 false，面板显示 `—` 而不是 `0`。
+
 回答"为什么这个 tick 慢"目前只能到 tick 级别。
 更细的（哪个 Mod / 哪个 Region / 哪个 Entity）需要
 Phase 9 ExecutionContext 与 Region 埋点 ——**尚未实施**。
