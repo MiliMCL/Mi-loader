@@ -2,6 +2,7 @@ package org.loader.runtime.instance;
 
 import org.loader.runtime.kernel.*;
 import org.loader.runtime.mod.*;
+import org.loader.runtime.util.DependencySorter;
 import org.loader.runtime.util.ModLogger;
 
 import java.util.*;
@@ -90,6 +91,11 @@ public class ModManager implements Resource {
      * Takes the instance's requested mod IDs and resolves them against
      * available mods, checking dependencies and producing a load-ordered list.
      *
+     * <p><b>循环检测</b>：排序交给 {@link DependencySorter}（三态 DFS）。
+     * 历史实现只用 {@code visited} 去重，{@code A → B → A} 会被当成
+     * 「已访问」而非环，于是循环依赖以任意顺序「解析成功」并进入加载流程。
+     * 现在环、缺失、版本不匹配是三类可区分的失败。
+     *
      * @param instance the instance definition
      * @return the resolution result
      */
@@ -100,25 +106,40 @@ public class ModManager implements Resource {
         lock.readLock().lock();
         try {
             // Build lookup of available mods
-            Map<String, ModManifest> available = new HashMap<>();
+            Map<String, ModManifest> available = new LinkedHashMap<>();
             for (ModManifest mod : discoverer.discover()) {
-                available.put(mod.id(), mod);
+                available.putIfAbsent(mod.id(), mod);
             }
 
-            List<String> requestedIds = instance.modIds();
-            List<ModManifest> resolved = new ArrayList<>();
-            List<String> missing = new ArrayList<>();
-            Set<String> visited = new HashSet<>();
-
-            for (String modId : requestedIds) {
-                resolveRecursive(modId, available, resolved, missing, visited);
+            List<DependencySorter.Node> nodes = new ArrayList<>(available.size());
+            for (ModManifest mod : available.values()) {
+                nodes.add(new DependencySorter.Node(mod.id(), requiredDependencyIds(mod)));
             }
 
-            if (!missing.isEmpty()) {
+            DependencySorter.Result sorted =
+                    DependencySorter.sort(nodes, instance.modIds());
+
+            List<String> conflicts = new ArrayList<>();
+            for (List<String> cycle : sorted.cycles()) {
+                conflicts.add("依赖循环: " + String.join(" -> ", cycle));
+            }
+            conflicts.addAll(versionConflicts(available, sorted.order()));
+
+            if (sorted.hasMissing() || !conflicts.isEmpty()) {
                 ModResolutionResult result = ModResolutionResult.failed(
-                        instance.instanceId(), missing, List.of());
+                        instance.instanceId(), sorted.missing(), conflicts);
                 resolutionCache.put(instance.instanceId(), result);
+                logger.info("Resolution failed for instance " + instance.instanceId()
+                        + ": " + result.summary());
                 return result;
+            }
+
+            List<ModManifest> resolved = new ArrayList<>(sorted.order().size());
+            for (String id : sorted.order()) {
+                ModManifest manifest = available.get(id);
+                if (manifest != null) {
+                    resolved.add(manifest);
+                }
             }
 
             ModResolutionResult result = ModResolutionResult.success(
@@ -205,29 +226,71 @@ public class ModManager implements Resource {
         return load(runtime, modSet);
     }
 
-    private void resolveRecursive(String modId,
-                                  Map<String, ModManifest> available,
-                                  List<ModManifest> resolved,
-                                  List<String> missing,
-                                  Set<String> visited) {
-        if (visited.contains(modId)) return;
-
-        ModManifest manifest = available.get(modId);
-        if (manifest == null) {
-            missing.add(modId);
-            return;
-        }
-
-        visited.add(modId);
-
-        // Resolve dependencies first
-        for (ModManifest.DependencyEntry dep : manifest.dependencies()) {
+    /** 只取必需依赖的 mod id；可选依赖不参与加载顺序约束。 */
+    private static List<String> requiredDependencyIds(ModManifest mod) {
+        List<String> ids = new ArrayList<>(mod.dependencies().size());
+        for (ModManifest.DependencyEntry dep : mod.dependencies()) {
             if (dep.required()) {
-                resolveRecursive(dep.modId(), available, resolved, missing, visited);
+                ids.add(dep.modId());
             }
         }
+        return ids;
+    }
 
-        resolved.add(manifest);
+    /**
+     * 检查已解析 Mod 之间的版本约束冲突。
+     *
+     * <p>与「缺失」「循环」刻意分开表达：这三类失败的处理方式完全不同
+     * （装包 / 改依赖关系 / 换版本），混在一个列表里等于没诊断。
+     */
+    private static List<String> versionConflicts(Map<String, ModManifest> available,
+                                                 List<String> order) {
+        List<String> conflicts = new ArrayList<>();
+        for (String id : order) {
+            ModManifest mod = available.get(id);
+            if (mod == null) {
+                continue;
+            }
+            for (ModManifest.DependencyEntry dep : mod.dependencies()) {
+                if (!dep.required()) {
+                    continue;
+                }
+                ModManifest target = available.get(dep.modId());
+                if (target == null) {
+                    // 缺失已由 missingDependencies 表达，不重复报告
+                    continue;
+                }
+                if (!versionSatisfies(dep.versionRange(), target.version())) {
+                    conflicts.add("版本不匹配: " + mod.id() + " 要求 " + dep.modId()
+                            + " " + dep.versionRange() + "，实际为 " + target.version());
+                }
+            }
+        }
+        return conflicts;
+    }
+
+    /**
+     * 版本约束求值。
+     *
+     * <p>当前只实现三种情形：通配（{@code *} / 空）、精确版本、以及
+     * <b>未支持的范围表达式</b>。范围表达式（{@code ^}、{@code ~}、
+     * 比较符、逗号交集）一律按「不校验」处理 —— 平台的依赖声明目前
+     * 只产出 {@code *}，把未实现的语法当作失败会造成误报，
+     * 而误报会阻断本来能跑的 Mod。
+     */
+    static boolean versionSatisfies(String range, String actualVersion) {
+        if (range == null || range.isBlank() || "*".equals(range.trim())) {
+            return true;
+        }
+        String r = range.trim();
+        for (int i = 0; i < r.length(); i++) {
+            char c = r.charAt(i);
+            if (c == '^' || c == '~' || c == '>' || c == '<' || c == ','
+                    || c == '[' || c == '(' || c == ')' || c == ']' || c == ' ') {
+                return true;   // 未实现的范围语法：不参与校验
+            }
+        }
+        return r.equals(actualVersion);
     }
 
     private void checkNotClosed() {

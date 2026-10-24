@@ -22,7 +22,7 @@ Mili 平台通过三个独立的版本字符串来描述运行环境。三者职
 
 ## mod.json 中的版本声明
 
-每一个 Mod 通过其根目录下的 `mod.json` 文件声明自身元数据。与传统的 Fabric `fabric.mod.json` 或 Forge `mods.toml` 不同，Mili 在 `mod.json` 中引入了一个可选的顶级 `"mili"` 对象，用于承载三元组声明。当该对象缺失时，Mod 被视为"未绑定"（unbound），加载器允许其加载但会输出警告，以此提供向后兼容，同时引导开发者在迁移时补全声明。
+每一个 Mod 通过其根目录下的 `mod.json` 文件声明自身元数据。与传统的 Fabric `fabric.mod.json` 或 Forge `mods.toml` 不同，Mili 在 `mod.json` 中引入了一个顶级 `"mili"` 对象，用于承载三元组声明。该对象<b>在语法上可缺省，但在语义上是必填</b>：缺失即"未绑定"（unbound），加载器会以 `MOD_PLATFORM_MISSING` 拒绝该 Mod（见下文「严格匹配规则」）。不存在"缺失就警告放行"的兼容模式。
 
 一个完整的 `mod.json` 示例结构如下。`"mili"` 对象内部包含三个字符串字段：`platform`、`abi`、`minecraft`。它们必须与运行环境中 `VersionInfo` 的对应常量完全一致，不允许使用前缀、范围表达式或通配符。
 
@@ -41,7 +41,9 @@ Mili 平台通过三个独立的版本字符串来描述运行环境。三者职
 }
 ```
 
-`"mili"` 对象是可选的，但强烈建议所有新 Mod 完整填写。缺失 `"mili"` 对象的旧式 Mod 在加载时会被标记为未绑定状态，加载器会在日志中以警告级别记录该 Mod 的 id 和版本，但不阻断启动流程。这种过渡性策略仅用于兼容迁移期，未来版本可能将其升级为错误。
+`"mili"` 对象缺失时，加载在 `LoaderMain.validateVersionBindings()` 阶段直接失败：
+抛出 `ModLoadError`（错误码 `MOD_PLATFORM_MISSING`），消息里带 Mod 的 id 与来源，
+启动中止。`mod.json` 里能省掉的只有 `"mili"` 这个键本身，代价是这个 Mod 一定加载不起来。
 
 `"dependencies"` 数组用于声明当前 Mod 对其他 Mod 的依赖关系，其格式与版本校验机制独立于本文档描述的三元组体系，依赖解析器另行校验。
 
@@ -53,9 +55,12 @@ Mili 平台通过三个独立的版本字符串来描述运行环境。三者职
 
 对于 abi 字段：Mod 声明的 abi 整数必须与 `VersionInfo.ABI_VERSION` 完全相等。由于 ABI 的核心价值在于接口稳定性，abi 的变化代表破坏性更新，因此不存在"兼容"的概念，必须精确一致。
 
-对于 minecraft 字段：Mod 声明的 minecraft 字符串必须与 `VersionInfo.TARGET_MINECRACT` 逐字符相等。Minecraft 版本格式遵循 Mojang 官方的主版本.次版本命名，不携带补丁段或快照标识。
+对于 minecraft 字段：Mod 声明的 minecraft 字符串必须与 `VersionInfo.TARGET_MINECRAFT` 逐字符相等。Minecraft 版本格式遵循 Mojang 官方的主版本.次版本命名，不携带补丁段或快照标识。
 
-三个字段独立校验，任一不匹配即产生对应的错误码。如果同一 Mod 同时存在多个字段不匹配，加载器应报告所有不匹配项，而非在首个错误处停止，以便开发者一次性修全部问题。
+三个字段按 `platform → abi → minecraft` 的顺序校验，**遇到第一个不匹配即返回**
+（`ModManifest.validateVersionBinding()` 是短路的）。因此一次启动只会看到一个错误码：
+修好 platform 之后才会看到 abi 的问题，依此类推。这不是"理想行为"而是当前实现，
+写在这里以免被误读成"一次报全"。
 
 "未绑定"Mod（即缺少 `"mili"` 对象）不参与严格匹配，将产生 **MOD_PLATFORM_MISSING** 错误码。按当前规范，未绑定视为校验失败，阻断加载——不再有静默降级或警告放行。
 
@@ -79,17 +84,20 @@ Mili 平台通过三个独立的版本字符串来描述运行环境。三者职
 
 ## 模块版本策略
 
-Mili 平台由四个主要模块构成，每个模块在 Maven 坐标中独立版本化，但在 Mili 三元组的管理框架下保持协调演进。
+Mili 平台由五个模块构成（`mili-abi`、`mili-runtime`、`mili-loader`、`mili-minecraft-integration`、`mili-installer`），每个模块在 Maven 坐标中独立版本化，但在 Mili 三元组的管理框架下保持协调演进。
 
 **mili-abi** 是纯接口模块，不包含任何实现代码。它定义了 Mod 能够直接引用的所有公开类型，并承载 `VersionInfo` 常量类。mili-abi 的版本与 ABI 版本号保持同步，当发生破坏性接口变更时升级主版本。该模块的稳定性最高，升级频率最低。
 
 **mili-runtime** 是平台核心实现，包含 Scope、Scheduler、EventBus、Capability 和 ResourceManager 等核心组件，以及面向 Mod 的 SDK。mili-runtime 的版本与 platform 版本号保持同步。该模块不允许引用任何 Minecraft 特定的包，与 `mili-minecraft-integration` 之间的边界由 CI 强制检查，任何跨边界的 import 将导致构建失败。
 
-**mili-loader** 负责 Mod 的发现、类加载、GameProvider SPI 以及版本校验逻辑本身。mili-loader 的版本也与 platform 版本号保持同步。该模块同时持有 `ModManifest` 和 `ValidationResult` 等校验相关类型，并在启动阶段执行三元组校验。
+**mili-loader** 负责 Mod 的发现、依赖排序、类加载、GameProvider SPI 以及版本校验逻辑本身。mili-loader 的版本也与 platform 版本号保持同步。校验相关的类型（`ModManifest`、`ValidationResult`）位于 `mili-runtime`，loader 在启动阶段调用它们执行三元组校验。
+
+**mili-installer** 是独立的安装器（不依赖任何其它模块，只需要 JDK），版本同样与 platform 同步。
+它不参与 Mod 加载，因此三元组校验与它无关；它负责把 Minecraft 官方文件按 SHA-1 校验后铺到游戏目录。
 
 **mili-minecraft-integration** 是 Mili 与 Minecraft 26.2 客户端之间的桥接层。它的版本同样与 platform 版本号保持同步，但它内部可以自由引用 Minecraft 相关包。该模块是平台中唯一被允许直接耦合 Minecraft 内部实现的模块，其他模块如需访问 Minecraft 功能需要通过 `mili-runtime` 提供的抽象间接进行。
 
-四个模块尽管在 Maven 中各自拥有独立版本号，但在每次平台发布时统一递增。这种"统一发布、协调版本"的策略避免了模块间版本组合爆炸，确保每个平台版本对应一组经过联合测试的模块集合。开发者只需关心 platform 版本，无需单独追踪每个模块的版本号。
+五个模块尽管在 Maven 中各自拥有独立版本号，但在每次平台发布时统一递增。这种"统一发布、协调版本"的策略避免了模块间版本组合爆炸，确保每个平台版本对应一组经过联合测试的模块集合。开发者只需关心 platform 版本，无需单独追踪每个模块的版本号。
 
 ## 升级
 
@@ -117,15 +125,18 @@ platform 描述的是实现，abi 描述的是契约。实现可以频繁重构�
 
 **如果我只是想快速测试一个 Mod，可以不填 `"mili"` 对象吗？**
 
-短期可以，但强烈不建议。未绑定 Mod 以警告模式运行，未来可能随平台演进而受到更多限制。在生产环境或发布版本中，未绑定状态将不被允许。
+不可以。未声明绑定的 Mod 会被 `MOD_PLATFORM_MISSING` 拒绝，启动直接中止。
+测试环境与生产环境的行为完全一致 —— 平台上没有"开发模式跳过校验"的分支。
 
 **Java 版本 25 是必须的吗？**
 
 是的。Mili 平台构建和运行均要求 Java 25 或更高版本。`VersionInfo.TARGET_JAVA` 声明了这一最低要求。低于该版本的 JVM 无法加载 Mili 平台。
 
-**未绑定 Mod 会不会在未来变成硬错误？**
+**未绑定 Mod 现在是什么行为？**
 
-有可能。当前允许未绑定状态是为了兼容迁移期。随着生态成熟，平台可能在未来版本中将未绑定 Mod 的警告升级为加载阻断错误。建议开发者尽早为所有 Mod 补充 `"mili"` 声明。
+已经是硬错误。`ModManifest.validateVersionBinding()` 对未绑定清单返回 `MISSING`，
+`LoaderMain` 据此抛 `MOD_PLATFORM_MISSING`。这条策略从平台 0.1.0 起就只有一个开关值，
+没有"未来可配置"的余地。
 
 **多 Minecraft 版本共存时如何处理？**
 

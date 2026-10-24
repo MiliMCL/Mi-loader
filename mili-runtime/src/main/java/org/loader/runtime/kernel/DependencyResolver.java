@@ -1,11 +1,19 @@
 package org.loader.runtime.kernel;
 
+import org.loader.runtime.util.DependencySorter;
+
 import java.util.*;
 
 /**
  * Resolves dependency graphs between Mods.
  * <p>
  * Dependencies are represented separately from ownership.
+ *
+ * <p><b>与其它入口共享同一套算法</b>：排序委托给
+ * {@link DependencySorter}（三态 DFS）。本类额外保留「插入期就拒绝成环」
+ * 的快速失败（{@link #addDependency}），但即使有人绕过它构造出环，
+ * {@link #resolveInitializationOrder()} 也会发现并拒绝，且错误信息包含
+ * 完整的环链（{@code A -> B -> C -> A}），而不只是一个节点名。
  */
 public class DependencyResolver {
 
@@ -36,16 +44,24 @@ public class DependencyResolver {
 
     /**
      * Returns the initialization order (topological sort).
+     *
+     * @throws IllegalStateException 若图中存在环；消息包含完整环链
      */
     public List<String> resolveInitializationOrder() {
-        List<String> result = new ArrayList<>();
-        Set<Node> visited = new HashSet<>();
-        Set<Node> inProgress = new HashSet<>();
-
+        List<DependencySorter.Node> graph = new ArrayList<>(nodes.size());
         for (Node node : nodes.values()) {
-            visit(node, visited, inProgress, result);
+            List<String> dependencies = new ArrayList<>(node.dependencies.size());
+            for (Node dep : node.dependencies) {
+                dependencies.add(dep.id);
+            }
+            graph.add(new DependencySorter.Node(node.id, dependencies));
         }
-        return Collections.unmodifiableList(result);
+
+        DependencySorter.Result result = DependencySorter.sort(graph, nodes.keySet());
+        if (result.hasCycles()) {
+            throw new IllegalStateException("Cycle detected: " + result.describeCycles());
+        }
+        return Collections.unmodifiableList(new ArrayList<>(result.order()));
     }
 
     /**
@@ -55,22 +71,6 @@ public class DependencyResolver {
         List<String> order = new ArrayList<>(resolveInitializationOrder());
         Collections.reverse(order);
         return order;
-    }
-
-    private void visit(Node node, Set<Node> visited, Set<Node> inProgress, List<String> result) {
-        if (visited.contains(node)) {
-            return;
-        }
-        if (inProgress.contains(node)) {
-            throw new IllegalStateException("Cycle detected at node: " + node.id);
-        }
-        inProgress.add(node);
-        for (Node dep : node.dependencies) {
-            visit(dep, visited, inProgress, result);
-        }
-        inProgress.remove(node);
-        visited.add(node);
-        result.add(node.id);
     }
 
     private boolean wouldCreateCycle(Node from, Node to) {

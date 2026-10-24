@@ -10,18 +10,24 @@ Mili 的 API 层完全不含 Minecraft 依赖，所有与游戏本体的交互�
 
 ## 模块构成
 
-Mili 由四个 Gradle 模块组成，依赖关系严格单向：
+Mili 由五个 Gradle 模块组成（与 `settings.gradle.kts` 的 `include` 一一对应）：
 
 | 模块 | 职责 |
 |---|---|
 | `mili-abi` | 稳定契约接口，零运行时依赖，Mod 编译的唯一目标 |
 | `mili-runtime` | Runtime 核心：Scope、Scheduler、EventBus、Capability、ResourceManager |
-| `mili-loader` | 启动发现、依赖解析、类加载、生命周期调度 |
-| `mili-minecraft-integration` | 反射桥接层，负责与 Minecraft 26.2 客户端交互 |
+| `mili-loader` | 启动发现、依赖解析、类加载、生命周期调度、分发包 |
+| `mili-minecraft-integration` | 反射桥接 + 平台自有字节码转换，负责与 Minecraft 26.2 客户端交互 |
+| `mili-installer` | 独立安装器：从 Mojang 官方源拉取并校验游戏文件（只依赖 JDK） |
 
-依赖方向为 `abi ← runtime ← loader` 与 `abi ← minecraft-integration`。`mili-runtime` 依赖 `mili-abi`，Loader 依赖 `mili-runtime` 与 `mili-abi`。Minecraft 集成模块只依赖 ABI，不反向引用 Loader。这种设计保证了 ABI 模块的纯洁性——它不引用自己即将被注入的任何实现类，整个依赖图无环且单向。Minecraft 集成模块之所以独立而非嵌入 Loader，是因为它的替换频率远高于 Loader 本体——Minecraft 补丁发布时只需重打集成模块 JAR，无需重建整套 Loader 链。这个设计决策也允许第三方社区为不同的 Minecraft 快照版本独立维护桥接层实现，只要不违反 ABI 契约。
+实际依赖方向（见各模块 `build.gradle.kts`）为 `runtime → abi`、`minecraft-integration → runtime, abi`、
+`loader → runtime, minecraft-integration, abi, installer`；`installer` 不依赖任何其它模块 —— 它必须能用
+单个 JDK 直接运行，因为它是「启动前」的工具。Minecraft 集成模块不反向引用 Loader，这样补丁发布时
+只需重打集成模块 JAR。`mili-abi` 只对外暴露 `api` 依赖，下游无法通过传递依赖引入内部类型。
 
-模块之间的边界不仅是代码层面的约定，也通过 Gradle 的 `api` 与 `implementation` 关键字严格实施。`mili-abi` 只暴露 `api` 依赖，下游 Mod 无法通过传递依赖引入任何内部类型。`mili-runtime` 对 Loader 暴露 `api` 依赖，但对自己内部的实现细节使用 `implementation` 确保编译期隔离。Gradle 编译器插件定期审核这些依赖声明，一旦发现违规（如 ABI 模块引入了意外依赖），构建会立即失败并给出修复建议。
+这套边界不是靠文档约定维持的：`mili-loader` 的 `ApiBoundaryTest` 会扫描源码里对
+`org.loader.runtime.*` 的 import，只放行显式白名单（`runtime.kernel.Scope/Runtime`、
+`runtime.mod.*`、`runtime.tick.TickContract` 等），越界即测试失败。
 
 ## Minecraft 26.2 集成流水线
 
@@ -59,9 +65,9 @@ Minecraft 26.2 JAR (build input)
 - `mili-loader/build/libs/mili-loader-<version>.jar` — Loader 本体
 - `mili-minecraft-integration/build/libs/mili-minecraft-integration-<version>.jar` — 反射桥接
 
-将 Loader JAR、Runtime JAR 与 Minecraft 集成 JAR 放入 `<loader-dir>/core/`，Mod JAR 放入 `<loader-dir>/mods/`，运行 Loader 即可启动。Loader 会自动扫描 Mod 目录、验证元数据、解析依赖图，并按拓扑顺序初始化每个 Mod。启动过程的所有步骤都有对应的日志输出，使得排查 Mod 加载失败的原因成为一件可追溯的工作。如果 Mod 加载失败，Loader 会在日志中输出具体的错误原因（缺失的依赖、能力不匹配、类无法实例化等），并在 `startup-report.json` 中生成一份完整的启动报告。
+将 Loader JAR、Runtime JAR 与 Minecraft 集成 JAR 放入 `<loader-dir>/core/`，Mod JAR 放入 `<loader-dir>/mods/`，运行 Loader 即可启动。Loader 会自动扫描 Mod 目录、验证元数据、解析依赖图，并按拓扑顺序初始化每个 Mod。依赖图排序由 `org.loader.runtime.util.DependencySorter` 统一实现（三态 DFS）：缺失依赖单独报告，循环依赖在任何入口都会被拒绝并给出完整环链（`A -> B -> C -> A`）。启动过程的关键步骤都有 `[Mili]` 前缀的日志输出，平台日志另存于 `logs/mili-platform.log`。
 
-开发模式下，可以通过 `./gradlew :mili-loader:run` 直接在 IDE 中启动 Loader。开发模式跳过了部分严格校验以加速迭代（例如不强制校验 Mod 的版本三元组在 patch 级别上完全一致），但生产构建中的校验一个都不会少。开发与生产环境的差异是 Mili 刻意维护的——它让开发者可以在本地快速试错，同时保证发布产物始终经过完整验证。开发模式的差异范围在文档中有明确列表，任何未在文档中列出的 Loader 行为都假定在两种模式下表现一致。
+开发模式下可以直接在 IDE 中以 `mili-loader` 的 `main`（`org.loader.loader.LoaderMain`）启动；该模块没有 `application` 插件，因此没有 `./gradlew :mili-loader:run` 这个任务。安装器有：`./gradlew :mili-installer:run --args="--dry-run --version 26.2"`。
 
 ## 构建说明
 
@@ -87,7 +93,19 @@ Mili 不与 Fabric 竞争生态位，也不试图兼容 Fabric 的 Mod。Fabric 
 
 ABI 优先是 Mili 最核心的设计决策。所有 Mod 只编译 `mili-abi`，这意味着 Loader 实现可以任意重构、优化甚至重写，只要保持 ABI 不变，已有的 Mod 二进制无需重新编译即可运行。这种接口与实现的严格分离是整个平台可维护性的基石。但 ABI 优先不仅仅是技术约束——它也是一种承诺：一旦进入稳定契约，我们保证不会在次要版本中静默破坏 Mod 的二进制兼容性。这个承诺是 Mili 与其他"ABI 优先"项目竞争时的关键差异——其他项目可能声称 ABI 优先但在实践中频繁做出破坏性变更，Mili 通过将 ABI 版本号语义与破坏性变更策略写入项目治理文件来制度化这一承诺。具体而言，破坏性变更必须经历：提案阶段（在社区 RFC 中论证变更的必要性）、过渡期（旧 API 标记为 `@Deprecated` 并附带迁移指引）、移除期（在经过至少一个次版本号的过渡期后才真正将旧 API 移除）。
 
-反射桥接是无字节码重写的，这意味着不需要 Agent、不需要 premain、不需要修改启动参数。Mili 通过纯反射访问 Minecraft 运行时类，显式且可追踪。这种方法牺牲了一点启动性能，换来了极高的可调试性与版本可移植性。对于每个反射访问点，桥接层维护一份声明，Loader 在启动时验证声明的字段与方法在目标 Minecraft 版本中确实存在，如果不存在则输出清晰的结构化错误信息而非抛出难以理解的 `NoSuchMethodError`。这份声明的维护工作集成在 CI 中，保证桥接层与目标 Minecraft 版本的持续同步。当 Minecraft 26.2.x 补丁发布时，这个 CI 流程会自动检测桥接声明是否仍然有效，失效点会在第一时间被修复或标记。
+反射桥接不依赖 Java Agent，也不需要 `-javaagent`/`premain` 或修改 JVM 启动参数：它对 Minecraft 内部类的访问全部经过 `org.loader.runtime.minecraft` 下的统一门面，访问点在启动时被校验存在性，失败会给出结构化错误而不是让 `NoSuchMethodError` 在运行期随机爆发。
+
+**但「无 Agent」不等于「无字节码改写」。** 平台确实会把部分 Mojang 类改写后再交给游戏
+（例如在 `MinecraftServer.tickServer` 的首尾注入 tick 回调、在客户端主界面 `init` 头部注入
+标题界面钩子、替换创造栏标签布局的取值），实现位于 `mili-runtime` 的
+`transform/engine` + `transform/asm`（ASM 9.9.1），由 `mili-loader` 的
+`ClassTransformInterceptor` 在 `MinecraftClassLoader` 的 `findClass` 阶段挂接。
+设计取舍与边界见 [ADR-0011](docs/decisions/0011-platform-owned-asm-transformation.md)
+和 [TRANSFORMATION_ENGINE.md](docs/design/TRANSFORMATION_ENGINE.md)。
+
+这条边界是有代价的：字节码改写天然脆弱于版本变更，因此平台把「改哪些类、改哪个方法、按什么描述符」
+全部收敛到符号表 `MiliSymbol`，并用真实 Minecraft jar 在 CI 上逐条校验坐标存在性 ——
+符号过期时构建立刻失败，而不是「转换器静默不注入、Mod 功能悄悄消失」。
 
 结构化并发通过 Scheduler 与 Scope 提供，替代了裸线程手动管理。每个异步任务的生命周期天然有界，取消传播确定，不会留下悬挂的线程或泄漏的资源。Capability 系统提供了声明式、可组合的访问控制，能力不匹配则拒绝而非静默失败。这一切的组合使得 Mili 平台的 Mod 比传统加载器上的 Mod 更易于推理其行为边界。结构化并发不是一个时髦的术语——它是 Mili 平台区别于其他加载器的最核心技术差异。当传统的 Mod 作者在 `CompletableFuture` 的取消传播链上苦苦挣扎时，Mili 开发者可以通过 Scope 的上下文取消机制优雅地终止任务链，无需关心线程级的中断状态传播。
 
@@ -95,19 +113,58 @@ ABI 优先是 Mili 最核心的设计决策。所有 Mod 只编译 `mili-abi`，
 
 每个 Mod 拥有独立的 ClassLoader，类的解析遵循父委托模型，但委托目标经过精心控制：ABI 接口由平台 ClassLoader 提供，Minecraft 类由集成层 ClassLoader 提供，而 Mod 自定义类由自身 ClassLoader 解析。Mod A 无法直接引用 Mod B 的类，除非通过 ABI 接口显式共享。这个模型避免了"classpath 污染"——那种在旧加载器上常见的、因为类被意外共享而导致静默崩溃的问题。ClassLoader 隔离的另一个好处是，当某个 Mod 存在严重 Bug 导致 JVM 崩溃时，Loader 可以通过崩溃前日志追溯具体的 Mod ID，而不是在混合堆栈中费力猜测。
 
-依赖声明在 Mod 元数据中完成，Loader 在构建依赖图时检测循环依赖并拒绝加载整个链。版本冲突解析采用最小版本选择（MVS），即在所有声明的需求版本中选择满足所有约束的最小版本。这个策略与 Gradle 自身一致，避免引入新的心智负担。可选依赖与强制依赖有明确区分：如果可选依赖不存在，Mod 加载流程不受影响，但运行时访问该依赖的能力时会收到空结果而非异常。
+依赖声明在 Mod 元数据中完成，Loader 在构建依赖图时检测循环依赖并拒绝加载整个链 ——
+排序与环检测由 `org.loader.runtime.util.DependencySorter`（三态 DFS）统一实现，
+所有入口（`ModDiscovery` / `ModManager` / `DependencyResolver`）共用同一套语义，
+环会被报成 `A -> B -> C -> A` 而不是被当成「已访问」。可选依赖（`required: false`）
+不参与排序，缺失时只告警。
+
+**版本冲突解析目前<b>没有</b>实现「最小版本选择」之类的求解器**：依赖条目里的
+`versionRange` 只支持精确匹配与 `*`（其余范围语法按「不校验」处理），
+版本不匹配会作为独立错误（与「缺失」「循环」分开）报告。多版本共存 →
+见下方「同一个 Mod 不能同时存在两个版本」的约束。
 
 ClassLoader 的命名空间规则确保 Mod 之间不会发生意外的类共享——两个不同的 Mod 即使声明了相同全限定名的类，也不会相互干扰，因为它们被独立的 ClassLoader 分别解析。唯一的例外是 ABI 接口类，它们由统一的平台 ClassLoader 提供，这是 ABI 优先设计的必然结果：所有 Mod 共享同一份 ABI 类定义。如果 ABI 接口发生变更（按照破坏性变更策略），所有依赖它的 Mod 需要重新编译——这正是 ABI 版本号语义所约束的范围。ClassLoader 隔离也带来了一些有趣的边缘情况：同一个 Mod 不能同时存在两个不同版本的实例，因为它们的 JAR 文件名相同会导致 Loader 拒绝扫描。如果某个 Mod 需要版本化的模块化能力（如一个"核心模块"和多个"功能模块"），它们应该共享同一个 Mod ID 并通过能力系统区分功能，而不是拆分出独立的 Mod JAR。
 
-热加载与热卸载在开发模式下由 Loader 的实验性功能支持——但这不意味着 Mod 可以无痛支持热替换。资源回收、事件注销与 ClassLoader 销毁的语义目前仍在积极讨论中，因此不建议在生产环境依赖热加载。开发模式下的热加载主要用于 UI 迭代、配置文件验证与轻量级逻辑调试，重度状态管理的场景每次仍然需要完整重启。Loader 的热加载 API 标记为 `@ExperimentalApi`，行为可能在次版本变更中发生不兼容调整。热加载的实现基于 ClassLoader 重新创建——旧 ClassLoader 中的状态不会迁移到新实例，因此这是一个"语义冷重启"而非"真正的热替换"。
+热加载与热卸载**目前没有实现**：仓库里既没有该功能的入口，也没有标记为实验性的 API。
+`ModClassLoader` 关闭后其 `URLClassLoader` 句柄会释放（这是 Mod JAR 能被删除/替换的前提），
+但「JVM 类卸载」并不因此保证发生 —— 只要还有强引用（静态字段、线程栈、缓存），类与其
+ClassLoader 就仍然可达。所以当前语义是「重新启动游戏」，不是热替换。
 
 ## 生命周期与调度
 
-Mod 的生命周期严格受 `Lifecycle` 状态机约束：加载（`LOADING`）、初始化（`INITIALIZING`）、活跃（`ACTIVE`）、中止（`SUSPENDED`）、卸载（`UNLOADED`）。状态转换不可逆，一旦进入 `UNLOADED` 即不可回退。这个模型确保了 Mod 不会进入半初始化状态而难以推理。每一个状态转换都会触发对应的生命周期事件，订阅这些事件的 Mod 可以在状态变更时执行自己的逻辑——例如当某个依赖 Mod 进入 `ACTIVE` 状态时，本 Mod 才开始它的网络初始化。监听器抛出的异常会捕获并记录，但不阻止状态转换的继续。状态机的不可逆性是一个核心约束：在 Mod 系统的语境下，"加载失败后重试"的状态机循环只会让问题被掩盖而非解决，因此 Loader 要求重试逻辑必须显式地经 `Lifecycle.unload()` 后再进入 `Lifecycle.load()`，即重新加载的语义是全新实例而非状态回溯。
+Mod 的生命周期由 `LifecycleState` 状态机约束，实际状态序列是：
+`DISCOVERED → RESOLVED → LOADED → INITIALIZED → REGISTERED → RUNNING → STOPPING → STOPPED`，
+失败路径进入 `FAILED`（终态）。状态转换不合法会直接抛 `IllegalStateException`
+（`Scope.transitionTo` 的 CAS + `canTransitionTo`），因此不存在「悄悄跳过某个阶段」。
+**没有 `SUSPENDED`/`resume()`**：任一 Mod 的入口加载或 `initialize()` 抛异常都会中止整个启动
+（`invokeModEntrypoints` 直接抛 `ModLoadError`，fail-fast），错误消息里带 Mod id、入口类名与错误码；
+恢复方式是修好 Mod 后重启实例。这是刻意的：把失败 Mod 隔离掉继续跑，会让「部分功能静默不生效」
+变成常态。每次转换都会通知 `ScopeListener`；监听器抛出的异常被隔离，不阻断转换本身。
 
-`Scheduler` 基于结构化并发设计——每个任务归属于一个 `Scope`，Scope 关闭时所有未完成任务自动取消。任务优先级通过 `TaskPriority` 控制，映射为线程优先级与超时策略。`TaskState` 提供等待、运行、完成、取消四种状态的查询，调用方可以据此做出决策而不需要轮询。超时配置通过 `Configurer` 在 Scope 创建时设定，后续不可更改；子 Scope 继承父 Scope 的超时配置但可以通过自己的配置进行覆盖。任务分组（`TaskGroup`）允许批量管理同一逻辑域下的任务，整个组的取消与状态查询都通过统一的 `GroupHandle` 完成。
+`Scheduler` 是 Runtime 内唯一的异步执行入口，其契约是明确且可测量的：
 
-不推荐使用 Java 原生的 `CompletableFuture` 提交长时间运行的任务——它们不受 Scope 控制，取消传播依赖显式的链式取消调用，极易导致任务泄漏。所有异步逻辑应当通过 `Scheduler.submit(Scope, Task)` 统一管理。如果一个第三方库返回 `CompletableFuture`，应当在收到结果后尽快通过 `Handle.adapt()` 将其桥接到 Scheduler 的管理框架中——桥接后，任务的取消状态会与 Scope 关联，但不保证原始 `CompletableFuture` 本身会被取消。这是结构化并发哲学的直接体现：任务的取消应该从外向内传播，而不是由内部任务自行决定如何响应取消。
+| 维度 | 行为 |
+|---|---|
+| 排序 | `TaskPriority` **值越大越先执行**；同优先级按提交顺序 FIFO |
+| 并发 | 常驻 `corePoolSize` 个线程，队列满时可扩到 `corePoolSize * 2` |
+| 队列 | 有界，默认 16384（`Scheduler.DEFAULT_QUEUE_CAPACITY`，可在构造期指定） |
+| 超限 | `submit` 抛 `SchedulerError`（显式失败，不静默丢弃、不在调用线程偷偷执行） |
+| 关闭后提交 | 抛 `IllegalStateException` |
+| 取消 | 未开始的任务从队列摘除；已开始的走协作取消（`future.cancel(true)`） |
+| 指标 | `metrics()` 暴露 `queueDepth/queueCapacity/remainingCapacity/rejected/active` 与等待/执行分位数 |
+
+`TaskPriority` **不映射**为线程优先级，也不触发超时策略 —— 它只决定出队顺序。
+周期任务（`submitRepeating`）由独立的守护计时器线程触发，不经过优先级队列，
+因此不受队列容量约束，`priority` 也不影响其执行顺序；`cancel()`、Scope 停止、
+Scheduler 关闭都会释放该计时器线程。
+
+**这个 Scheduler 不是并行 Tick 引擎。** Minecraft 的 tick 仍由单一驱动线程串行推进
+（`TickEngine` + `TickContract`），Scheduler 负责与 tick 解耦的异步工作及其生命周期，
+它不会把一次 tick 拆到多线程并行执行，也不改变游戏逻辑的线程亲和性。
+
+不推荐用 Java 原生 `CompletableFuture` 提交长时间运行的任务 —— 它们不受 Scope 控制，
+取消传播依赖显式链路，容易造成任务泄漏。所有异步逻辑应通过 `Scheduler.submit(...)` 管理。
 
 ## 事件传播
 
@@ -115,7 +172,7 @@ Mod 的生命周期严格受 `Lifecycle` 状态机约束：加载（`LOADING`）
 
 事件的类型安全在发布时被检验——`EventBus.publish(Event)` 保证只有匹配该事件类型的监听器会被调用。编译期泛型保证了发布方无法意外地发布错误类型的运行时对象。这对于 Mod 系统的健壮性至关重要——事件类型的错误往往在运行时才暴露，而此时已经造成了难以追溯的状态混乱。类型安全也带来了一个实际的好处：当 Loader 需要梳理事件监听链时，它可以基于泛型参数快速索引相关处理器，而不需要运行时类型检查。
 
-处理器抛出异常不会终止事件传播链——Loader 会捕获并记录异常，然后继续调用下一个处理器。但连续多处理器抛错会触发"频率熔断"。Loader 内部的维护窗口记录：每个事件类型上，每经过一百次事件传播，如果其中有超过十次处理器抛错，该事件类型会被临时送入"冷却期"三十秒。冷却期内仍接受发布但不调用任何处理器——所有抛错的日志仍正常输出，只是不触发用户代码。冷却期结束后自动恢复，若再次触发，冷却期加倍。这是防止"一个坏处理器拖垮整个事件链路"的防御策略，同时也在日志中输出详细的异常堆栈。
+处理器抛出异常不会终止事件传播链——Loader 会捕获并记录异常，然后继续调用下一个处理器。**当前没有**「按错误率熔断/冷却」的机制（仓库里不存在相关实现），因此一个持续抛错的处理器会持续产生日志，但不会拖垮整条链路的其它订阅者。事件系统同样没有优先级与冒泡：需要协调的两个 Mod 应通过 Capability 显式声明。
 
 ## 能力与权限
 
@@ -123,37 +180,60 @@ Mod 的生命周期严格受 `Lifecycle` 状态机约束：加载（`LOADING`）
 
 `Permission` 与 `PermissionManager` 构成运行时的第二层访问控制：加载期校验能力匹配，运行时校验具体操作权限。权限可以在 Mod 的配置文件中声明，默认配置对所有 Mod 开放常用权限，而对高危操作（如网络访问、文件系统写入）要求显式声明。管理员可以通过覆盖默认配置收紧权限策略。权限检查发生在 API 调用层面，Mod 无法绕过——所有敏感操作都通过 `PermissionManager` 的门面进入系统。权限的审计日志会记录每次拒绝与通过事件，可通过全局配置的审计级别调整详细程度。审计日志默认关闭，开启后会带来可感知的 I/O 开销——在生产环境中建议仅开启 `DENY` 级别的审计，关闭 `ALLOW` 级别的审计。
 
-能力匹配的语义基于"完全相等"而非"兼容或继承"——`CapabilityToken` 的比较使用引用相等性而非自定义比较器。这么设计的意图是让能力语义显式化：如果两个 Mod 希望它们的能力可互相替代，它们必须使用同一个 `CapabilityToken` 实例（通过共享 ABI 模块中的常量）或使用 `CapabilityToken.aliasOf()` 声明显式别名。没有隐式的继承推导——这避免了"看似兼容但行为微妙不同"的尴尬情况。
+能力匹配的语义基于"完全相等"而非"兼容或继承"——`CapabilityToken` 的比较使用引用相等性而非自定义比较器。这么设计的意图是让能力语义显式化：如果两个 Mod 希望它们的能力可互相替代，它们必须使用同一个 `CapabilityToken` 实例（通常来自共享 ABI 模块中的常量）。**没有别名/继承机制**（`aliasOf()` 不存在），也没有隐式推导 —— 这避免了"看似兼容但行为微妙不同"的尴尬情况。
 
 ## 资源管理
 
 `Resource` 与 `ResourceManager` 负责 Mod 的资产访问，包括配置文件、语言文件、数据资源与原生库。每个 Mod 通过 `ModContext.getResourceManager()` 获取自己的资源管理器，资源访问范围严格限定在 Mod 自身的 JAR 范围内。跨 Mod 的资源共享必须通过 ABI 接口暴露，不允许直接文件系统访问其他 Mod 的资产。这个设计约束了 Mod 系统的安全边界——一个 Mod 无法盗用另一个 Mod 的创意资产，也无法因为读取了错误的文件而静默加载错误的内容。
 
-资源加载遵循优先级规则：Mod 自身的资源优先，平台补丁次之，Minecraft 原生的最后。这个规则确保了 Mod 可以安全地覆盖任何级别的原生资源而不必担心循环依赖。资源解析在首次访问时惰性完成，而非在加载期一次性读取全部资源——这种惰性设计减少了启动开销，也让内存中的资源占用与实际使用量成正比。如果 Mod 的资源文件数量巨大（几千个以上的语言文件），惰性解析不是唯一的管理手段——ResourceManager 还提供了一个 `preload(String... paths)` 方法，允许 Mod 显式声明哪些资源应在加载期解析并在内存中缓存。
+资源加载遵循优先级规则：Mod 自身的资源优先，平台补丁次之，Minecraft 原生的最后。这个规则确保了 Mod 可以安全地覆盖任何级别的原生资源而不必担心循环依赖。资源解析在首次访问时惰性完成，而非在加载期一次性读取全部资源。**没有 `preload(...)` 这类预加载 API**：资源读取走 ClassLoader，每次打开流即读，平台不做整包缓存。
 
-资源监视器（`ResourceWatcher`）提供文件变更通知，允许开发者在开发模式下实现配置热重载。生产模式下该功能关闭，所有资源的生命周期与 Mod 同步——Mod 卸载时其资源监视器一并销毁，释放所有文件句柄。Watcher 的轮询间隔在开发模式下是每 500ms，可通过全局配置调整，但不得低于 100ms（低于这个阈值会导致文件系统层面的竞争条件）。
+**没有文件变更监视器**（`ResourceWatcher` 不存在）：资源与配置都在启动时读取，运行期不监听文件变化。需要改配置时重启游戏。
 
 ## 反射桥接层
 
-`mili-minecraft-integration` 是 Mili 与 Minecraft 26.2 之间的唯一边界。该模块通过反射访问 Minecraft 运行时类，将所有访问点显式声明在一个集中的清单文件中。Loader 在启动时验证这份清单——如果某个声明的字段或方法在目标 Minecraft 版本中存在但签名不匹配，Loader 会输出结构化错误信息并跳过该桥接点，而不是让整个客户端崩溃。清单文件作为代码而非资源整合在项目中，使得每一次声明变更都有对应的 Git 痕迹与 Code Review 记录。
+`mili-minecraft-integration` 是 Mili 与 Minecraft 26.2 之间的唯一边界。它通过
+`org.loader.runtime.minecraft.reflect.Reflect` 这一个门面访问游戏类：`Reflect.gameClass(...)`、
+`Reflect.method(owner, name, paramTypes...)`、`Reflect.staticField(...)` 等，解析结果缓存复用
+（`clearCaches()` 可整体失效）。
 
-反射方法句柄（`MethodHandle`）被缓存在类加载阶段，避免每次调用都执行反射查找。在安全前提下，通过 `setAccessible(true)` 移除访问检查以提升性能。所有反射操作都经过统一门面，任何未能按预期工作的访问点都会被记录并在启动报告中列出，便于桥接层的持续维护。门面层还处理了一个隐藏的问题：Minecraft 类中同名方法在不同 JVM 版本下可能有不同的调用约定（如静态方法与实例方法的字节码签名差异），门面层统一了访问入口，上层无需感知这些差异。
+**方法坐标不是「清单文件」，而是符号表代码 + CI 实测**：会被平台改写的目标方法的坐标集中在
+`mili-abi` 的 `org.loader.api.transform.symbol.MiliSymbol`；根构建的
+`verifyTransformationSymbols` 用真实 Minecraft jar 逐条比对 owner+name+descriptor
+（只比名字会命中重载，生成调错方法的字节码）。本地没有 `test_client/26.2.jar` 时该任务 SKIPPED，
+CI 上则必须通过。
 
-反射桥接层不包含任何逻辑代码——它只是一层薄的访问封装，真正的"做什么"决策由 Loader 或上层 Mod 完成。这种设计使得桥接层本身可以极薄且极快地维护，同时也使得它对 Minecraft 版本变化的适应性更强：当方法签名变化时，只需修改桥接层的声明文件，而不需要改动任何业务逻辑代码。当一个新的 Minecraft 补丁发布时（例如从 `26.2.0` 到 `26.2.1`），桥接层清单的维护工作通常集中在一两个小时内完成，不需要深入了解游戏本体的改动——修改聚焦于签名声明上的字段名、方法名与参数类型的变化。CI 系统会自动运行桥接层验证测试，确保修改后的声明与新的游戏客户端 JAR 匹配。
+**不会「输出错误信息并跳过桥接点」**：符号缺失是构建失败，转换器 `matches` 命中目标却找不到方法时
+抛 `TargetNotFoundException`。静默跳过会让「游戏照常跑、Mod 功能消失、日志无异常」，这是最坏的失效形态。
+
+反射门面不做业务决策 —— 它只负责「按坐标取到成员并调用」。当补丁导致签名变化时，修改集中在
+`MiliSymbol` 与各转换器的坐标常量上，业务逻辑不受影响。
 
 ## 错误与异常
 
-`MiliException` 是所有异常的基类。`ModLoadException` 表示加载期问题（类缺失、签名不匹配），`CapabilityException` 表示能力声明与消费之间的冲突，`ApiException` 表示运行时 API 调用错误。Loader 在启动阶段捕获所有异常并以结构化日志输出，包含堆栈链、受影响 Mod ID、建议修复方案。Mod 作者不应抛出 `MiliException` 的子类——它们应该通过返回值或回调表达错误，让 Loader 决定是否属于平台级错误。如果 Mod 未捕获的异常穿透了 Loader，Loader 会将该 Mod 转入 `SUSPENDED` 状态以隔离其影响范围。Loader 的 try-catch 边界位于每个 Mod 的生命周期回调处，因此一个 Mod 的回调抛错不会影响其他 Mod 的正常加载流程。这个隔离边界的设计经过了仔细的辩证：如果 Loader 捕获所有异常并忽略，会导致 Mod 作者误以为一切正常，而实际上部分 Mod 功能并未生效。因此 Loader 将异常信息传达给日志和 UI，但不向上抛出影响平台稳定性。
+`org.loader.api.exception.MiliException` 是契约层异常的基类。加载期错误统一用
+`org.loader.runtime.error.ModLoadError`（带 `errorCode()`，如 `MOD_PLATFORM_MISSING`、
+`MOD_DEPENDENCY_CYCLE`、`MOD_ENTRYPOINT_INVALID`、`MOD_ENTRYPOINT_FAILED`），
+运行时错误继承 `ModularRuntimeException`。
 
-当 Mod 抛出未受检异常时，Loader 将该 Mod 转入 `SUSPENDED` 状态，隔离其事件订阅与能力提供，但不会终止整个平台的运行。这个"隔离失败"的设计确保了单个 Mod 的崩溃不会拖垮整个客户端。SUSPENDED 状态的 Mod 在日志中会被所有潜在依赖方看到，从而避免依赖方陷入无限等待。隔离的范围包括：停止处理该 Mod 的事件、将其能力注册标记为不可达、取消所有由其 Scheduler 提交的任务、但不立即卸载其 ClassLoader（卸载仅在显式调用 `Lifecycle.unload()` 后执行）。这个设计带来了故障排查的便利性——开发者可以在 Mod 进入 SUSPENDED 后，通过日志查看异常堆栈链与上下文信息，同时也保留了通过 `Lifecycle.resume()` 重试恢复的可能性。
+**失败语义是 fail-fast，不是「隔离坏 Mod 继续跑」**：`LoaderMain.invokeModEntrypoints`
+在入口类缺失、未实现 `org.loader.api.Mod`、抽象类、构造或 `initialize()` 抛异常时，
+一律抛 `ModLoadError` 中止启动。错误消息包含 Mod id、入口类全名、错误码与原始异常 ——
+目标是让根因一眼可见，而不是让一个半初始化的 Mod 留在进程里。
 
-崩溃恢复策略取决于异常类型。对于可恢复的 `ApiException`，Loader 允许 Mod 通过 `Lifecycle.resume()` 重试初始化；对于不可恢复的 `ModLoadException`，Loader 会将该 Mod 标记为永久失败，直到重新安装或修复。永久失败的 Mod 在 UI 中会显示为明确的状态指示器，避免用户困惑于某个功能突然不可用的原因。恢复重试有次数限制——连续重试超过五次后，Loader 会认为该 Mod 存在根本性问题，建议完全卸载并等待作者修复。重试计数在每次成功加载后归零，这意味着一个偶发性失败不应导致 Mod 被永久标记——只有反复失败才触发硬限制。
+因此**没有 `SUSPENDED` 状态、没有 `resume()`、没有重试次数限制**：这些机制在代码里不存在。
+「一个 Mod 出错不影响其他 Mod」在 Mili 里不是靠运行时隔离实现的，而是靠启动期严格校验 +
+清晰的错误码，让问题在启动时就暴露、修好再启动。
 
-启动失败时 Loader 会生成一份结构化的启动报告（`startup-report.json`），内容包括所有已处理的 Mod、依赖图拓扑序、每个 Mod 的最终状态与加载耗时。这份报告在持续集成环境中被 Mili 维护者用于验证 Loader 本身的正确性，在用户端则被 Mod 开发者用于定位加载失败。报告格式版本化，当前版本为 `1.0`，与 `ABI_VERSION` 独立版本号。启动报告中还包含 Loader 自身的版本信息与环境摘要（Java 版本、操作系统、系统架构），这些信息对于跨环境问题复现有不可替代的价值。
+启动失败时没有 `startup-report.json`：诊断信息全部走日志 —— 控制台/`logs/latest.log` 里的 `[Mili]` 行，以及平台自有的 `logs/mili-platform.log`（含 ClassLoader 拓扑、重复类、被拒绝的访问）。安装器会写 `logs/install-report.json`（结构化 steps/issues），那是安装阶段的报告，不是启动报告。
 
 ## 版本策略
 
-版本锁定遵循严格三元组机制，三者必须一致：Loader 实现版本（`CURRENT_VERSION`）、ABI 契约版本（`ABI_VERSION`）、目标 Minecraft 版本（`TARGET_MINECRAFT`）。Loader 在加载每个 Mod 时会校验三元组，任一不匹配即拒绝并给出明确的错误提示。没有向后兼容的降级路径——版本锁定是安全的基石。一个声明与 `26.2` ABI 兼容的 Mili Loader 实例，不会因为某个 Mod 错误地声明了 `26.1` ABI 版本而对它放松检查。这种严格的版本锁定的另一面是它对早期开发状态的宽容：在 `0.x` 阶段，Loader 会自动将版本检查限制为忽略 patch 级别的差异，但这只是过渡期的政策——一旦进入 `1.0`，所有级别的差异都会被严格执行。
+版本锁定遵循严格三元组机制，三者必须一致：Loader 实现版本（`CURRENT_VERSION`）、ABI 契约版本（`ABI_VERSION`）、目标 Minecraft 版本（`TARGET_MINECRAFT`）。Loader 在加载每个 Mod 时会校验三元组，任一不匹配即拒绝并给出明确的错误码。
+
+**没有任何「0.x 阶段忽略 patch 差异」的宽容**：`ModManifest.validateVersionBinding()` 对三个字段
+逐字符/逐整数比较，`platform="0.1.0"` 与 `"0.1.1"` 视为不匹配；未声明 `mili` 对象的 Mod
+直接以 `MOD_PLATFORM_MISSING` 拒绝。这是当前唯一的行为，不存在隐藏的 dev/prod 分支。
 
 当前版本状态：
 
@@ -168,11 +248,18 @@ Mod 的生命周期严格受 `Lifecycle` 状态机约束：加载（`LOADING`）
 
 ## 详细文档
 
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — Runtime 内核与设计决策，包含 Scope、Scheduler、EventBus 的工作原理
+- [docs/architecture/CURRENT.md](docs/architecture/CURRENT.md) — 当前架构总览（Scope、Scheduler、EventBus 的实际形态）
 - [MOD_DEVELOPMENT.md](docs/MOD_DEVELOPMENT.md) — Mod 开发指南，包含入口点声明、元数据配置、依赖声明
-- [API_REFERENCE.md](docs/API_REFERENCE.md) — 完整 API 参考，包含所有公开接口与方法签名
+- [ABI.md](docs/ABI.md) — 契约接口清单（源码即参考：`mili-abi/src/main/java/org/loader/api/`）
 - [PLATFORM_VERSIONING.md](docs/PLATFORM_VERSIONING.md) — 版本策略与三元组锁定机制
 - [ABI.md](ABI.md) — ABI 契约与接口规范，明确哪些变更属于破坏性
+
+## 文档状态
+
+本文档在 26.2 修复轮次中按「只描述已验证行为」逐段核对过实现，并修正了多处与代码冲突的断言
+（模块数量、字节码改写、Scheduler 优先级/背压、事件熔断、资源监视器、`startup-report.json`、
+`SUSPENDED` 状态等）。核对过程、证据与尚未覆盖的部分见
+[docs/repair/MI_LOADER_REPAIR_REPORT.md](docs/repair/MI_LOADER_REPAIR_REPORT.md)。
 
 ## 许可证
 

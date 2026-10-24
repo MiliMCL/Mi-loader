@@ -20,8 +20,11 @@ import java.util.Map;
  *
  * <p>只读取 piston-meta 的公开清单，不涉及任何账号或认证端点。
  * 解析链：{@code version_manifest_v2.json} → 目标版本条目 → 版本 JSON。
+ *
+ * <p>实现 {@link MetaSource} 是为了让安装流程可以在离线测试中注入替身；
+ * 生产路径使用的仍然是本类。
  */
-public final class MojangMetaClient {
+public final class MojangMetaClient implements MetaSource {
 
     /** 官方版本清单。 */
     public static final String VERSION_MANIFEST =

@@ -91,6 +91,22 @@ class ModClassLoaderTest {
     }
 
     @Test
+    void modClassLoader_missingClassFailsWithClassNotFound() throws Exception {
+        // 缺失类必须是明确的 ClassNotFoundException，而不是被兜底成
+        // 「加载成功、运行期再炸」—— 后者会让报错点离根因很远。
+        MinecraftClassLoader game = newGameLoader();
+        ModManifest manifest = ModManifest.of("absent-mod", "AbsentMod", "1.0");
+
+        try (ModClassLoader mcl = new ModClassLoader(manifest, game, Path.of("."))) {
+            ClassNotFoundException e = assertThrows(ClassNotFoundException.class,
+                    () -> mcl.loadModClass("com.example.DefinitelyAbsent"));
+            assertTrue(e.getMessage().contains("com.example.DefinitelyAbsent")
+                            || e.getMessage().contains("DefinitelyAbsent"),
+                    e.getMessage());
+        }
+    }
+
+    @Test
     void modClassLoader_loadsAbiClassesFromParent() throws Exception {
         // ABI 必须对 Mod 可见（PARENT_FIRST）
         MinecraftClassLoader game = newGameLoader();

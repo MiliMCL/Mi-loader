@@ -104,7 +104,7 @@ public final class InstallerMain {
     private static void printSummary(InstallOrchestrator.Report r) {
         System.out.println();
         System.out.println("========================================");
-        System.out.println(" Mili 安装完成");
+        System.out.println(r.ok() ? " Mili 安装完成" : " Mili 安装失败（存在必需资源未就绪）");
         System.out.println("========================================");
         System.out.println(" Minecraft 版本 : " + r.versionId() + "  (Java " + r.javaRequired() + ")");
         System.out.println(" 平台         : " + r.platform());
@@ -124,6 +124,12 @@ public final class InstallerMain {
         }
         System.out.println(" 目录总大小   : "
                 + Progress.humanBytes(r.totalBytes()));
+        if (!r.failures().isEmpty()) {
+            System.out.println(" 失败         : " + r.failures().size() + " 项（安装不可用）");
+            for (var f : r.failures()) {
+                System.out.println("   ! " + f.describe());
+            }
+        }
         if (!r.warnings().isEmpty()) {
             System.out.println(" 警告         : " + r.warnings().size() + " 条");
             for (String w : r.warnings()) {
@@ -131,7 +137,11 @@ public final class InstallerMain {
             }
         }
         System.out.println("========================================");
-        System.out.println("接下来运行加载器启动 Minecraft，登录使用你的正版账号。");
+        if (r.ok()) {
+            System.out.println("接下来运行加载器启动 Minecraft，登录使用你的正版账号。");
+        } else {
+            System.out.println("安装未完成：请修复上述失败项后重试（重跑会补齐缺失部分）。");
+        }
         System.out.println("========================================");
     }
 

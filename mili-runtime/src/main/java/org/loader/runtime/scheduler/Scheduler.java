@@ -15,8 +15,41 @@ import java.util.concurrent.atomic.AtomicReference;
  * <p>
  * Mods must not create unmanaged background execution for ordinary Runtime work.
  * All async tasks must pass through the Scheduler.
+ *
+ * <h2>排队与拒绝契约（可测量，不是「大概有背压」）</h2>
+ *
+ * <pre>
+ *   容量      queueCapacity（默认 {@value #DEFAULT_QUEUE_CAPACITY}，构造时可指定）
+ *   排序      TaskPriority 升序；同优先级按 createdAtNanos 先进先出
+ *   线程数    corePoolSize 常驻，饱和时最多扩到 corePoolSize * 2
+ *   超限      ThreadPoolExecutor 拒绝 → submit() 抛 SchedulerError（显式失败，绝不静默丢弃）
+ *   关闭后    submit() 抛 IllegalStateException
+ *   取消      未开始的任务从队列移除；已开始的走协作取消
+ *   指标      metrics().queueDepth()/remainingCapacity()/rejected()/active()
+ * </pre>
+ *
+ * <p><b>为什么必须是有界队列</b>：无界队列下 {@code ThreadPoolExecutor}
+ * 永远不会调用拒绝策略 —— 线程数停在 corePoolSize，队列无限增长，
+ * 延迟无上限地变大，最后 OOM。历史上这里配了
+ * {@code CallerRunsPolicy} 并注释「队列无界，改用调用者执行以施加背压」，
+ * 但无界队列根本不会触发拒绝，那段策略是一行永远不会执行的代码。
+ * 有界队列 + 显式拒绝才是真的背压：调用方立刻知道「系统撑不住了」。
+ *
+ * <p><b>这个 Scheduler 不是并行 Tick 引擎</b>：Minecraft 的 tick 仍由单一
+ * 驱动线程串行推进（见 {@code TickEngine}）。Scheduler 负责的是
+ * <i>与 tick 解耦的异步工作</i>及其生命周期管理，它不会把一次 tick 拆到
+ * 多线程并行执行，也不改变游戏逻辑的线程亲和性。
  */
 public class Scheduler implements org.loader.runtime.kernel.Resource {
+
+    /**
+     * 默认队列容量。
+     *
+     * <p>取值远高于正常帧内提交量（每 tick 通常是几十个任务），
+     * 因此正常游戏不会碰到上限；它拦的是「持续堆积」这种真正的异常。
+     * 单条 {@code ScheduledTask} 约百字节，满队列约 1.6MB，可以接受。
+     */
+    public static final int DEFAULT_QUEUE_CAPACITY = 16_384;
 
     private final String id;
     private final Scope owner;
@@ -33,6 +66,9 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
     private final AtomicLong completedTasks = new AtomicLong(0);
     private final AtomicLong failedTasks = new AtomicLong(0);
     private final AtomicLong cancelledTasks = new AtomicLong(0);
+    private final AtomicLong rejectedTasks = new AtomicLong(0);
+    /** 正在执行的线程数。不能用 taskMap 大小推算 —— 见 run() 里的清理。 */
+    private final AtomicLong activeTasks = new AtomicLong(0);
     private final AtomicLong totalExecutionTime = new AtomicLong(0);
 
     // Sample collectors for percentile metrics (bounded to prevent memory leaks)
@@ -45,13 +81,30 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
             ConcurrentHashMap.newKeySet();
 
     public Scheduler(String id, Scope owner, int corePoolSize) {
+        this(id, owner, corePoolSize, DEFAULT_QUEUE_CAPACITY);
+    }
+
+    /**
+     * @param corePoolSize  常驻工作线程数
+     * @param queueCapacity 队列容量，必须 &gt; 0；超出后 submit 显式失败
+     */
+    public Scheduler(String id, Scope owner, int corePoolSize, int queueCapacity) {
+        if (queueCapacity <= 0) {
+            throw new IllegalArgumentException("queueCapacity 必须 > 0，实际: " + queueCapacity);
+        }
         this.id = Objects.requireNonNull(id);
         this.owner = Objects.requireNonNull(owner);
         this.taskQueue = new PriorityWorkQueue(
-                // 优先级值越小越优先，因此用升序比较器
-                Comparator.comparingInt((ScheduledTask t) -> t.priority().value())
-                        // 同优先级按提交顺序（先到先执行），保证公平与可预测
-                        .thenComparingLong(ScheduledTask::createdAtNanos)
+                // TaskPriority 的公开语义是「值越大优先级越高」（ABI 与 runtime
+                // 两个枚举的 javadoc 都这么写），所以必须**降序**排列。
+                // 历史实现按升序比较，于是 LOW(0) 先于 CRITICAL(20) 执行 ——
+                // 优先级完全反了，且没有任何测试覆盖到执行顺序。
+                Comparator.<ScheduledTask>comparingInt((ScheduledTask t) -> t.priority().value())
+                        .reversed()
+                        // 同优先级按提交顺序（先到先执行），保证公平与可预测。
+                        // 注意 thenComparing 链在 reversed() 之后，次级键不受影响。
+                        .thenComparingLong(ScheduledTask::createdAtNanos),
+                queueCapacity
         );
         this.executor = new ThreadPoolExecutor(
                 corePoolSize, corePoolSize * 2,
@@ -62,8 +115,9 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
                     t.setDaemon(true);
                     return t;
                 },
-                // 队列无界，CallerRuns 不会因拒绝而丢弃任务；改为在调用线程执行以施加背压
-                new ThreadPoolExecutor.CallerRunsPolicy()
+                // 队列有界，因此这里真的会被触发：submit() 把它转成 SchedulerError，
+                // 让调用方立刻知道系统饱和，而不是把任务悄悄丢进一个无底洞。
+                new ThreadPoolExecutor.AbortPolicy()
         );
         startDispatcher();
     }
@@ -126,9 +180,13 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
             taskMap.remove(taskId);
             state.set(TaskState.CANCELLED);
             future.cancel(false);
+            rejectedTasks.incrementAndGet();
             throw new org.loader.runtime.error.SchedulerError(
                     "线程池拒绝任务: " + taskId
-                            + "（executor=" + (closed.get() ? "已关闭" : "饱和") + "）",
+                            + "（" + (closed.get()
+                                    ? "executor 已关闭"
+                                    : "队列已满 " + taskQueue.size() + "/" + taskQueue.capacity())
+                            + "）",
                     org.loader.runtime.error.ErrorContext.builder("scheduler")
                             .owner(id)
                             .operation("submit")
@@ -157,6 +215,16 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
      * Submits a task that repeats at a fixed interval.
      * The task re-schedules itself after each run until cancelled.
      *
+     * <p><b>与队列的关系</b>：周期任务由独立计时器线程触发，<b>不经过</b>
+     * 优先级队列，因此不受 queueCapacity 限制，{@code priority} 也只
+     * 记录在 handle 上、不参与执行顺序（work 直接跑在计时器线程上）。
+     * 这是当前实现的已知边界，写在这里以免被误读成「周期任务也有背压」。
+     *
+     * <p><b>终止语义</b>：cancel()、scope 停止、scheduler 关闭、计时器被关闭
+     * 这四种情况都会让计时器线程被释放，并把 future 正常完成 —— 否则
+     * 一个已停止 Scope 的周期任务会永久占住一个线程（无池化，一任务一线程），
+     * 等待 future 的调用方也会挂死。
+     *
      * @param scope    the scope that owns the task
      * @param work     the work to execute each tick
      * @param delayMs  initial delay in ms before first execution
@@ -182,12 +250,16 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
 
         java.util.concurrent.atomic.AtomicBoolean cancelled = new AtomicBoolean(false);
         java.util.concurrent.ScheduledFuture<?>[] handleRef = new java.util.concurrent.ScheduledFuture<?>[1];
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        java.util.concurrent.atomic.AtomicReference<TaskState> stateRef =
+                new java.util.concurrent.atomic.AtomicReference<>(TaskState.RUNNING);
 
         Runnable tick = new Runnable() {
             @Override
             public void run() {
                 if (cancelled.get() || scope.isStopped() || closed.get()) {
-                    return; // 到此终止，计时器线程随之退出
+                    terminate();
+                    return;
                 }
                 try {
                     work.run();
@@ -198,34 +270,52 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
                     try {
                         handleRef[0] = timer.schedule(this, period, TimeUnit.MILLISECONDS);
                     } catch (java.util.concurrent.RejectedExecutionException ignored) {
-                        // 关闭竞态：忽略
+                        terminate();
                     }
+                } else {
+                    terminate();
                 }
             }
+
+            /**
+             * 释放计时器线程。{@code newSingleThreadScheduledExecutor} 的核心线程
+             * 不会自行超时退出，不关就是泄漏。
+             */
+            private void terminate() {
+                timer.shutdownNow();
+                synchronized (repeatingTimers) {
+                    repeatingTimers.remove(timer);
+                }
+                stateRef.compareAndSet(TaskState.RUNNING, TaskState.COMPLETED);
+                future.complete(null);
+            }
         };
+
+        // 必须在 schedule 之前登记：tick 可能在登记前就因 scope 停止而
+        // terminate()，那时它会从集合里移除自己，后登记就会留下一个死引用。
+        synchronized (repeatingTimers) {
+            repeatingTimers.add(timer);
+        }
 
         try {
             long initial = delay > 0 ? delay : period;
             handleRef[0] = timer.schedule(tick, initial, TimeUnit.MILLISECONDS);
         } catch (java.util.concurrent.RejectedExecutionException e) {
             timer.shutdownNow();
+            synchronized (repeatingTimers) {
+                repeatingTimers.remove(timer);
+            }
             throw new org.loader.runtime.error.SchedulerError(
                     "周期任务调度失败", 
                     org.loader.runtime.error.ErrorContext.builder("scheduler")
                             .owner(id).operation("submitRepeating").build(), e);
         }
 
-        // 关闭时一并清理计时器
-        synchronized (repeatingTimers) {
-            repeatingTimers.add(timer);
-        }
-
-        CompletableFuture<Void> future = new CompletableFuture<>();
         return new TaskHandleImpl(
                 id + "-repeating-" + taskCounter.incrementAndGet(),
-                scope, TaskState.QUEUED, priority, future,
-                new AtomicReference<>(TaskState.RUNNING), () -> {
+                scope, TaskState.RUNNING, priority, future, stateRef, () -> {
                     cancelled.set(true);
+                    stateRef.set(TaskState.CANCELLED);
                     java.util.concurrent.ScheduledFuture<?> h = handleRef[0];
                     if (h != null) {
                         h.cancel(false);
@@ -234,7 +324,10 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
                     synchronized (repeatingTimers) {
                         repeatingTimers.remove(timer);
                     }
-                    future.complete(null);
+                    // 注意：这里**不能** future.complete(null)。
+                    // TaskHandleImpl.cancel() 紧接着会 future.cancel(true)，
+                    // 若 future 已被正常完成，那次 cancel 返回 false ——
+                    // 于是「取消成功」却报告失败。
                 });
     }
 
@@ -255,29 +348,51 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
 
     /**
      * Cancels a task by handle.
+     *
+     * <p>取消语义由句柄自身持有（队列任务走「出队 + 状态 CAS」，
+     * 周期任务走「停计时器」）。历史上这里先查 {@code taskMap}，而周期任务
+     * 从不进 {@code taskMap} —— 于是 {@code scheduler.cancel(周期任务)} 永远
+     * 返回 false，调用方以为没取消成功。
      */
     public boolean cancel(TaskHandle handle) {
-        ScheduledTask task = taskMap.get(handle.taskId());
-        if (task == null) {
-            return false;
-        }
+        Objects.requireNonNull(handle, "handle must not be null");
         return handle.cancel();
     }
 
     /**
      * Cancels all tasks owned by a scope.
+     *
+     * <p>必须真正把任务从队列里摘掉：只把状态标成 CANCELLED 而留在队列中，
+     * 会让「已取消」的任务继续占着容量（进而触发队列满拒绝），
+     * 等待它们的 future 也会一直挂到被出队为止。
      */
     public void cancelAll(Scope scope) {
-        taskMap.values().stream()
-                .filter(t -> t.ownerScope().equals(scope))
-                .forEach(t -> new TaskHandleImpl(
-                        t.taskId(), t.ownerScope(), t.state().get(),
-                        t.priority(), t.future(), t.state(), () -> {}
-                ).cancel());
+        Objects.requireNonNull(scope, "scope must not be null");
+        for (ScheduledTask task : taskMap.values()) {
+            if (!task.ownerScope().equals(scope)) {
+                continue;
+            }
+            TaskState current = task.state().get();
+            if (current == TaskState.QUEUED || current == TaskState.CREATED) {
+                if (task.state().compareAndSet(current, TaskState.CANCELLED)) {
+                    taskQueue.remove(task);
+                    task.future().cancel(true);
+                    cancelledTasks.incrementAndGet();
+                    taskMap.remove(task.taskId());
+                }
+            } else if (current == TaskState.RUNNING) {
+                // 已开始执行：只能协作取消（中断标志交给任务自己处理）
+                task.future().cancel(true);
+            }
+        }
     }
 
     /**
      * Returns current scheduler metrics.
+     *
+     * <p>{@code active} 是「正在执行」的计数，不是 {@code taskMap} 大小推算出来的
+     * —— 已完成的任务会从 {@code taskMap} 中移除（否则长跑游戏每秒泄漏若干条），
+     * 用集合大小做差会得到负数。
      */
     public SchedulerMetrics metrics() {
         return new SchedulerMetrics(
@@ -285,7 +400,11 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
                 completedTasks.get(),
                 failedTasks.get(),
                 cancelledTasks.get(),
-                taskMap.size() - completedTasks.get() - failedTasks.get() - cancelledTasks.get(),
+                rejectedTasks.get(),
+                activeTasks.get(),
+                taskQueue.size(),
+                taskQueue.capacity(),
+                taskQueue.remainingCapacity(),
                 totalExecutionTime.get(),
                 percentile(waitTimeSamples, 50) / 1_000_000.0,
                 percentile(waitTimeSamples, 95) / 1_000_000.0,
@@ -315,6 +434,7 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
             for (ScheduledTask t : taskQueue.drainAll()) {
                 t.state().set(TaskState.CANCELLED);
                 t.future().cancel(true);
+                taskMap.remove(t.taskId());
             }
 
             // 清理重复任务的计时器线程
@@ -323,13 +443,10 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
             }
             repeatingTimers.clear();
 
-            // Try to cancel running tasks
-            taskMap.values().stream()
-                    .filter(t -> t.state().get() == TaskState.RUNNING)
-                    .forEach(t -> new TaskHandleImpl(
-                            t.taskId(), t.ownerScope(), t.state().get(),
-                            t.priority(), t.future(), t.state(), () -> {}
-                    ).cancel());
+            // 正在执行的任务：置终态并取消 future（协作式，只能通知不能强杀）
+            for (ScheduledTask t : taskMap.values()) {
+                t.future().cancel(true);
+            }
 
             executor.shutdown();
             try {
@@ -357,9 +474,18 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
         private final java.util.concurrent.PriorityBlockingQueue<ScheduledTask> delegate;
         /** 正在执行的任务，用于移除时按 ScheduledTask 定位。 */
         private final java.util.Set<ScheduledTask> pending = ConcurrentHashMap.newKeySet();
+        /** 容量上限。{@code PriorityBlockingQueue} 本身无界，必须自己把关。 */
+        private final int capacity;
+        /** size 判定 + 插入必须原子，否则并发下会超出上限。 */
+        private final Object capacityLock = new Object();
 
-        PriorityWorkQueue(Comparator<ScheduledTask> comparator) {
+        PriorityWorkQueue(Comparator<ScheduledTask> comparator, int capacity) {
             this.delegate = new java.util.concurrent.PriorityBlockingQueue<>(256, comparator);
+            this.capacity = capacity;
+        }
+
+        int capacity() {
+            return capacity;
         }
 
         private static ScheduledTask unwrap(Runnable r) {
@@ -378,13 +504,12 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
         }
 
         /**
-         * 非平台任务（理论上只有 ThreadPoolExecutor 内部的 FutureTask，
-         * 但不应依赖这个假设）用「队尾优先级」包装后接收，而不是拒绝。
+         * 入队。返回 {@code false} 表示<b>队列已满</b> —— 这不是错误，
+         * 而是让 {@code ThreadPoolExecutor} 有机会扩容或显式拒绝。
          *
-         * <p><b>为什么不能返回 false</b>：{@code offer} 返回 false 会让
-         * {@code ThreadPoolExecutor} 认为队列已满，触发 {@code CallerRunsPolicy}；
-         * 而 {@code put} 返回 false 则是直接抛异常。两种结果都是任务被静默
-         * 丢弃或行为异常 —— 队列应该「永远接得住」，排序是次要问题。
+         * <p>历史实现无条件返回 {@code true}（并注释「队列应该永远接得住」），
+         * 配合无界队列的结果是：线程数永远停在 corePoolSize，队列无限增长，
+         * 拒绝策略形同虚设，任务延迟无上限地变大直到 OOM。
          */
         @Override
         public boolean offer(Runnable r) {
@@ -395,8 +520,16 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
             if (st == null) {
                 st = ScheduledTask.foreign(r);
             }
-            pending.add(st);
-            return delegate.offer(st);
+            synchronized (capacityLock) {
+                if (delegate.size() >= capacity) {
+                    return false;
+                }
+                boolean added = delegate.offer(st);
+                if (added) {
+                    pending.add(st);
+                }
+                return added;
+            }
         }
 
         // BlockingQueue 的两个额外插入方法。AbstractQueue 只要求 offer(E)，
@@ -407,9 +540,18 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
             return offer(r);
         }
 
+        /**
+         * 满队列时 {@code put} 必须抛异常而不是永久阻塞。
+         *
+         * <p>{@code ThreadPoolExecutor} 不会调用 {@code put}，但外部若把它当
+         * 普通 BlockingQueue 使用，静默阻塞一个游戏线程是不可接受的。
+         */
         @Override
         public void put(Runnable r) throws InterruptedException {
-            offer(r);
+            if (!offer(r)) {
+                throw new IllegalStateException(
+                        "Scheduler 队列已满（容量 " + capacity + "），拒绝阻塞等待: " + r);
+            }
         }
 
         @Override
@@ -486,7 +628,7 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
 
         @Override
         public int remainingCapacity() {
-            return Integer.MAX_VALUE;
+            return Math.max(0, capacity - delegate.size());
         }
 
         @Override
@@ -604,6 +746,7 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
                 return;
             }
 
+            scheduler.activeTasks.incrementAndGet();
             long startTime = System.nanoTime();
             try {
                 scheduler.addSample(scheduler.waitTimeSamples, startTime - createdAtNanos);
@@ -633,19 +776,37 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
                 long execNanos = System.nanoTime() - startTime;
                 scheduler.totalExecutionTime.addAndGet(execNanos);
                 scheduler.addSample(scheduler.executionTimeSamples, execNanos);
+                scheduler.activeTasks.decrementAndGet();
+                // 终态任务不再需要句柄索引。不移除的话，每个生命周期执行过的
+                // 任务都会常驻 taskMap —— 一个跑几小时的服务端实例会稳定泄漏。
+                scheduler.taskMap.remove(taskId);
             }
         }
     }
 
     /**
      * Snapshot of scheduler metrics.
+     *
+     * @param submitted           提交总数
+     * @param completed           成功完成数
+     * @param failed              抛异常数
+     * @param cancelled           取消数（含关闭时被清理的）
+     * @param rejected            因队列满/关闭被拒绝的提交数
+     * @param active              当前正在执行的线程数
+     * @param queueDepth          当前队列深度
+     * @param queueCapacity       队列容量上限
+     * @param remainingCapacity   队列剩余容量
      */
     public record SchedulerMetrics(
             long submitted,
             long completed,
             long failed,
             long cancelled,
+            long rejected,
             long active,
+            int queueDepth,
+            int queueCapacity,
+            int remainingCapacity,
             long totalExecutionTimeNanos,
             double p50WaitMs,
             double p95WaitMs,

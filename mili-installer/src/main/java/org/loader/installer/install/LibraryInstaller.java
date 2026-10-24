@@ -41,12 +41,40 @@ public final class LibraryInstaller {
         this.progress = progress;
     }
 
-    /** 统计结果，供报告使用。 */
-    public record Result(int applied, int skippedByRule, int nativeArchives, List<String> warnings) {
+    /**
+     * 统计结果，供报告使用。
+     *
+     * <p>{@code issues} 是结构化结果：{@link InstallIssue.Severity#ERROR} 表示
+     * 该库（必需资源）安装失败，调用方必须据此把整体安装判为失败。
+     * {@link #warnings()} 仅供展示，不得参与成功判定。
+     */
+    public record Result(int applied, int skippedByRule, int nativeArchives,
+                         List<InstallIssue> issues) {
+
+        public Result {
+            issues = List.copyOf(issues);
+        }
+
+        public boolean hasFailures() {
+            return issues.stream().anyMatch(InstallIssue::isError);
+        }
+
+        /** 警告文本（展示用）。 */
+        public List<String> warnings() {
+            return issues.stream()
+                    .filter(i -> i.severity() == InstallIssue.Severity.WARNING)
+                    .map(InstallIssue::describe)
+                    .toList();
+        }
     }
 
     /**
      * 安装所有适用于本机的库。
+     *
+     * <p><b>失败语义</b>：Mojang 元数据里的 libraries 没有「可选」概念 ——
+     * 凡是被 rules 判定适用于本机的条目都是启动所必需的。因此任意一项下载、
+     * 校验或 native 解压失败都会记为 {@link InstallIssue.Severity#ERROR}，
+     * 由 {@link InstallOrchestrator} 汇总为整体失败。
      *
      * @param meta     版本元数据
      * @param gameDir  游戏目录（其下创建 libraries/ 与 natives/）
@@ -60,7 +88,7 @@ public final class LibraryInstaller {
         int applied = 0;
         int skippedByRule = 0;
         int nativeArchives = 0;
-        List<String> warnings = new ArrayList<>();
+        List<InstallIssue> issues = new ArrayList<>();
 
         int index = 0;
         for (VersionMeta.Library lib : meta.libraries()) {
@@ -71,43 +99,65 @@ public final class LibraryInstaller {
                 continue;
             }
 
-            try {
-                if (lib.hasMainArtifact() && lib.artifactPath() != null) {
-                    Path target = librariesDir.resolve(lib.artifactPath()).normalize();
-                    if (!target.startsWith(librariesDir)) {
-                        warnings.add("Refused path traversal in library path: " + lib.artifactPath());
-                    } else {
-                        downloader.download(target, lib.artifactUrl(), lib.artifactSha1());
-                        applied++;
-                    }
-                }
+            if (lib.hasMainArtifact() && lib.artifactPath() == null) {
+                // 元数据自相矛盾：声明了 artifact 却没有 path。静默跳过会让
+                // 「库里少一个 jar」在运行时才炸，且报错与根因无关。
+                issues.add(InstallIssue.error(InstallIssue.Stage.LIBRARY, lib.name(),
+                        "元数据声明了 artifact 但缺少 path，无法安装"));
+                continue;
+            }
 
-                Set<String> nativeKeys = PlatformRules.nativeClassifierKeys(lib.classifiers());
-                for (String key : nativeKeys) {
-                    Map<String, Object> entry = lib.classifiers().get(key);
-                    if (entry == null) {
-                        continue;
-                    }
-                    String url = asString(entry.get("url"));
-                    String sha1 = asString(entry.get("sha1"));
-                    if (url == null) {
-                        continue;
-                    }
-                    Path cacheDir = gameDir.resolve("natives").resolve(".cache");
-                    Path archive = cacheDir.resolve(key + "-" + lib.name() + ".jar");
-                    downloader.download(archive, url, sha1);
-                    extractNatives(archive, nativesDir, warnings);
-                    nativeArchives++;
+            if (lib.hasMainArtifact() && lib.artifactPath() != null) {
+                Path target = librariesDir.resolve(lib.artifactPath()).normalize();
+                if (!target.startsWith(librariesDir)) {
+                    issues.add(InstallIssue.error(InstallIssue.Stage.LIBRARY, lib.name(),
+                            "拒绝路径穿越: " + lib.artifactPath()));
+                    continue;
                 }
-            } catch (IOException e) {
-                warnings.add("Failed to install library '" + lib.name() + "': " + e.getMessage());
+                try {
+                    downloader.download(target, lib.artifactUrl(), lib.artifactSha1());
+                    applied++;
+                } catch (IOException e) {
+                    issues.add(InstallIssue.error(InstallIssue.Stage.LIBRARY, lib.name(),
+                            "下载或校验失败: " + e.getMessage(), e));
+                    continue;
+                }
+            }
+
+            Set<String> nativeKeys = PlatformRules.nativeClassifierKeys(lib.classifiers());
+            for (String key : nativeKeys) {
+                Map<String, Object> entry = lib.classifiers().get(key);
+                if (entry == null) {
+                    continue;
+                }
+                String url = asString(entry.get("url"));
+                String sha1 = asString(entry.get("sha1"));
+                if (url == null) {
+                    continue;
+                }
+                Path cacheDir = gameDir.resolve("natives").resolve(".cache");
+                Path archive = cacheDir.resolve(key + "-" + lib.name() + ".jar");
+                try {
+                    downloader.download(archive, url, sha1);
+                } catch (IOException e) {
+                    issues.add(InstallIssue.error(InstallIssue.Stage.NATIVE, lib.name() + ":" + key,
+                            "native 包下载或校验失败: " + e.getMessage(), e));
+                    continue;
+                }
+                try {
+                    extractNatives(archive, nativesDir, issues, lib.name());
+                    nativeArchives++;
+                } catch (IOException e) {
+                    issues.add(InstallIssue.error(InstallIssue.Stage.NATIVE, lib.name() + ":" + key,
+                            "native 解压失败: " + e.getMessage(), e));
+                }
             }
         }
 
         // native 缓存只是中转，解压完即可删除，避免双份占用磁盘。
         deleteRecursivelyQuietly(nativesDir.resolve(".cache"));
 
-        return new Result(applied, skippedByRule, nativeArchives, List.copyOf(warnings));
+        return new Result(applied, skippedByRule, nativeArchives, issues);
     }
 
     /**
@@ -116,7 +166,8 @@ public final class LibraryInstaller {
      * <p>只抽取真正的共享库与必要的 META-INF 版本化变体，跳过 {@code .SF}/
      * {@code .DSA} 签名文件（解压出来的签名必然校验失败，反而污染 classpath）。
      */
-    private void extractNatives(Path archive, Path nativesDir, List<String> warnings) throws IOException {
+    private void extractNatives(Path archive, Path nativesDir, List<InstallIssue> issues,
+                                String libraryName) throws IOException {
         String osDir = PlatformRules.currentOsName();
         Path outRoot = nativesDir.resolve(osDir);
         Files.createDirectories(outRoot);
@@ -134,7 +185,8 @@ public final class LibraryInstaller {
                 }
                 Path out = outRoot.resolve(stripLeading(name)).normalize();
                 if (!out.startsWith(outRoot)) {
-                    warnings.add("Refused path traversal in native entry: " + name);
+                    issues.add(InstallIssue.error(InstallIssue.Stage.NATIVE,
+                            libraryName + "!" + name, "native 条目路径穿越，已拒绝"));
                     continue;
                 }
                 Files.createDirectories(out.getParent());

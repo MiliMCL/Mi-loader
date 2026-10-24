@@ -185,10 +185,17 @@ Scheduler 负责**跨 tick 的异步工作**，TickEngine 负责**单次 tick �
 两者在阶段屏障处收敛：`ASYNC_COMPLETION` 阶段的
 `awaitAllTasks` 是异步工作必须落地的位置。
 
-Scheduler 已修复的两个真实缺陷（见 CURRENT.md）：
+Scheduler 已修复的真实缺陷（见 CURRENT.md）：
 
 1. 优先级被 FIFO 线程池抹平 → 现按优先级出队
-2. `submitRepeating` 用 `Thread.sleep` 占池线程 → 现用独立计时器
+2. **优先级比较器方向写反** → 曾按升序比较，`LOW(0)` 反而先于 `CRITICAL(20)` 执行；
+   现按 `TaskPriority.value()` 降序（两个枚举的 javadoc 都写的是"值越大优先级越高"）
+3. `submitRepeating` 用 `Thread.sleep` 占池线程 → 现用独立计时器
+4. 队列无界导致 `CallerRunsPolicy` 形同虚设 → 现有界队列 + 显式 `SchedulerError`
+
+**Scheduler 不是并行 Tick 引擎。** 它不会把一次 tick 拆到多线程并行执行，
+也不改变游戏逻辑的线程亲和性；tick 仍由单一驱动线程串行推进（见上文的不变量）。
+把「有线程池」理解成「tick 已并行化」是这条边界上最容易犯的错。
 
 ---
 

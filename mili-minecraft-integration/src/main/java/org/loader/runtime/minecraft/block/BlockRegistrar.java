@@ -435,6 +435,20 @@ public final class BlockRegistrar {
      */
     public static void initModdedBlockStates() {
         try {
+            // 【不要在这里调 ensureRegistriesReadable()】
+            // [registry-exempt: 窗口已关闭，无法开窗]
+            //
+            // 本方法唯一的调用者是 BootstrapGate.ensureBootstrapped()，它在
+            // RegistrationPhase.closeRegistryWindow() 【之后】调用本方法
+            // （见 BootstrapGate 中 closeRegistryWindow 紧跟的那一行）。
+            // 此时 windowClosed=true，ensureRegistriesReadable() 内部走
+            // openRegistryWindow()，会直接抛
+            // "The registration window is already closed" —— 与
+            // drainUnregisteredBlocks() 遇到的约束完全相同。
+            //
+            // 此刻注册表类必然已初始化完毕：窗口能开就说明
+            // isBootstrapped 标志已置、BuiltInRegistries 已被触碰过，
+            // 因此这里读静态字段不存在「首次触碰失败 → 类被永久毒化」的风险。
             Object blockRegistry = Reflect.staticField(
                     BUILTIN_REGISTRIES_CLASS, "BLOCK");
             Object stateRegistry = Reflect.staticField(
