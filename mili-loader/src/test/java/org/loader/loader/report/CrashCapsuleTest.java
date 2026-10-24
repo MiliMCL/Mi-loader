@@ -32,7 +32,8 @@ class CrashCapsuleTest {
         assertTrue(Files.exists(r.zipPath()));
 
         try (ZipFile zip = new ZipFile(r.zipPath().toFile())) {
-            var names = zip.entries().asList().stream().map(ZipEntry::getName).toList();
+            var names = java.util.Collections.list(zip.entries()).stream()
+                    .map(ZipEntry::getName).toList();
             assertTrue(names.contains("startup-report.json"));
             assertTrue(names.contains("mili-platform.log"));
             for (String n : names) {

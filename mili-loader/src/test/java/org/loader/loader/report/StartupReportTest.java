@@ -85,7 +85,7 @@ class StartupReportTest {
 
     @Test
     @DisplayName("onLaunchFailure 真实落盘 startup-report.json 且不抛出")
-    void onLaunchFailureWritesReport() {
+    void onLaunchFailureWritesReport() throws Exception {
         System.setProperty("mili.crashCapsule", "false"); // zip 单独测
         try {
             assertDoesNotThrow(() ->

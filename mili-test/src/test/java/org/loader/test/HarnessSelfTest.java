@@ -3,7 +3,6 @@ package org.loader.test;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.loader.runtime.scheduler.TaskHandle;
-import org.loader.runtime.scheduler.TaskState;
 
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -16,6 +15,10 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * 测试框架自身的验收测试（同时充当最小示例 —— A4 验收："最小示例 Mod、
  * Scope 自动清理、事件断言、任务取消、失败隔离、并发测试"）。
+ *
+ * <p>断言风格说明：全部基于<b>可观察行为</b>（latch、await、future 状态、
+ * 计数器），不基于 {@code TaskHandle.state()} —— 26.2 基线的 state() 是
+ * 构造时冻结的 record 快照（实时状态读取属未合并的 hardening 分支）。
  */
 class HarnessSelfTest extends MiliTest {
 
@@ -34,7 +37,7 @@ class HarnessSelfTest extends MiliTest {
     }
 
     @Test
-    @DisplayName("Scope 自动清理：fixture 关闭后，排队任务被取消、新提交被拒绝")
+    @DisplayName("Scope 自动清理：fixture 关闭后，排队任务不再执行、新提交被拒绝")
     void scopeAutoCleanup() throws Exception {
         TestModFixture mod = mili().installMod("cleanup");
         CountDownLatch release = new CountDownLatch(1);
@@ -49,22 +52,19 @@ class HarnessSelfTest extends MiliTest {
 
         mod.close(); // Mod 卸载语义：Scope 关闭
 
-        // 排队任务最终应被取消（给调度器一点时间传播）
+        release.countDown(); // 释放阻塞线程，让队列清空
+        // 等待排队任务终结（取消/完成均视为 done），随后断言它从未执行
         long deadline = System.currentTimeMillis() + 2000;
-        while (queued.state() != TaskState.CANCELLED
-                && System.currentTimeMillis() < deadline) {
+        while (!queued.future().isDone() && System.currentTimeMillis() < deadline) {
             Thread.sleep(10);
         }
-        assertEquals(TaskState.CANCELLED, queued.state(),
-                "Scope 关闭应取消未开始的任务");
-        assertEquals(0, ran.get(), "被取消的任务不应执行");
+        Thread.sleep(100); // 宽限：若清理失败，此时任务已可能执行
+        assertEquals(0, ran.get(), "Scope 关闭后排队任务不应执行");
 
         // 新提交被拒绝（Scope 已停止）
         assertThrows(Exception.class,
                 () -> mod.scheduler().submit(mod.scope(), () -> {
                 }));
-
-        release.countDown(); // 释放阻塞线程，避免泄漏到其他测试
     }
 
     @Test
@@ -74,7 +74,8 @@ class HarnessSelfTest extends MiliTest {
         record ChatEvent(String msg) {
         }
 
-        try (EventRecorder<ChatEvent> rec = EventRecorder.on(mod.eventBus(), ChatEvent.class)) {
+        EventRecorder<ChatEvent> rec = EventRecorder.on(mod.eventBus(), ChatEvent.class);
+        try (rec) {
             mod.eventBus().post(new ChatEvent("one"));
             mod.eventBus().post(new ChatEvent("two"));
 
@@ -113,8 +114,8 @@ class HarnessSelfTest extends MiliTest {
         });
         TaskHandle fine = mod.scheduler().submit(mod.scope(), good::incrementAndGet);
 
-        awaitState(fine, TaskState.COMPLETED, 2000);
-        awaitState(bad, TaskState.FAILED, 2000);
+        assertFailed(bad);
+        assertCompleted(fine);
         assertEquals(1, good.get(), "坏任务不应拖垮好任务");
     }
 
@@ -129,11 +130,12 @@ class HarnessSelfTest extends MiliTest {
         TaskHandle victim = mod.scheduler().submit(mod.scope(), ran::incrementAndGet);
 
         assertTrue(victim.cancel(), "排队任务应可取消");
-        awaitState(victim, TaskState.CANCELLED, 2000);
-        assertEquals(0, ran.get());
-
+        assertCancelled(victim);
         gate.countDown();
-        awaitState(blocker, TaskState.COMPLETED, 2000);
+        Thread.sleep(100); // 宽限：若取消无效，任务已可能执行
+        assertEquals(0, ran.get(), "被取消的任务不应执行");
+
+        assertCompleted(blocker);
     }
 
     @Test
@@ -148,7 +150,7 @@ class HarnessSelfTest extends MiliTest {
         }
         assertTrue(all.await(5, TimeUnit.SECONDS), "100 个任务应在 5 秒内完成");
         for (TaskHandle h : handles) {
-            assertEquals(TaskState.COMPLETED, h.state(), "任务 " + h.taskId());
+            assertDoesNotThrow(h::await, "任务 " + h.taskId() + " 应正常完成");
         }
     }
 
@@ -169,15 +171,5 @@ class HarnessSelfTest extends MiliTest {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-    }
-
-    private static void awaitState(TaskHandle handle, TaskState expected, long timeoutMs)
-            throws InterruptedException {
-        long deadline = System.currentTimeMillis() + timeoutMs;
-        while (handle.state() != expected && System.currentTimeMillis() < deadline) {
-            Thread.sleep(10);
-        }
-        assertEquals(expected, handle.state(),
-                "等待状态超时，当前 " + handle.state());
     }
 }

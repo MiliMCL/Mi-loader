@@ -55,6 +55,17 @@ class ApiBoundaryTest {
     private static final List<String> ALLOWED_RUNTIME_PREFIXES = List.of(
             "import org.loader.runtime.RuntimeEnvironment;",
             "import org.loader.runtime.error.",
+            // 诊断面（diagnostics）：loader 是唯一知道「启动分成哪几步、
+            // 哪个 Mod 还没被回收」的地方，观测点只能打在它身上 —— 换任何
+            // 模块都拿不到这份全局视角。
+            //
+            // 这里放开的是**整包**而不是逐个类，与上面的 error. 同一处理：
+            // 这几个类彼此耦合（时间线 / 审计 / 归因 / 看门狗），逐个白名单
+            // 只会让每次新增观测点都多一次 CI 红。代价是白名单变宽，因此
+            // 需要一条硬约束兜住：diagnostics 包<b>不得</b> import
+            // net.minecraft.* 或 org.loader.loader.*，也不得依赖字节码能力 ——
+            // 它只能是观测者。这条约束由 ci.yml 的模块边界检查保证。
+            "import org.loader.runtime.diagnostics.",
             "import org.loader.runtime.mod.",
             // Mod 列表快照是「loader 采集数据、集成层渲染」的跨模块契约。
             // 它必须住在 runtime（两边都能看见），而采集方只能是 loader ——

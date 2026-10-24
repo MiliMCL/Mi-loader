@@ -63,6 +63,8 @@ final class DoctorCommand {
 
     private final List<Finding> findings = new ArrayList<>();
     private final List<ModEntry> mods = new ArrayList<>();
+    /** examine() 阶段确定的实际生效 modsDir（Override 或 gameDir/mods 推导）。 */
+    private Path effectiveModsDir;
 
     private DoctorCommand() {
     }
@@ -114,9 +116,9 @@ final class DoctorCommand {
         doctor.examine(gameDir, modsDirOverride);
 
         if (json) {
-            out.println(doctor.renderJson(gameDir, modsDirOverride));
+            out.println(doctor.renderJson(gameDir));
         } else {
-            doctor.renderText(out, gameDir, modsDirOverride);
+            doctor.renderText(out, gameDir);
         }
         if (graph) {
             out.println(doctor.renderMermaid());
@@ -131,6 +133,7 @@ final class DoctorCommand {
                 ? LoaderConfig.at(gameDir, modsDirOverride)
                 : LoaderConfig.at(gameDir);
         Path modsDir = config.getModsPath();
+        this.effectiveModsDir = modsDir;
 
         // 1. gameDir 本体
         if (!Files.isDirectory(gameDir)) {
@@ -325,6 +328,10 @@ final class DoctorCommand {
         ModManifest.ValidationResult r = formal.validateVersionBinding();
         String source = m.source();
         switch (r) {
+            // 模式 switch（即使作为语句）对密封类型也要求穷尽性 —— Ok 必须显式出现
+            case ModManifest.ValidationResult.Ok ok -> {
+                // 绑定一致：无 finding
+            }
             case ModManifest.ValidationResult.MissingBinding b ->
                     findings.add(Finding.of("MOD_PLATFORM_MISSING", Severity.ERROR,
                             "未声明 mili 平台绑定（platform/abi/minecraft 三元组）",
@@ -386,8 +393,9 @@ final class DoctorCommand {
             for (ModManifest.DependencyEntry dep : m.dependencies()) {
                 if (!index.containsKey(dep.modId())) continue;
                 if (inStack.contains(dep.modId())) {
+                    // 从栈顶（最近入栈）向栈底回溯到目标节点，构造完整闭合环
                     List<String> cycle = new ArrayList<>();
-                    for (Iterator<String> it = stack.descendingIterator(); it.hasNext(); ) {
+                    for (Iterator<String> it = stack.iterator(); it.hasNext(); ) {
                         String n = it.next();
                         cycle.add(n);
                         if (n.equals(dep.modId())) break;
@@ -412,15 +420,17 @@ final class DoctorCommand {
         return (int) findings.stream().filter(f -> f.severity() == Severity.ERROR).count();
     }
 
-    private void renderText(PrintStream out, Path gameDir, Path modsDir) {
+    private void renderText(PrintStream out, Path gameDir) {
         out.println("mili doctor — 只读体检");
         out.println("gameDir: " + gameDir);
-        out.println("modsDir: " + modsDir);
+        out.println("modsDir: " + effectiveModsDir);
         out.println();
         for (Severity s : List.of(Severity.ERROR, Severity.WARNING, Severity.INFO)) {
             for (Finding f : findings) {
                 if (f.severity() != s) continue;
-                out.printf("[%s] %s: %s%n", s, f.id(), f.message());
+                String source = f.source() != null ? "  [" + f.source() + "]" : "";
+                String mod = f.modId() != null ? "  (mod: " + f.modId() + ")" : "";
+                out.printf("[%s] %s: %s%s%s%n", s, f.id(), f.message(), source, mod);
             }
         }
         out.println();
@@ -467,11 +477,11 @@ final class DoctorCommand {
         return mods.stream().anyMatch(m -> m.id().equals(id));
     }
 
-    private String renderJson(Path gameDir, Path modsDir) {
+    private String renderJson(Path gameDir) {
         StringBuilder sb = new StringBuilder(1024);
         sb.append("{\"schemaVersion\":\"").append(MiliCli.SCHEMA_VERSION).append('"');
         sb.append(",\"gameDir\":\"").append(MiliCli.jsonEscape(gameDir.toString())).append('"');
-        sb.append(",\"modsDir\":\"").append(MiliCli.jsonEscape(modsDir.toString())).append('"');
+        sb.append(",\"modsDir\":\"").append(MiliCli.jsonEscape(effectiveModsDir.toString())).append('"');
         sb.append(",\"summary\":{\"errors\":").append(errorCount())
           .append(",\"warnings\":").append(warnCount())
           .append(",\"infos\":").append(infoCount()).append('}');

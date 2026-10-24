@@ -67,15 +67,16 @@ class NewCommandTest {
         assertEquals((double) VersionInfo.ABI_VERSION, ((Number) mili.get("abi")).doubleValue());
         assertEquals(VersionInfo.TARGET_MINECRAFT, mili.get("minecraft"));
 
-        // 入口类：只 import API，实现 Mod 接口
+        // 入口类：只 import API，实现 Mod 接口（对 import 语句断言，避免误伤
+        // 模板中解释"不许 import 什么"的注释文本）
         String main = Files.readString(root.resolve("src/main/java/com/example/mymod/MyMod.java"));
         assertTrue(main.contains("package com.example.mymod;"));
         assertTrue(main.contains("implements Mod"));
         assertTrue(main.contains("void initialize(ModContext"));
-        assertFalse(main.contains("org.loader.runtime"),
-                "模板不得引用 runtime 内部包");
-        assertFalse(main.contains("org.loader.loader"),
-                "模板不得引用 loader 内部包");
+        assertFalse(main.contains("import org.loader.runtime"),
+                "模板不得 import runtime 内部包");
+        assertFalse(main.contains("import org.loader.loader"),
+                "模板不得 import loader 内部包");
 
         // 构建脚本锁定 Java 25 工具链
         String build = Files.readString(root.resolve("build.gradle.kts"));

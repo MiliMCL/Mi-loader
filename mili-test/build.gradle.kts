@@ -23,10 +23,13 @@ dependencies {
 
 tasks.jar {
     manifest {
+        // 与其他模块一致：从 rootProject.extra 读取并显式转型（extra 返回 Any?）
+        val platformVersion = rootProject.extra["miliPlatformVersion"] as String
+        val abiVersion = rootProject.extra["miliAbiVersion"] as String
         attributes(
             "Implementation-Title" to "Mili Test Framework",
-            "Mili-Platform" to rootProject.extra["miliPlatformVersion"],
-            "Mili-Abi" to rootProject.extra["miliAbiVersion"]
+            "Mili-Platform" to platformVersion,
+            "Mili-Abi" to abiVersion
         )
     }
 }

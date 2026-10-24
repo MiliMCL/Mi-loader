@@ -435,6 +435,8 @@ public final class BlockRegistrar {
      */
     public static void initModdedBlockStates() {
         try {
+            // [registry-exempt: 本方法按契约只在注册表冻结后运行（见方法 Javadoc：
+            //  此处为只读访问，且失败仅记 SEVERE 不重试——不存在类初始化污染路径）]
             Object blockRegistry = Reflect.staticField(
                     BUILTIN_REGISTRIES_CLASS, "BLOCK");
             Object stateRegistry = Reflect.staticField(

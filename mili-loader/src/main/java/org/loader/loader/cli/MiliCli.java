@@ -75,10 +75,13 @@ public final class MiliCli {
 
     private static int runExplain(String[] args, PrintStream out, PrintStream err, boolean tty) {
         boolean json = false;
+        boolean list = false;
         String code = null;
         for (String a : args) {
             if ("--json".equals(a)) {
                 json = true;
+            } else if ("--list".equals(a)) {
+                list = true;
             } else if ("--no-color".equals(a)) {
                 // 颜色由下方 color() 统一判定；此 flag 显式禁用
                 tty = false;
@@ -93,7 +96,7 @@ public final class MiliCli {
             }
         }
 
-        if (code == null || "--list".equals(code)) {
+        if (code == null || list) {
             return printCodeList(out, json);
         }
 
