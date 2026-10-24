@@ -222,25 +222,10 @@ public final class MiliCli {
         }
     }
 
-    /** 最小 JSON 字符串转义（RFC 8259 必需集合 + 控制字符）。 */
+    /** 最小 JSON 字符串转义（RFC 8259 必需集合 + 控制字符）。内容语义，不含两侧引号。 */
     static String jsonEscape(String s) {
-        StringBuilder sb = new StringBuilder(s.length() + 8);
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            switch (c) {
-                case '"' -> sb.append("\\\"");
-                case '\\' -> sb.append("\\\\");
-                case '\n' -> sb.append("\\n");
-                case '\r' -> sb.append("\\r");
-                case '\t' -> sb.append("\\t");
-                case '\b' -> sb.append("\\b");
-                case '\f' -> sb.append("\\f");
-                default -> {
-                    if (c < 0x20) sb.append(String.format("\\u%04x", (int) c));
-                    else sb.append(c);
-                }
-            }
-        }
-        return sb.toString();
+        if (s == null) return "";
+        String q = org.loader.loader.util.MiliJson.quote(s);
+        return q.substring(1, q.length() - 1); // 去掉 quote() 的首尾引号
     }
 }

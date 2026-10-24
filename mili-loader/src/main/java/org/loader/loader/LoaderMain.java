@@ -8,6 +8,11 @@ import org.loader.loader.discovery.MinecraftDiscovery;
 import org.loader.loader.discovery.ModDiscovery;
 import org.loader.loader.game.GameProvider;
 import org.loader.loader.game.MinecraftGameProvider;
+import org.loader.runtime.diagnostics.LifecycleAudit;
+import org.loader.runtime.diagnostics.ModOwners;
+import org.loader.runtime.diagnostics.ShutdownAudit;
+import org.loader.runtime.diagnostics.StartupTimeline;
+import org.loader.runtime.diagnostics.TickWatchdog;
 import org.loader.runtime.error.ModLoadError;
 import org.loader.runtime.kernel.Scope;
 import org.loader.runtime.mod.ApiModContext;
@@ -52,6 +57,31 @@ import java.util.ServiceLoader;
 public class LoaderMain {
 
     private final LoaderConfig config;
+    /**
+     * 启动阶段计时器。
+     *
+     * <p>由 {@link #main(String[])} 创建后传入，而不是在这里 {@code new} ——
+     * 起点必须早于 {@code parseArgs}，否则「解析参数 → 构造 Loader」这段
+     * 会整体掉进"未归因"，而它恰恰是最容易被服务启动器放大的一段
+     * （分发包脚本、参数拼接错误都发生在那里）。
+     */
+    private final StartupTimeline timeline;
+
+    /**
+     * 生命周期审计环。失败时落盘，成为下次启动的线索。
+     *
+     * <p>刻意不在每次正常启动都写文件：正常路径已经有时间线和日志了，
+     * 再写一份只会让 logs/ 变成没人看的垃圾堆。<b>只在失败时留下痕迹</b>，
+     * 这份痕迹才有分量。
+     */
+    private final LifecycleAudit audit = new LifecycleAudit();
+
+    /**
+     * 关闭期审计的线程基线，取在 Mod 初始化<b>之前</b>。
+     * 取在之后会让增量恒为 0，等于什么都没测。
+     */
+    private ShutdownAudit.Snapshot threadBaseline;
+
     private final org.loader.runtime.kernel.Runtime runtime;
     private ModClassLoaderManager classLoaderManager;
     private final GameProvider gameProvider;
@@ -69,7 +99,15 @@ public class LoaderMain {
     }
 
     public LoaderMain(LoaderConfig config) {
+        this(config, new StartupTimeline("bootstrap"));
+    }
+
+    /**
+     * 带时间线构造；包级可见，供测试注入一个已开始计时的实例。
+     */
+    LoaderMain(LoaderConfig config, StartupTimeline timeline) {
         this.config = config;
+        this.timeline = java.util.Objects.requireNonNull(timeline, "timeline");
         this.runtime = org.loader.runtime.kernel.Runtime.create("loader-runtime");
         this.gameProvider = discoverGameProvider();
     }
@@ -167,9 +205,23 @@ public class LoaderMain {
     }
 
     public static void main(String[] args) throws Exception {
+        // 时间线必须先于 parseArgs 建立：启动参数解析、配置装配、Loader 构造
+        // 这三步在任何 Mod 相关的工作之前，却是"改了启动脚本之后变慢"时
+        // 最先要排除的嫌疑段。
+        StartupTimeline timeline = new StartupTimeline("bootstrap");
+
+        long parseStart = System.nanoTime();
         LaunchOptions opts = parseArgs(args);
+        timeline.mark("parseArgs", parseStart);
+
+        long configStart = System.nanoTime();
         LoaderConfig config = LoaderConfig.at(opts.gameDir(), opts.modsDir());
-        LoaderMain m = new LoaderMain(config);
+        timeline.mark("loadConfig", configStart);
+
+        long constructStart = System.nanoTime();
+        LoaderMain m = new LoaderMain(config, timeline);
+        timeline.mark("constructLoader", constructStart);
+
         m.gameDir = opts.gameDir();
         m.launch(opts.mcArgs());
     }
@@ -246,12 +298,53 @@ public class LoaderMain {
 
     /**
      * 完整启动流程。
+     *
+     * <p>失败时先落盘时间线再抛出：一次启动失败发生在哪一段、前序阶段
+     * 各花了多久，是排障时唯一能区分"Mod 写错了"与"平台自己慢"的证据。
      */
     public void launch(String[] mcArgs) throws Exception {
+        try {
+            launchTracked(mcArgs);
+        } catch (Exception e) {
+            timeline.closeAll();
+            audit.record("platform.failed", null, String.valueOf(e));
+            // 失败才落盘，且是追加：同一台机器上连续崩两次，两份墓碑都在。
+            if (gameDir != null) {
+                audit.dumpTo(gameDir.resolve("logs").resolve("mili-audit.log"), 64,
+                        "=== " + java.time.LocalDateTime.now() + " 启动失败 ===");
+            }
+            // [A3 Crash Capsule] 结构化失败报告（logs/startup-report.json）
+            // + 本地可选诊断包。调用内部全量兜底：报告生成失败绝不改变
+            // 原始异常的传播路径。
+            if (gameDir != null) {
+                org.loader.loader.report.StartupReport.onLaunchFailure(
+                        gameDir, e, timeline, getLoadedMods());
+            }
+            reportTimeline("启动失败");
+            throw e;
+        }
+    }
+
+    /**
+     * 实际启动流程，每个阶段末尾打一个点。
+     *
+     * <p>打点位置的选择原则：<b>打在该阶段产生的副作用之后</b>，而不是
+     * 之前。{@code locateGame} 的耗时里包含文件系统扫描，{@code createGameClassLoader}
+     * 的耗时里包含 JAR 打开与主类可解析校验 —— 这些才是真正的成本项。
+     */
+    private void launchTracked(String[] mcArgs) throws Exception {
+        // 停滞报告接到平台日志（同时写控制台与 logs/mili-platform.log）。
+        // 默认 sink 是 stderr —— 在启动器吞掉 stderr 的环境里那份报告会丢，
+        // 而"卡住"恰好是最需要留下证据的场景。
+        TickWatchdog.installSink(PlatformLog::warn);
+        audit.record("platform.start", null, "bootstrap begin");
+
         ensureMinecraftPresent();
+        timeline.mark("ensureMinecraft");
 
         // ── 2. 发现 Minecraft ────────────────────────────────────────────
         List<Path> gameClasspath = gameProvider.locateGame(gameDir);
+        timeline.mark("locateGame");
 
         // ── 3. 建立唯一的 MinecraftClassLoader ───────────────────────────
         if (!(gameProvider instanceof MinecraftGameProvider mcProvider)) {
@@ -262,6 +355,7 @@ public class LoaderMain {
         MinecraftClassLoader gameCL = mcProvider.createGameClassLoader(gameClasspath);
         classLoaderManager = new ModClassLoaderManager(gameCL, gameDir, config.getModsPath());
         this.mcProvider = mcProvider;
+        timeline.mark("createGameClassLoader");
 
         // ── 4. 发现 Mod ──────────────────────────────────────────────────
         //
@@ -269,13 +363,25 @@ public class LoaderMain {
         // 它，不能重新 LoaderConfig.at(gameDir) —— 那会把 Mod 目录重置回
         // gameDir/mods，在分发包布局下指向一个不存在的目录。
         ModDiscovery modDiscovery = ModDiscovery.scan(config);
-        List<ModManifest> resolved = modDiscovery.resolveDependencies(modDiscovery.discover());
+        timeline.mark("scanMods");
+
+        List<ModManifest> discovered = modDiscovery.discover();
+        timeline.mark("discoverManifests");
+
+        List<ModManifest> resolved = modDiscovery.resolveDependencies(discovered);
+        timeline.mark("resolveDependencies");
+
         reportDiscovery(resolved);
+        // 单独打点：reportDiscovery 会 list() 一遍 Mod 目录，200 个 JAR 时
+        // 不是零成本。混进 runtimeStart 会让人误以为运行时启动慢。
+        timeline.mark("reportDiscovery");
 
         runtime.start();
+        timeline.mark("runtimeStart");
 
         // ── 6. 严格平台版本校验 ───────────────────────────────────────────
         validateVersionBindings(resolved);
+        timeline.mark("validateVersionBindings");
 
         // ── 7. 创建 ModClassLoader（parent = gameCL） ──────────────────────
         //
@@ -287,10 +393,14 @@ public class LoaderMain {
             Scope modScope = runtime.rootScope().createChild("mod:" + manifest.id());
             ModClassLoader mcl = classLoaderManager.create(
                     manifest, modSources.get(manifest.id()));
+            // 归因边界在这里建立：ClassLoader 与 Mod 一一对应，之后任何由
+            // 这个 CL 加载的类都能反查到 modId，Mod 侧不需要做任何事。
+            ModOwners.register(mcl, manifest.id());
             Mod mod = new Mod(manifest, modScope, mcl);
             loadedMods.add(mod);
             modScope.registerResource(mod);
         }
+        timeline.mark("createModClassLoaders");
 
         // ── 7.5 装配运行时服务 ────────────────────────────────────────────
         //
@@ -300,8 +410,17 @@ public class LoaderMain {
         // 初始化之后，于是任何用存储的 Mod 都会以
         // StorageUnavailableException 加载失败。
         installRuntimeServices();
+        timeline.mark("installServices");
 
         // ── 8. 调用 Mod 入口 ─────────────────────────────────────────────
+        //
+        // 这一段自带计时（initializeMods 区间 + 每个 Mod 一行），
+        // 因此这里不再额外打点 —— 否则同一段时间会被计两次，
+        // 「未归因」会被算成负数。
+        //
+        // 线程基线必须在 Mod 初始化之前抓：之后抓等于把 Mod 新建的线程
+        // 也算进基线，关闭期增量恒为 0，审计变成摆设。
+        threadBaseline = ShutdownAudit.capture();
         invokeModEntrypoints();
 
         // 快照方块清单：创造栏标签在 EntryPointHook 里创建。清单经
@@ -316,13 +435,34 @@ public class LoaderMain {
         mcProvider().declaredItems(Map.copyOf(declaredItemsByMod));
 
         PlatformLog.info("ClassLoader 拓扑:\n" + classLoaderManager.diagnostics());
+        timeline.mark("declareContent");
 
         // ── 9. 启动 Minecraft ────────────────────────────────────────────
+        //
+        // 报告放在这里而不是 shutdown 之后：gameProvider.launch() 会一直
+        // 阻塞到游戏退出，等到那时才打印，等于在退出时才告诉用户
+        // 「你三分钟前那次启动慢在哪」。这也是 TTCF 口径的终点 ——
+        // 平台能让玩家看到的第一帧，取决于它把控制权交给游戏的速度。
+        reportTimeline("平台启动完成");
+        audit.record("platform.ready", null,
+                "mods=" + loadedMods.size() + " bootstrap="
+                        + (timeline.totalNanos() / 1_000_000L) + "ms");
         try {
             gameProvider.launch(gameDir, runtime, classLoaderManager, gameClasspath, mcArgs);
         } finally {
             shutdown();
         }
+    }
+
+    /**
+     * 输出启动时间线。
+     *
+     * <p>为什么用一次 {@code info} 而不是逐行打印：这份报告的价值在于
+     * <b>整体形状</b>（哪一段占了多大比例），拆成十几条带时间戳的日志反而
+     * 会切断阅读。日志文件里它仍是一段连续文本，可以直接 grep 出来贴进 issue。
+     */
+    private void reportTimeline(String stage) {
+        PlatformLog.info("启动时间线（" + stage + "）:\n" + timeline.render());
     }
 
     /**
@@ -391,7 +531,9 @@ public class LoaderMain {
      * 找不到入口即 {@code ModLoadError}，不静默忽略。
      */
     private void invokeModEntrypoints() {
+        timeline.open("initializeMods");
         for (Mod mod : loadedMods) {
+            long modInitStart = System.nanoTime();
             String entrypoint = mod.manifest().entrypoint();
             if (entrypoint == null || entrypoint.isBlank()) {
                 throw new ModLoadError("Mod '" + mod.id() + "' 没有声明 entrypoint",
@@ -449,6 +591,12 @@ public class LoaderMain {
 
                 PlatformLog.info("Mod initialized: " + mod.id() + " -> " + entrypoint);
 
+                // 只记成功路径：失败的 Mod 会立刻抛出并终止整个启动，
+                // 那时最重要的信息是异常本身，不是它花了多久。用 mark 而不是
+                // open/close，是为了不给这段套 try/finally —— 逐 Mod 的
+                // 失败点有四处，套上去只会把异常处理结构搅浑。
+                timeline.mark("init:" + mod.id(), modInitStart);
+
             } catch (ModLoadError e) {
                 throw e;
             } catch (InvocationTargetException e) {
@@ -472,6 +620,7 @@ public class LoaderMain {
                         "MOD_ENTRYPOINT_FAILED", e);
             }
         }
+        timeline.close();
     }
 
     /** 已装配的 runtime ModContext，供关闭阶段与诊断使用。 */
@@ -650,6 +799,16 @@ public class LoaderMain {
                     + "/" + storageService.size());
         }
 
+        // 已加载类数必须在 ClassLoader 关闭**之前**取：关掉之后
+        // loadedClasses() 就是空集合，报告会变成"每个 Mod 0 个类"，
+        // 看起来像一次完美回收，实际是没测。
+        Map<String, Integer> classesPerMod = new LinkedHashMap<>();
+        if (classLoaderManager != null) {
+            for (ModClassLoader mcl : classLoaderManager.all()) {
+                classesPerMod.put(mcl.modId(), mcl.loadedClasses().size());
+            }
+        }
+
         if (classLoaderManager != null) {
             try {
                 classLoaderManager.close();
@@ -661,6 +820,29 @@ public class LoaderMain {
             runtime.close();
         } catch (Exception ignored) {
             // 同上
+        }
+
+        reportShutdownAudit(classesPerMod);
+    }
+
+    /**
+     * 输出关闭期回收审计。
+     *
+     * <p>放在 {@code runtime.close()} 之后：此时调度器、事件总线、看门狗
+     * 都已经有机会退出，剩下的线程才是真正的残留。放在之前测到的只是
+     * "还没关完"，没有意义。
+     */
+    private void reportShutdownAudit(Map<String, Integer> classesPerMod) {
+        if (threadBaseline == null) {
+            return;
+        }
+        try {
+            PlatformLog.info(ShutdownAudit.report(
+                    threadBaseline, ShutdownAudit.capture(), classesPerMod));
+            audit.record("platform.stop", null, "shutdown audit emitted");
+        } catch (RuntimeException e) {
+            // 审计失败不能影响关闭流程
+            PlatformLog.warn("关闭期审计失败: " + e);
         }
     }
 
