@@ -59,3 +59,34 @@ tasks.jar {
     }
 }
 
+// ── B0: 热点微基准（独立 benchmark source set，不进 check/build）─────────────
+//
+// 为什么是 source set 而不是独立模块：只为两三百行基准代码开一个 Gradle 模块，
+// 会引入新的发布/版本同步负担（MD B0 要求"不引入不必要生态"）。source set
+// 足够隔离：不进 check、不进 build、不进发布产物，只在手动运行
+// `:mili-runtime:benchmark` 时编译执行。
+//
+// 为什么不用 JMH：仓库坚持离线可构建（gradle.properties 有专门的离线缓存
+// 锁定说明），JMH 及其注解处理器会破坏该约束。统计口径的取舍见
+// BenchmarkMain 类注释 —— 定位是趋势对比，不是绝对值宣称。
+val benchmarkSourceSet = sourceSets.create("benchmark") {
+    java.srcDir("src/benchmark/java")
+}
+benchmarkSourceSet.compileClasspath +=
+    sourceSets.main.get().output + configurations.compileClasspath.get()
+benchmarkSourceSet.runtimeClasspath +=
+    benchmarkSourceSet.output + benchmarkSourceSet.compileClasspath
+
+tasks.register<JavaExec>("benchmark") {
+    group = "verification"
+    description =
+        "运行热点微基准（EventBus/Scheduler/Permission）。手动执行，不进 check —— " +
+        "噪声敏感的基准进硬门禁会造成随机失败（MD B0 禁止）"
+    classpath = benchmarkSourceSet.runtimeClasspath
+    mainClass = "org.loader.runtime.benchmark.BenchmarkMain"
+    // JVM 参数刻意保守：与生产 gradle.properties 的 512m 约束同数量级，
+    // 避免"基准机配置"与"真实运行环境"脱节。
+    jvmArgs("-Xmx512m")
+}
+
+
