@@ -62,6 +62,8 @@ public final class MiliCli {
                 return runExplain(tail(args), out, err, tty);
             case "doctor":
                 return DoctorCommand.run(tail(args), out, err, tty);
+            case "new":
+                return NewCommand.run(tail(args), out, err, tty);
             default:
                 err.println("未知命令: " + cmd);
                 err.println("运行 `mili help` 查看可用命令。");
@@ -185,6 +187,9 @@ public final class MiliCli {
         out.println("  explain --list [--json]   列出全部已登记错误码");
         out.println("  doctor <gameDir> [选项]   只读体检：发现/绑定/依赖/文件完整性");
         out.println("                            选项: --json --graph --mili-mods <dir>");
+        out.println("  new <目录> --id <modId> --package <包名>");
+        out.println("       [--name <名>] [--version <v>] [--author <名>]");
+        out.println("                            从内嵌权威模板生成 Mod 工程");
         out.println("  help                      显示本帮助");
         out.println();
         out.println("退出码: 0=成功  1=业务失败(未知码/doctor发现error)  2=用法错误");

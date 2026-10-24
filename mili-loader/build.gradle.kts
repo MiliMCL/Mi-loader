@@ -668,3 +668,118 @@ tasks.named("check") {
     dependsOn("distributionBoundaryCheck")
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// A5: 开发运行与诊断任务（MD 里程碑 A5）
+//
+// 命名与边界约定：
+//  - runClient        开发模式启动完整 Loader（gameDir 可指定）
+//  - runTestMod       在 build/ 下的隔离目录启动，绝不触碰用户的 game/mods
+//  - miliDoctor       调用 MiliCli doctor 做只读体检
+//  - miliExplain      调用 MiliCli explain 解释错误码
+//
+// 不复刻 Installer 的安装流程：LoaderMain 自带 ensureMinecraftPresent()
+// 自动安装逻辑，这里只负责把参数送对位置。
+// ═══════════════════════════════════════════════════════════════════════════
+
+val miliGameDir: String =
+    (findProperty("mili.gameDir") as String?) ?: "test_client"
+val miliModsDir: String? = findProperty("mili.modsDir") as String?
+
+tasks.register<JavaExec>("runClient") {
+    group = "mili"
+    description =
+        "开发模式启动 Loader。gameDir 默认 test_client（-Pmili.gameDir=... 覆盖），" +
+        "Mod 目录默认 gameDir/mods（-Pmili.modsDir=... 覆盖）"
+    mainClass = "org.loader.loader.LoaderMain"
+    classpath = sourceSets.main.get().runtimeClasspath
+
+    val gameDirPath = file(miliGameDir) // file() 同时兼容相对与绝对路径
+    doFirst {
+        if (!gameDirPath.isDirectory) {
+            throw GradleException(
+                "gameDir 不存在: ${gameDirPath.absolutePath}\n" +
+                    "用 -Pmili.gameDir=<目录> 指定包含 Minecraft 的目录。"
+            )
+        }
+        logger.lifecycle("[runClient] gameDir=${gameDirPath.absolutePath}")
+        if (miliModsDir != null) {
+            logger.lifecycle("[runClient] modsDir=$miliModsDir")
+        }
+    }
+
+    args(gameDirPath.absolutePath)
+    if (miliModsDir != null) {
+        args("--mili-mods", file(miliModsDir).absolutePath)
+    }
+}
+
+tasks.register<JavaExec>("runTestMod") {
+    group = "mili"
+    description =
+        "在隔离目录启动 Loader 运行测试 Mod（-Pmili.testMod=<jar 或目录>）。" +
+        "运行目录为 build/mili-testrun/，绝不触碰用户的 game/、mods/ 或存档"
+    mainClass = "org.loader.loader.LoaderMain"
+    classpath = sourceSets.main.get().runtimeClasspath
+
+    val testRunGame = layout.buildDirectory.dir("mili-testrun/game")
+    val testRunMods = layout.buildDirectory.dir("mili-testrun/mods")
+
+    args(testRunGame.get().asFile.absolutePath)
+    args("--mili-mods", testRunMods.get().asFile.absolutePath)
+
+    doFirst {
+        val testRunModsDir = testRunMods.get().asFile.apply { mkdirs() }
+        val testModSrc = findProperty("mili.testMod") as String?
+        if (testModSrc != null) {
+            val src = file(testModSrc)
+            if (!src.exists()) {
+                throw GradleException("mili.testMod 指向的路径不存在: $src")
+            }
+            if (src.isFile) {
+                copy { from(src); into(testRunModsDir) }
+            } else {
+                // 目录形态（开发中的 Mod 工程）：拷贝 mod.json + 类产物
+                copy { from(src); into(testRunModsDir.resolve(src.name)) }
+            }
+            logger.lifecycle("[runTestMod] 已拷贝测试 Mod: $src")
+        }
+        val hasMod = testRunModsDir.listFiles()?.isNotEmpty() == true
+        if (!hasMod) {
+            throw GradleException(
+                "隔离 Mod 目录为空: ${testRunModsDir.absolutePath}\n" +
+                    "用 -Pmili.testMod=<Mod JAR 或工程目录> 指定要运行的测试 Mod。"
+            )
+        }
+        logger.lifecycle("[runTestMod] gameDir=${testRunGame.get().asFile.absolutePath}（隔离）")
+        logger.lifecycle("[runTestMod] modsDir=${testRunModsDir.absolutePath}（隔离）")
+    }
+}
+
+tasks.register<JavaExec>("miliDoctor") {
+    group = "mili"
+    description =
+        "只读体检 Mod 目录（gameDir 默认 test_client；" +
+        "-Pmili.doctorJson=true 输出 JSON）"
+    mainClass = "org.loader.loader.cli.MiliCli"
+    classpath = sourceSets.main.get().runtimeClasspath
+
+    args("doctor", file(miliGameDir).absolutePath)
+    if (miliModsDir != null) {
+        args("--mili-mods", file(miliModsDir).absolutePath)
+    }
+    if (findProperty("mili.doctorJson") == "true") {
+        args("--json")
+    }
+}
+
+tasks.register<JavaExec>("miliExplain") {
+    group = "mili"
+    description = "解释错误码（-Pmili.code=MOD_ABI_MISMATCH；缺省列出全部码）"
+    mainClass = "org.loader.loader.cli.MiliCli"
+    classpath = sourceSets.main.get().runtimeClasspath
+
+    val code = findProperty("mili.code") as String?
+    args("explain")
+    if (code != null) args(code) else args("--list")
+}
+
