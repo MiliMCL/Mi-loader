@@ -10,16 +10,18 @@ Mili 的 API 层完全不含 Minecraft 依赖，所有与游戏本体的交互�
 
 ## 模块构成
 
-Mili 由四个 Gradle 模块组成，依赖关系严格单向：
+Mili 由六个 Gradle 模块组成，依赖关系严格单向：
 
 | 模块 | 职责 |
 |---|---|
 | `mili-abi` | 稳定契约接口，零运行时依赖，Mod 编译的唯一目标 |
 | `mili-runtime` | Runtime 核心：Scope、Scheduler、EventBus、Capability、ResourceManager |
-| `mili-loader` | 启动发现、依赖解析、类加载、生命周期调度 |
+| `mili-loader` | 启动发现、依赖解析、类加载、生命周期调度、诊断 CLI |
 | `mili-minecraft-integration` | 反射桥接层，负责与 Minecraft 26.2 客户端交互 |
+| `mili-installer` | 首次运行的 Minecraft 客户端/库/资源安装器 |
+| `mili-test` | 纯 JVM Mod 测试框架（测试依赖，不属于运行时） |
 
-依赖方向为 `abi ← runtime ← loader` 与 `abi ← minecraft-integration`。`mili-runtime` 依赖 `mili-abi`，Loader 依赖 `mili-runtime` 与 `mili-abi`。Minecraft 集成模块只依赖 ABI，不反向引用 Loader。这种设计保证了 ABI 模块的纯洁性——它不引用自己即将被注入的任何实现类，整个依赖图无环且单向。Minecraft 集成模块之所以独立而非嵌入 Loader，是因为它的替换频率远高于 Loader 本体——Minecraft 补丁发布时只需重打集成模块 JAR，无需重建整套 Loader 链。这个设计决策也允许第三方社区为不同的 Minecraft 快照版本独立维护桥接层实现，只要不违反 ABI 契约。
+依赖方向为 `abi ← runtime ← loader` 与 `abi ← runtime ← minecraft-integration`。`mili-runtime` 依赖 `mili-abi`，Loader 依赖 `mili-runtime`、`mili-minecraft-integration` 与 `mili-installer`。Minecraft 集成模块依赖 ABI 与 runtime（Screen 桥接需要 runtime 类型），不反向引用 Loader。这种设计保证了 ABI 模块的纯洁性——它不引用自己即将被注入的任何实现类，整个依赖图无环且单向。Minecraft 集成模块之所以独立而非嵌入 Loader，是因为它的替换频率远高于 Loader 本体——Minecraft 补丁发布时只需重打集成模块 JAR，无需重建整套 Loader 链。这个设计决策也允许第三方社区为不同的 Minecraft 快照版本独立维护桥接层实现，只要不违反 ABI 契约。
 
 模块之间的边界不仅是代码层面的约定，也通过 Gradle 的 `api` 与 `implementation` 关键字严格实施。`mili-abi` 只暴露 `api` 依赖，下游 Mod 无法通过传递依赖引入任何内部类型。`mili-runtime` 对 Loader 暴露 `api` 依赖，但对自己内部的实现细节使用 `implementation` 确保编译期隔离。Gradle 编译器插件定期审核这些依赖声明，一旦发现违规（如 ABI 模块引入了意外依赖），构建会立即失败并给出修复建议。
 
@@ -61,7 +63,7 @@ Minecraft 26.2 JAR (build input)
 
 将 Loader JAR、Runtime JAR 与 Minecraft 集成 JAR 放入 `<loader-dir>/core/`，Mod JAR 放入 `<loader-dir>/mods/`，运行 Loader 即可启动。Loader 会自动扫描 Mod 目录、验证元数据、解析依赖图，并按拓扑顺序初始化每个 Mod。启动过程的所有步骤都有对应的日志输出，使得排查 Mod 加载失败的原因成为一件可追溯的工作。如果 Mod 加载失败，Loader 会在日志中输出具体的错误原因（缺失的依赖、能力不匹配、类无法实例化等），并在 `startup-report.json` 中生成一份完整的启动报告。
 
-开发模式下，可以通过 `./gradlew :mili-loader:run` 直接在 IDE 中启动 Loader。开发模式跳过了部分严格校验以加速迭代（例如不强制校验 Mod 的版本三元组在 patch 级别上完全一致），但生产构建中的校验一个都不会少。开发与生产环境的差异是 Mili 刻意维护的——它让开发者可以在本地快速试错，同时保证发布产物始终经过完整验证。开发模式的差异范围在文档中有明确列表，任何未在文档中列出的 Loader 行为都假定在两种模式下表现一致。
+开发模式下，可以通过 `./gradlew :mili-loader:runClient` 在 IDE 外直接启动 Loader（gameDir 默认 `test_client/`，可用 `-Pmili.gameDir=` 覆盖），或用 `./gradlew :mili-loader:miliDoctor` 对 Mod 目录做只读体检。开发模式跳过了部分严格校验以加速迭代（例如不强制校验 Mod 的版本三元组在 patch 级别上完全一致），但生产构建中的校验一个都不会少。开发与生产环境的差异是 Mili 刻意维护的——它让开发者可以在本地快速试错，同时保证发布产物始终经过完整验证。开发模式的差异范围在文档中有明确列表，任何未在文档中列出的 Loader 行为都假定在两种模式下表现一致。
 
 ## 构建说明
 
@@ -115,13 +117,13 @@ Mod 的生命周期严格受 `Lifecycle` 状态机约束：加载（`LOADING`）
 
 事件的类型安全在发布时被检验——`EventBus.publish(Event)` 保证只有匹配该事件类型的监听器会被调用。编译期泛型保证了发布方无法意外地发布错误类型的运行时对象。这对于 Mod 系统的健壮性至关重要——事件类型的错误往往在运行时才暴露，而此时已经造成了难以追溯的状态混乱。类型安全也带来了一个实际的好处：当 Loader 需要梳理事件监听链时，它可以基于泛型参数快速索引相关处理器，而不需要运行时类型检查。
 
-处理器抛出异常不会终止事件传播链——Loader 会捕获并记录异常，然后继续调用下一个处理器。但连续多处理器抛错会触发"频率熔断"。Loader 内部的维护窗口记录：每个事件类型上，每经过一百次事件传播，如果其中有超过十次处理器抛错，该事件类型会被临时送入"冷却期"三十秒。冷却期内仍接受发布但不调用任何处理器——所有抛错的日志仍正常输出，只是不触发用户代码。冷却期结束后自动恢复，若再次触发，冷却期加倍。这是防止"一个坏处理器拖垮整个事件链路"的防御策略，同时也在日志中输出详细的异常堆栈。
+处理器抛出异常不会终止事件传播链——Loader 会捕获并记录异常，然后继续调用下一个处理器。监听器内部采用不可变数组快照：注册与注销只发生在写路径（重建快照数组），发布路径对快照做零分配遍历。关于"频率熔断"（对连续抛错的监听器做冷却降级）——该机制在当前实现中**尚未落地**，属于规划项；当前的实际行为是逐监听器 try/catch 隔离并记录日志。在它通过 RFC/ADR 确认语义并实现之前，请以本段描述为准。
 
 ## 能力与权限
 
 `CapabilityToken` 是能力声明与消费的基础凭证，由提供者注册、由消费者消费。能力匹配发生在加载期，如果消费者的需求无法被任何提供者的声明满足，则 Loader 拒绝加载该消费者 Mod。这个早期失败的哲学——在能验证的时候尽早验证——贯穿了整个 Mili 的设计。能力匹配不只检查 Token 是否存在，还检查 Token 类型的兼容性——`CapabilityToken<NetworkProvider>` 与 `CapabilityToken<RenderProvider>` 代表完全不同的语义，即使它们被错误地共享了同一个字符串标识，Loader 也能通过泛型参数类型区分。这个"类型 + 引用"的双重匹配机制比传统的服务注册模式（通常只依赖字符串键）更加安全，也更易于在规模化项目中治理。
 
-`Permission` 与 `PermissionManager` 构成运行时的第二层访问控制：加载期校验能力匹配，运行时校验具体操作权限。权限可以在 Mod 的配置文件中声明，默认配置对所有 Mod 开放常用权限，而对高危操作（如网络访问、文件系统写入）要求显式声明。管理员可以通过覆盖默认配置收紧权限策略。权限检查发生在 API 调用层面，Mod 无法绕过——所有敏感操作都通过 `PermissionManager` 的门面进入系统。权限的审计日志会记录每次拒绝与通过事件，可通过全局配置的审计级别调整详细程度。审计日志默认关闭，开启后会带来可感知的 I/O 开销——在生产环境中建议仅开启 `DENY` 级别的审计，关闭 `ALLOW` 级别的审计。
+`Permission` 与 `PermissionManager` 构成运行时的第二层访问控制：加载期校验能力匹配，运行时校验具体操作权限。权限可以在 Mod 的配置文件中声明，默认配置对所有 Mod 开放常用权限，而对高危操作（如网络访问、文件系统写入）要求显式声明。管理员可以通过覆盖默认配置收紧权限策略。权限检查发生在 API 调用层面，Mod 无法绕过——所有敏感操作都通过 `PermissionManager` 的门面进入系统。权限审计（记录每次拒绝与通过事件）的基础设施已存在（`security.AuditLog`），但**尚未接入权限决策路径**——这是已知的未完成项；生产环境请以日志中的权限拒绝异常（`SecurityException`）为准。
 
 能力匹配的语义基于"完全相等"而非"兼容或继承"——`CapabilityToken` 的比较使用引用相等性而非自定义比较器。这么设计的意图是让能力语义显式化：如果两个 Mod 希望它们的能力可互相替代，它们必须使用同一个 `CapabilityToken` 实例（通过共享 ABI 模块中的常量）或使用 `CapabilityToken.aliasOf()` 声明显式别名。没有隐式的继承推导——这避免了"看似兼容但行为微妙不同"的尴尬情况。
 
@@ -149,7 +151,7 @@ Mod 的生命周期严格受 `Lifecycle` 状态机约束：加载（`LOADING`）
 
 崩溃恢复策略取决于异常类型。对于可恢复的 `ApiException`，Loader 允许 Mod 通过 `Lifecycle.resume()` 重试初始化；对于不可恢复的 `ModLoadException`，Loader 会将该 Mod 标记为永久失败，直到重新安装或修复。永久失败的 Mod 在 UI 中会显示为明确的状态指示器，避免用户困惑于某个功能突然不可用的原因。恢复重试有次数限制——连续重试超过五次后，Loader 会认为该 Mod 存在根本性问题，建议完全卸载并等待作者修复。重试计数在每次成功加载后归零，这意味着一个偶发性失败不应导致 Mod 被永久标记——只有反复失败才触发硬限制。
 
-启动失败时 Loader 会生成一份结构化的启动报告（`startup-report.json`），内容包括所有已处理的 Mod、依赖图拓扑序、每个 Mod 的最终状态与加载耗时。这份报告在持续集成环境中被 Mili 维护者用于验证 Loader 本身的正确性，在用户端则被 Mod 开发者用于定位加载失败。报告格式版本化，当前版本为 `1.0`，与 `ABI_VERSION` 独立版本号。启动报告中还包含 Loader 自身的版本信息与环境摘要（Java 版本、操作系统、系统架构），这些信息对于跨环境问题复现有不可替代的价值。
+启动失败时 Loader 会生成一份结构化的启动报告（`logs/startup-report.json`），内容包括：平台与环境摘要（Java 版本、操作系统、系统架构）、脱敏后的错误类型/标准错误码/堆栈、失败发生阶段、启动时间线（各阶段耗时）、已加载 Mod 的最终状态。该报告在持续集成环境中被 Mili 维护者用于验证 Loader 本身的正确性，在用户端则被 Mod 开发者用于定位加载失败。报告格式版本化，当前版本为 `1.0`，与 `ABI_VERSION` 独立版本号；schema 详见 `docs/ERROR_MODEL.md` 与代码内 `StartupReport` 注释。失败时还会在 `logs/` 下生成可选的本地诊断包（`crash-report-*.zip`，默认开启，`mili.crashCapsule=false` 关闭）——它**只存在于本地**，是否发给维护者由用户决定，平台绝不自动上传。所有文本在落盘前经过脱敏（主目录、用户名、令牌、绝对路径均被替换）。
 
 ## 版本策略
 
@@ -168,12 +170,15 @@ Mod 的生命周期严格受 `Lifecycle` 状态机约束：加载（`LOADING`）
 
 ## 详细文档
 
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — Runtime 内核与设计决策，包含 Scope、Scheduler、EventBus 的工作原理
+- [ARCHITECTURE.md](docs/history/ARCHITECTURE.md) — Runtime 内核与设计决策，包含 Scope、Scheduler、EventBus 的工作原理
 - [MOD_DEVELOPMENT.md](docs/MOD_DEVELOPMENT.md) — Mod 开发指南，包含入口点声明、元数据配置、依赖声明
-- [API_REFERENCE.md](docs/API_REFERENCE.md) — 完整 API 参考，包含所有公开接口与方法签名
+- [API_REFERENCE.md](docs/history/API_REFERENCE.md) — 完整 API 参考，包含所有公开接口与方法签名
 - [PLATFORM_VERSIONING.md](docs/PLATFORM_VERSIONING.md) — 版本策略与三元组锁定机制
-- [ABI.md](ABI.md) — ABI 契约与接口规范，明确哪些变更属于破坏性
+- [ABI.md](docs/ABI.md) — ABI 契约与接口规范，明确哪些变更属于破坏性
+- [ERROR_MODEL.md](docs/ERROR_MODEL.md) — 错误码目录、错误模型与 `mili explain` 用法
+- [docs/engineering/](docs/engineering/) — 工程执行记录（实现审计、任务状态、最终报告）
+- [docs/decisions/](docs/decisions/) — 架构决策记录（ADR）
 
 ## 许可证
 
-（l2）
+见仓库根目录的 [LICENSE.txt](LICENSE.txt)。
