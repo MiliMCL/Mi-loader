@@ -92,6 +92,12 @@ class ResourceLeakTest {
 
         for (int i = 0; i < 20; i++) {
             scheduler.submit(runtime.rootScope(), () -> counter.incrementAndGet()).await();
+            // 逐轮断言，而不是只在最后断言一次：await() 返回即代表任务已完成，
+            // 此时 active 必须是 0（契约见 Scheduler#metrics 的 javadoc）。
+            // 只在末尾断言的话，20 次里只有最后一次的时序会被检验 ——
+            // 历史上的「先 complete 后 decrement」正是这样偶尔漏过的。
+            assertEquals(0, scheduler.metrics().active(),
+                    "第 " + (i + 1) + " 个任务完成后 active 应归零");
         }
 
         assertEquals(20, counter.get());
