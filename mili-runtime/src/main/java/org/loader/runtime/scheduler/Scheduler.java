@@ -393,6 +393,11 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
      * <p>{@code active} 是「正在执行」的计数，不是 {@code taskMap} 大小推算出来的
      * —— 已完成的任务会从 {@code taskMap} 中移除（否则长跑游戏每秒泄漏若干条），
      * 用集合大小做差会得到负数。
+     *
+     * <p><b>可观测契约</b>：{@code await()} 返回之后 {@code active} 必然已归零。
+     * 递减发生在 future 完成之前（见 {@code ScheduledTask#run()}），
+     * 因此「任务完成」与「指标归零」之间不存在可观测的中间态；
+     * 调用方不需要 sleep 一轮再来读指标。
      */
     public SchedulerMetrics metrics() {
         return new SchedulerMetrics(
@@ -748,38 +753,58 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
 
             scheduler.activeTasks.incrementAndGet();
             long startTime = System.nanoTime();
+            boolean cancelled = false;
+            Throwable failure = null;
             try {
                 scheduler.addSample(scheduler.waitTimeSamples, startTime - createdAtNanos);
 
                 if (state.get() == TaskState.CANCELLED) {
-                    scheduler.cancelledTasks.incrementAndGet();
-                    future.cancel(true);
-                    return;
-                }
-                if (ownerScope.isStopped() || scheduler.closed.get()) {
+                    cancelled = true;
+                } else if (ownerScope.isStopped() || scheduler.closed.get()) {
                     state.set(TaskState.CANCELLED);
-                    scheduler.cancelledTasks.incrementAndGet();
-                    future.cancel(true);
-                    return;
+                    cancelled = true;
+                } else {
+                    state.set(TaskState.RUNNING);
+                    work.run();
+                    state.set(TaskState.COMPLETED);
+                    scheduler.completedTasks.incrementAndGet();
                 }
-
-                state.set(TaskState.RUNNING);
-                work.run();
-                state.set(TaskState.COMPLETED);
-                scheduler.completedTasks.incrementAndGet();
-                future.complete(null);
             } catch (Throwable e) {
                 state.set(TaskState.FAILED);
-                scheduler.failedTasks.incrementAndGet();
-                future.completeExceptionally(e);
+                failure = e;
             } finally {
                 long execNanos = System.nanoTime() - startTime;
                 scheduler.totalExecutionTime.addAndGet(execNanos);
                 scheduler.addSample(scheduler.executionTimeSamples, execNanos);
-                scheduler.activeTasks.decrementAndGet();
                 // 终态任务不再需要句柄索引。不移除的话，每个生命周期执行过的
                 // 任务都会常驻 taskMap —— 一个跑几小时的服务端实例会稳定泄漏。
                 scheduler.taskMap.remove(taskId);
+
+                // 顺序是关键：先把 active 减回去，**之后**才唤醒 future 的等待方。
+                //
+                // 历史实现在 try 里 future.complete(null)，在 finally 里才
+                // activeTasks.decrementAndGet() —— 于是 await() 已经返回、调用方
+                // 立刻读 metrics() 仍能看到 active == 1，「任务已完成」与
+                // 「指标归零」之间留下一道可观测的裂缝（CI 上
+                // ResourceLeakTest.scheduler_tasksCleanedAfterCompletion 就是这么挂的，
+                // 同一形态也潜伏在 SchedulerTest.submit_executesTask 里）。
+                //
+                // 把 decrement 放在 complete 之前，可以让它 happens-before future
+                // 完成（CompletableFuture 的 result 是 volatile 写，get() 读到它即
+                // 建立 happens-before），于是「await() 返回后 active == 0」由 JMM
+                // 保证，而不是靠调用方 sleep 去赌时序。
+                scheduler.activeTasks.decrementAndGet();
+            }
+
+            // 通知放最后：等待方一被唤醒，看到的就必须是终态一致的指标。
+            if (cancelled) {
+                scheduler.cancelledTasks.incrementAndGet();
+                future.cancel(true);
+            } else if (failure != null) {
+                scheduler.failedTasks.incrementAndGet();
+                future.completeExceptionally(failure);
+            } else {
+                future.complete(null);
             }
         }
     }
