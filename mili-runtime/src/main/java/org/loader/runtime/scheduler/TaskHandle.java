@@ -60,6 +60,19 @@ record TaskHandleImpl(
         java.lang.Runnable cancellable
 ) implements TaskHandle {
 
+    /**
+     * 返回<b>实时</b>状态。
+     *
+     * <p>record 的自动访问器只会返回构造时传入的快照（永远是 QUEUED），
+     * 于是 {@code handle.state()} 在任务跑完、被取消之后仍然报 QUEUED ——
+     * 与「TaskState 提供等待/运行/完成/取消的状态查询」这条公开契约矛盾。
+     * 状态的真实来源是 {@link #stateRef}（执行线程会更新它）。
+     */
+    @Override
+    public TaskState state() {
+        return stateRef.get();
+    }
+
     @Override
     public boolean cancel() {
         TaskState current = stateRef.get();

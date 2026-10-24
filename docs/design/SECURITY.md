@@ -60,11 +60,13 @@ Minecraft 由 **Installer 在用户拥有合法获取条件时**从官方来源�
 
 ---
 
-## 强制检查（三套独立实现）
+## 强制检查
 
-### 1. Gradle `distributionBoundaryCheck`
+### 1. Gradle `distributionBoundaryCheck` + `verifyPlatformJar`
 
-任务定义：[`mili-loader/distribution-boundary.gradle.kts`](../../mili-loader/distribution-boundary.gradle.kts)
+任务实现：[`mili-loader/build.gradle.kts`](../../mili-loader/build.gradle.kts)
+（规则说明保留在 [`mili-loader/distribution-boundary.gradle.kts`](../../mili-loader/distribution-boundary.gradle.kts)，
+该文件已不再被 `apply` —— 早期写法在 `:mili-loader` 上注册不了任务，见 build 文件里的注释）
 
 递归扫描：
 
@@ -88,12 +90,17 @@ Minecraft 由 **Installer 在用户拥有合法获取条件时**从官方来源�
 - `SHA256SUMS` 存在
 - `release-manifest.json` 存在且含 `platformId`/`version`/`abi`/`minecraft`/`java`/`assets`
 
-### 2. CI shell 扫描（`distribution-boundary` job）
+### 2. CI 的 `module-boundary-check` job（模块**源码**边界，不是分发包扫描）
 
 [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml)
 
-**刻意不复用 Gradle 逻辑** —— 两套独立实现必须同时通过，
-否则其中之一的 bug 不可见。
+该 job 用 grep 校验源码级边界：`mili-runtime` 不得 import `org.loader.runtime.minecraft.*` /
+`org.loader.loader.*`，`mili-abi` 不得 import runtime/loader，也不得 import ASM。
+
+> **已知缺口**：文档曾声称存在一套「刻意不复用 Gradle 逻辑的独立 shell 扫描」，
+> 但仓库里并没有这个 job。目前分发包内容的检查只有 Gradle 侧一处实现
+> （`distributionBoundaryCheck` / `verifyPlatformJar`），单一实现意味着它的 bug 不可见。
+> 这不是"设计上的双保险"，是待补的一项。
 
 ### 3. `verifyPlatformJar` 强制断言
 
@@ -138,6 +145,33 @@ META-INF/mili/minecraft.json     构建指纹（版本、artifact hash、registr
 
 违规会被拒绝并记录 `AccessViolation`，可通过
 `ModClassLoaderManager.allViolations()` 审计。
+
+---
+
+## 这不是恶意代码沙箱
+
+**必须说清楚的一件事**：`ModClassLoader` 的可见性契约与 `Capability` / `Permission`
+模型是**架构边界**，不是**安全沙箱**。
+
+Mod 代码与平台、与 Minecraft **运行在同一个 JVM、同一个进程**里。由此可推出：
+
+| 边界 | 能防什么 | 不能防什么 |
+|---|---|---|
+| `ClassVisibility` 拒绝 `org.loader.loader.**` | 编译期依赖被误用、Mod 调用平台内部 API 导致版本锁死 | 反射（`setAccessible`）、`Unsafe`、字节码库、JNI |
+| `CapabilityToken` 注册/消费 | 依赖关系显式化、缺失能力时早失败 | 绕过门面直接调用底层对象 |
+| `PermissionManager` | 让高危操作**显式**、可审计 | 阻止有意绕过者读取文件/开 socket |
+| 独立 `ModClassLoader` | 类名冲突、Minecraft 类重复定义 | 恶意代码执行 |
+
+换句话说：**能装进 Mili 的 Mod 必须是可信任的代码**。这与 Fabric / Forge / Bukkit
+的既有事实一致 —— 它们同样不隔离恶意代码，任何声称"沙箱化 Mod"的 JVM 加载器都需要
+独立进程、自定义 SecurityManager（已废弃）或字节码级能力检查，Mili 三者都不用。
+
+因此：
+
+- 不要从不可信来源安装 Mod；
+- 能力/权限系统的目标是「**让 Mod 的行为可预期、可审计**」，而不是「限制恶意 Mod」；
+- 未来若要支持不可信 Mod，需要的是进程级隔离或 JVM 级沙箱方案，
+  那是架构变更，不是给 ClassLoader 加几条规则就能得到的。
 
 ---
 
