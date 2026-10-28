@@ -6,6 +6,7 @@ import org.loader.runtime.minecraft.reflect.Reflect;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -127,6 +128,9 @@ public final class MenuTransitionDispatch {
     private static volatile boolean bridgeFailed;
 
     private static volatile Method mFill;
+    private static volatile Method mFillGradient;
+    /** 缓存的 {@code Button$OnPress.onPress(Button)} —— 见 {@link #invokeOriginal}。 */
+    private static volatile Method mOnPress;
 
     private MenuTransitionDispatch() {
     }
@@ -186,6 +190,11 @@ public final class MenuTransitionDispatch {
                 pendingSwap = null;
                 if (swap != null) {
                     swap.run();
+                    // 这条 INFO 是「换屏真的发生了」的唯一正面证据 ——
+                    // invokeOriginal 的失败只进 stderr（WARNING），而它一旦
+                    // 失败玩家就停在主菜单。平台日志里能看到这行，才能把
+                    // 「进不去游戏」这类投诉与转场链路切割开。
+                    LOG.info("[Mili] 转场交棒：原版换屏已执行");
                 }
             }
             if (f.done() || f.expired()) {
@@ -220,22 +229,50 @@ public final class MenuTransitionDispatch {
         @SuppressWarnings("unchecked")
         List<Object> children = (List<Object>) screen.getClass()
                 .getMethod("children").invoke(screen);
-        for (Object widget : children) {
+        // 为什么用快照遍历：动作里的 replaceButton 会 removeWidget /
+        // addRenderableWidget —— 两者都直接增删 children 本体。在原列表上
+        // 边遍历边删，替换完第一个按钮迭代器立即 ConcurrentModificationException，
+        // 第二个按钮（多人游戏）永远接管不上（2026-10-28 真机自测连续 7 次 CME）。
+        forEachSnapshot(children, widget -> {
             if (!Reflect.gameClass(BUTTON).isInstance(widget)
                     || installedButtons.containsKey(widget)) {
-                continue;
+                return;
             }
-            int x = (int) invokeNoArg(widget, "getX");
-            int y = (int) invokeNoArg(widget, "getY");
-            int bw = (int) invokeNoArg(widget, "getWidth");
-            int bh = (int) invokeNoArg(widget, "getHeight");
+            int x;
+            int y;
+            int bw;
+            int bh;
+            try {
+                x = (int) invokeNoArg(widget, "getX");
+                y = (int) invokeNoArg(widget, "getY");
+                bw = (int) invokeNoArg(widget, "getWidth");
+                bh = (int) invokeNoArg(widget, "getHeight");
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
             for (int[] target : targets) {
                 if (x == target[0] && y == target[1]
                         && bw == BUTTON_W && bh == BUTTON_H) {
-                    replaceButton(screen, widget, y == targets[0][1]);
+                    try {
+                        replaceButton(screen, widget, y == targets[0][1]);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
                     break;
                 }
             }
+        });
+    }
+
+    /**
+     * 快照遍历：迭代器挂在 {@code children} 的副本上，动作里对原列表的
+     * 增删（removeWidget / addRenderableWidget）不会触发 CME。
+     * 包级可见供回归测试直接验证「遍历中修改原列表」的契约。
+     */
+    static void forEachSnapshot(List<Object> children,
+                                java.util.function.Consumer<Object> action) {
+        for (Object widget : new ArrayList<>(children)) {
+            action.accept(widget);
         }
     }
 
@@ -337,17 +374,41 @@ public final class MenuTransitionDispatch {
         }
     }
 
-    private static void invokeOriginal(Object onPress, Object button) {
+    /**
+     * 触发原版换屏回调。
+     *
+     * <p><b>为什么必须从接口 {@code Button$OnPress} 解析 Method</b>：
+     * 原版 OnPress 实例是 LambdaMetafactory 生成的 <b>hidden class</b>
+     * （JEP 371）。在 hidden class 上 {@code getClass().getMethod(...)} 得到的
+     * Method 其声明类就是 hidden class 本身，而 hidden class 的成员对定义
+     * 之外的一切类都不可访问 —— <b>连 public 修饰也照样抛
+     * {@code IllegalAccessException}</b>。2026-10-28 真机自测证实：涌起完成后
+     * 原版换屏从未执行，玩家被困在主菜单，每次点击都是白点（点单人、点多人
+     * 都只见转场动画，界面纹丝不动）。
+     * 从公开接口解析则声明类是 public 接口，跨 ClassLoader 的访问检查通过。
+     */
+    static void invokeOriginal(Object onPress, Object button) {
         try {
-            onPress.getClass()
-                    .getMethod("onPress", Reflect.gameClass(BUTTON))
-                    .invoke(onPress, button);
+            onPressMethod().invoke(onPress, button);
         } catch (Throwable t) {
             // 原版回调自身失败按原版语义向上抛是不可能的（反射包装）——
             // 记录后吞掉。到这里动画已结束或从未开始，界面已切走。
             errorCount.incrementAndGet();
             LOG.log(Level.WARNING, "[Mili] 原版按钮回调执行失败", t);
         }
+    }
+
+    private static Method onPressMethod() throws Exception {
+        Method m = mOnPress;
+        if (m == null) {
+            m = Class.forName(BUTTON + "$OnPress", true, Reflect.gameClassLoader())
+                    .getMethod("onPress", Reflect.gameClass(BUTTON));
+            // 防御性 setAccessible：声明类是 public 接口，正常无需豁免；
+            // 但游戏若运行在具名模块里，显式豁免可省去一次跨模块检查。
+            m.setAccessible(true);
+            mOnPress = m;
+        }
+        return m;
     }
 
     // ── 绘制 ────────────────────────────────────────────────────────────────
@@ -357,26 +418,38 @@ public final class MenuTransitionDispatch {
         int w = sessionWidth;
         int h = sessionHeight;
         if (f.phase() == LiquidGlassTransition.Phase.COVER) {
+            // 玻璃盘用上亮下暗的垂直渐变替代平涂：平涂 alpha 0.04 在游戏
+            // 背景上几乎不可见，渐变才读得出「玻璃的厚度」。
             int glassAlpha = (int) Math.round(s.coverFillAlpha(f) * 255.0);
+            int topAlpha = Math.min(255, (int) Math.round(glassAlpha * 3.2));
+            int bottomAlpha = Math.max(1, glassAlpha / 2);
+            drawDiscGradient(g, s, f, w, h,
+                    argb(topAlpha, GLASS_RGB), argb(bottomAlpha, GLASS_RGB));
             int rimAlpha = (int) Math.round(RIM_ALPHA * f.p());
-            int liquidAlpha = (int) Math.round(s.coverLiquidAlpha(f) * 255.0);
-            drawDisc(g, s, f, w, h, argb(glassAlpha, GLASS_RGB));
             drawRim(g, s, f, w, h, argb(rimAlpha, WHITE));
+            int liquidAlpha = (int) Math.round(s.coverLiquidAlpha(f) * 255.0);
             drawBeads(g, s, f, now, argb(liquidAlpha, LIQUID_RGB));
         } else {
-            drawDisc(g, s, f, w, h, argb(DRAIN_GLASS_ALPHA, GLASS_RGB));
-            int liquidAlpha = (int) Math.round(s.drainLiquidAlpha() * 255.0);
-            drawLiquidBand(g, s, f, now, w, argb(liquidAlpha, LIQUID_RGB),
-                    argb(RIM_ALPHA, WHITE));
+            int glassAlpha = DRAIN_GLASS_ALPHA;
+            drawDiscGradient(g, s, f, w, h,
+                    argb(Math.min(255, glassAlpha * 3), GLASS_RGB),
+                    argb(glassAlpha, GLASS_RGB));
+            // 液面随泻落进度淡出 —— 旧实现恒定 0.26 直到最后一帧戛然而止，
+            // 收尾观感是「闪断」；随 (1-q) 衰减后液面是滑出画面而不是消失。
+            double fade = 1.0 - f.p();
+            int liquidAlpha = (int) Math.round(s.drainLiquidAlpha() * 255.0 * fade);
+            int rimAlpha = (int) Math.round(RIM_ALPHA * fade);
+            if (liquidAlpha > 0 || rimAlpha > 0) {
+                drawLiquidBand(g, s, f, now, w, argb(liquidAlpha, LIQUID_RGB),
+                        argb(rimAlpha, WHITE));
+            }
         }
     }
 
-    /** 圆盘：逐 2px 列填充弦区间。约 250 列、250 次 fill。 */
-    private static void drawDisc(Object g, LiquidGlassTransition s,
-                                 LiquidGlassTransition.Frame f, int w, int h, int argb) {
-        if (argb >>> 24 == 0) {
-            return;
-        }
+    /** 圆盘：逐 2px 列做垂直渐变填充（顶亮底暗）。约 250 列、250 次 fillGradient。 */
+    private static void drawDiscGradient(Object g, LiquidGlassTransition s,
+                                         LiquidGlassTransition.Frame f, int w, int h,
+                                         int topArgb, int bottomArgb) {
         int x0 = Math.max(0, f.cx() - f.r());
         int x1 = Math.min(w - 1, f.cx() + f.r());
         for (int x = x0; x <= x1; x += STRIDE) {
@@ -385,7 +458,12 @@ public final class MenuTransitionDispatch {
                 continue;
             }
             int bottom = Math.min(s.discBottomY(f, x) + 1, h);
-            fill(g, x, Math.max(0, top), Math.min(x + STRIDE, w), bottom, argb);
+            int y0 = Math.max(0, top);
+            if (bottom <= y0) {
+                continue;
+            }
+            fillGradient(g, x, y0, Math.min(x + STRIDE, w), bottom,
+                    topArgb, bottomArgb);
         }
     }
 
@@ -437,6 +515,23 @@ public final class MenuTransitionDispatch {
     private static int argb(int alpha, int rgb) {
         int a = Math.max(0, Math.min(255, alpha));
         return (a << 24) | (rgb & 0xFFFFFF);
+    }
+
+    /** 反射 fillGradient —— 缓存 Method；失败策略与 {@link #fill} 相同。 */
+    private static void fillGradient(Object g, int x0, int y0, int x1, int y1,
+                                     int col1, int col2) {
+        try {
+            Method m = mFillGradient;
+            if (m == null) {
+                m = Reflect.gameClass(GRAPHICS)
+                        .getMethod("fillGradient", int.class, int.class, int.class,
+                                int.class, int.class, int.class);
+                mFillGradient = m;
+            }
+            m.invoke(g, x0, y0, x1, y1, col1, col2);
+        } catch (Throwable t) {
+            errorCount.incrementAndGet();
+        }
     }
 
     /** 反射 fill —— 缓存 Method；单条失败只计数（与 ModListScreenDispatch 同策略）。 */

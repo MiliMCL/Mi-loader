@@ -186,3 +186,40 @@ init 回调里定义桥接类来得及"。26.2 反编译源证伪：`LoadingOver
 
 随修附带：`MiliMapping` 符号目录补上此前遗漏的
 `SCREEN_EXTRACT_RENDER_STATE` 并新增 `SCREEN_INIT`（目录 8 → 10 条）。
+
+## 9. 实装修整记录（2026-10-28 · 真机自测「进不去游戏」后）
+
+分发包（core 2026-10-24 17:52）真机复现：点「单人游戏 / 多人游戏」只播转场
+动画，换屏从不发生，玩家被困主菜单。`-Dmili.selftest.transition=true` 自测
+抓到两个真实缺陷（stderr 18 次 IllegalAccessException + 7 次 CME）：
+
+**缺陷一：hidden class 访问 —— 换屏从未执行**
+
+`invokeOriginal` 用 `onPress.getClass().getMethod("onPress", Button.class)`
+反射调用原版回调。原版 OnPress 是 LambdaMetafactory 生成的 **hidden class**
+（JEP 371）：getMethod 的声明类解析为 hidden class 本身，而 hidden class 的
+成员对定义之外的一切类不可访问，**public 修饰也不豁免**，invoke 一律抛
+`IllegalAccessException`。涌起完成 → swapDue → 原版回调炸 → 被吞 →
+界面纹丝不动。失败只进 stderr，mili-platform.log 全程无异常 ——
+正是本项目定义的「静默失效」。
+
+修复：从公开接口 `Button$OnPress` 解析（声明类 public 接口，跨 CL 访问
+检查通过）并缓存（`onPressMethod()`）。换屏成功现在会打一条 INFO
+「转场交棒：原版换屏已执行」—— 它是「换屏真的发生了」的唯一正面证据。
+
+**缺陷二：遍历中修改 children —— 按钮接管只完成一半**
+
+`takeoverButtons` 边遍历 `children()` 边 `removeWidget`：替换完第一个按钮
+（单人）迭代器立即 CME，第二个按钮（多人）从未接管。每次 TitleScreen
+init / resize 都重复。
+
+修复：`forEachSnapshot` —— 迭代器挂快照，动作里对原列表的增删不 CME。
+单元回归 `MenuTransitionDispatchRegressionTest` 同时锁住两个缺陷
+（lambda hidden class 用例对旧实现必然红）。
+
+**动效微调（绘制层，状态机参数不动）**
+
+- 玻璃盘平涂（alpha 0.04，游戏背景上几乎不可见）→ 上亮下暗垂直渐变
+  （`GuiGraphicsExtractor.fillGradient`），读得出「玻璃厚度」。
+- 泻落期液面恒定 0.26 直到末帧戛然而止 → 随 (1−q) 淡出，
+  液面是滑出画面而不是闪断；透明后整带跳过绘制。
