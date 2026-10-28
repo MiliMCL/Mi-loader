@@ -6,7 +6,7 @@ package org.loader.api;
  * 这些值与 gradle.properties 保持一致：
  * <ul>
  *     <li>miliPlatformVersion = {@link #CURRENT_VERSION} ("0.1.0")</li>
- *     <li>miliAbiVersion = {@link #ABI_VERSION} (1)</li>
+ *     <li>miliAbiVersion = {@link #ABI_VERSION} (2)</li>
  *     <li>minecraftVersion = {@link #TARGET_MINECRAFT} ("26.2")</li>
  *     <li>javaVersion = {@link #TARGET_JAVA} (25)</li>
  * </ul>
@@ -23,7 +23,7 @@ public final class VersionInfo {
     public static final String CURRENT_VERSION = "0.1.0";
 
     /** ABI 版本 —— Mod 编译和验证的目标契约版本。整数，从 1 递增。 */
-    public static final int ABI_VERSION = 1;
+    public static final int ABI_VERSION = 2;
 
     /** 目标 Java 主版本。 */
     public static final int TARGET_JAVA = 25;

@@ -8,7 +8,7 @@
   "entrypoint": "com.example.TestMod",
   "mili": {
     "platform": "0.1.0",
-    "abi": 1,
+    "abi": 2,
     "minecraft": "26.2"
   },
   "dependencies": []

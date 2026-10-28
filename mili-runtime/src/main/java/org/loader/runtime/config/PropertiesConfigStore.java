@@ -53,8 +53,15 @@ public final class PropertiesConfigStore implements ConfigService.Provider {
         this(Path.of(DEFAULT_CONFIG_DIR));
     }
 
-    /** 测试 / 定制目录构造器。 */
-    PropertiesConfigStore(Path baseDir) {
+    /**
+     * 定制目录构造器。
+     *
+     * <p>{@code public} 而不是包级：平台装配时必须把配置根目录指向
+     * {@code <gameDir>/config/mili}，而 gameDir 只有 loader 知道。
+     * 包级可见会让 loader 只能使用默认的相对路径 ——
+     * 那在分发包布局下会把配置写到进程工作目录，与游戏目录脱节。
+     */
+    public PropertiesConfigStore(Path baseDir) {
         this.baseDir = baseDir;
     }
 

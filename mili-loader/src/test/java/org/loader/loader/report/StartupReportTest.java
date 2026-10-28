@@ -36,7 +36,8 @@ class StartupReportTest {
         @SuppressWarnings("unchecked")
         Map<String, Object> platform = (Map<String, Object>) root.get("platform");
         assertEquals("0.1.0", platform.get("miliVersion"));
-        assertEquals(1.0, ((Number) platform.get("abiVersion")).doubleValue());
+        assertEquals((double) org.loader.api.VersionInfo.ABI_VERSION,
+                ((Number) platform.get("abiVersion")).doubleValue());
         assertEquals("26.2", platform.get("minecraftVersion"));
 
         @SuppressWarnings("unchecked")

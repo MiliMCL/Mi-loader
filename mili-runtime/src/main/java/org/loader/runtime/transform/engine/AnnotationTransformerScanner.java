@@ -72,15 +72,21 @@ public final class AnnotationTransformerScanner {
      * 而 {@link MiliMapping} 用完整坐标作 key。两者共存的前提是
      * 下面的解析在加载期执行（只发生一次），不在热路径上。
      */
-    private static final Map<String, TargetMethod> SYMBOLS = Map.of(
-            "minecraft.server.tick", MiliSymbol.SERVER_TICK,
-            "minecraft.server.tick_children", MiliSymbol.SERVER_TICK_CHILDREN,
-            "minecraft.client.level_tick", MiliSymbol.CLIENT_LEVEL_TICK,
-            "minecraft.client.tick", MiliSymbol.CLIENT_TICK,
-            "minecraft.client.brand", MiliSymbol.CLIENT_BRAND,
-            "minecraft.client.title_screen_init", MiliSymbol.TITLE_SCREEN_INIT,
-            "minecraft.client.main", MiliSymbol.CLIENT_MAIN,
-            "minecraft.server.main", MiliSymbol.SERVER_MAIN);
+    private static final Map<String, TargetMethod> SYMBOLS = Map.ofEntries(
+            Map.entry("minecraft.server.tick", MiliSymbol.SERVER_TICK),
+            Map.entry("minecraft.server.tick_children", MiliSymbol.SERVER_TICK_CHILDREN),
+            Map.entry("minecraft.client.level_tick", MiliSymbol.CLIENT_LEVEL_TICK),
+            Map.entry("minecraft.client.tick", MiliSymbol.CLIENT_TICK),
+            Map.entry("minecraft.client.brand", MiliSymbol.CLIENT_BRAND),
+            Map.entry("minecraft.client.title_screen_init", MiliSymbol.TITLE_SCREEN_INIT),
+            // Screen 基类的两个锚点：转场渲染出口与按钮接管出口。
+            // 它们与 TITLE_SCREEN_INIT 是两个不同的类，不能混用 ——
+            // Screen#init(II)V 是 Screen 自己定义的方法，TitleScreen#init()V
+            // 是子类重写，两者描述符不同、注入点也不在同一段字节码里。
+            Map.entry("minecraft.client.screen_init", MiliSymbol.SCREEN_INIT),
+            Map.entry("minecraft.client.screen_render_state", MiliSymbol.SCREEN_EXTRACT_RENDER_STATE),
+            Map.entry("minecraft.client.main", MiliSymbol.CLIENT_MAIN),
+            Map.entry("minecraft.server.main", MiliSymbol.SERVER_MAIN));
 
     /**
      * 校验：短名表必须与 {@link MiliMapping} 覆盖同一批坐标。

@@ -118,6 +118,52 @@ public interface ModContext {
     }
 
     /**
+     * 本 Mod 的持久化配置。
+     *
+     * <p>与 {@link #storage()} 的分工：storage 是「平台替你管的少量状态」
+     * （启动次数、窗口位置），config 是「玩家会去手改的文件」
+     * （{@code config/mili/<modId>.properties}）。两者都是 Properties，
+     * 但语义不同：storage 的键由 Mod 自己起名、玩家不该动；
+     * config 的键是对外契约，改坏了要能优雅降级。
+     *
+     * <p>同一 modId 每次返回同一实例 —— 两份实例会让「内存已改、磁盘未存」
+     * 的状态出现分叉。
+     *
+     * @throws org.loader.api.config.ConfigUnavailableException 平台尚未装配配置服务
+     */
+    default org.loader.api.config.ModConfig config() {
+        return org.loader.api.config.ConfigService.load(modId());
+    }
+
+    /**
+     * 跨 Mod 服务代理 —— 向其他 Mod 提供 / 发现服务。
+     *
+     * <p>这是 Mod 之间<b>唯一</b>的显式协作通道。能力（capability）回答
+     * 「平台给了我这个 Mod 什么权限」，服务（service）回答
+     * 「别的 Mod 能为我做什么」，两者不可互换。
+     *
+     * @return 绑定到本 Mod 的服务代理（发布时记录归属，停止时自动撤销）
+     */
+    org.loader.api.service.ServiceBroker services();
+
+    /**
+     * Tick 服务 —— 按 tick 计数调度工作。
+     *
+     * <p>与 {@link #scheduler()} 的分工：scheduler 按墙钟时间（毫秒），
+     * tick 按游戏逻辑节拍。游戏卡顿时两者会分叉，需要与游戏节奏对齐的
+     * 逻辑（例如「每 20 tick 检查一次」）必须用本服务。
+     */
+    org.loader.api.tick.TickService tick();
+
+    /**
+     * 权限管理器 —— 检查本 Mod 是否被授予某项权限。
+     *
+     * <p>默认策略是「拒绝即默认」：Mod 未被显式授予的权限一律为 false。
+     * 高风险管理操作（网络、原生库、覆盖他人字节码）必须由用户配置显式放行。
+     */
+    org.loader.api.permission.PermissionManager permissions();
+
+    /**
      * Returns the environment type (CLIENT, SERVER, DEDICATED_SERVER).
      */
     Environment environment();

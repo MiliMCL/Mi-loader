@@ -14,6 +14,7 @@
 | `execution/CURRENT_IMPLEMENTATION_STATE.md` | **完全过时**，该文件名极具误导性 |
 | `execution/THREAD_MODEL.md` | 基于已删除的轮询式 tick 设计 |
 | `API_REFERENCE.md` 的部分签名 | 签名已变更（如 `ModClassLoader.getClassLoader()` → 继承自 URLClassLoader） |
+| 各文档中的 `ABI_VERSION = 1` / `"abi": 1` | ABI 已升到 **2**（新增 TickEvent / ServiceBroker / TickService 等） |
 
 ## 应该读哪个
 

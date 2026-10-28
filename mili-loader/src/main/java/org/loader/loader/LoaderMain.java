@@ -399,6 +399,14 @@ public class LoaderMain {
             Mod mod = new Mod(manifest, modScope, mcl);
             loadedMods.add(mod);
             modScope.registerResource(mod);
+            // 交给生命周期管理器统一推进/关闭：这是 Scope 顺序确定性的唯一来源。
+            runtime.lifecycleManager().registerScope(modScope);
+            // Scope 的每次迁移都发到平台总线，让 Mod 之间能观察彼此的就绪。
+            modScope.addListener((scope, from, to) ->
+                    runtime.events().post(new org.loader.api.event.ModLifecycleEvent(
+                            manifest.id(),
+                            apiLifecycleState(from),
+                            apiLifecycleState(to))));
         }
         timeline.mark("createModClassLoaders");
 
@@ -433,6 +441,18 @@ public class LoaderMain {
         }
         mcProvider().declaredBlocks(Map.copyOf(declaredBlocksByMod));
         mcProvider().declaredItems(Map.copyOf(declaredItemsByMod));
+
+        // 契约门面接通：Mili.mod(...) / Mili.events() / Mili.modIds()
+        //
+        // 在此之前 Mili.registerProvider 从未被调用过 —— 整个
+        // org.loader.api.Mili 类在生产路径上是死的，任何 Mod 调
+        // Mili.mod(this) 都只会拿到 Optional.empty()。
+        installMiliFacade();
+
+        // 全部 Mod 初始化完成 —— 发布 READY，让 Mod 能在「大家都就绪」
+        // 这个时刻做一次全局汇总。
+        runtime.publishPlatformStage(
+                org.loader.api.event.PlatformStage.READY, loadedMods.size());
 
         PlatformLog.info("ClassLoader 拓扑:\n" + classLoaderManager.diagnostics());
         timeline.mark("declareContent");
@@ -565,7 +585,12 @@ public class LoaderMain {
                 }
 
                 Object instance = clazz.getDeclaredConstructor().newInstance();
-                ModContext runtimeCtx = new ModContext(mod);
+                // 装配模式：接平台总线、服务代理、权限、tick 容器与数据目录。
+                // 独立模式（new ModContext(mod)）只给每个 Mod 一条私有总线，
+                // 那样 Mod 收不到任何平台事件 —— 这里必须传 runtime。
+                ModContext runtimeCtx = new ModContext(
+                        mod, runtime, runtime.tickEngine(),
+                        gameDir.resolve("config").resolve("mili").resolve("data"));
                 // 环境必须在 Mod 的 initialize() 之前注入。
                 // 旧实现让 runtime 自己兜底成 DEDICATED_SERVER，而构造时
                 // 没人设置 —— 结果每个客户端 Mod 都以为自己在服务器上，
@@ -580,6 +605,10 @@ public class LoaderMain {
 
                 // 传给 Mod 的是契约接口的实现，不是 runtime 的具体类。
                 org.loader.api.ModContext apiCtx = new ApiModContext(runtimeCtx);
+                // 缓存契约视图：ApiModContext 构造时会把自己作为 Scope 资源注册
+                // （用于在 Mod 停止时注销平台总线上的监听器）。每次 Mili.mod(...)
+                // 都新建一个，就会往同一个 Scope 里无限追加资源。
+                apiContexts.put(mod.id(), apiCtx);
                 ((org.loader.api.Mod) instance).initialize(apiCtx);
 
                 modContexts.put(mod.id(), runtimeCtx);
@@ -590,6 +619,17 @@ public class LoaderMain {
                 collectDeclaredItems(mod.id(), apiCtx);
 
                 PlatformLog.info("Mod initialized: " + mod.id() + " -> " + entrypoint);
+
+                // 初始化成功后把 Scope 推进到 RUNNING。
+                //
+                // 这一步以前完全缺失：Mod 的 Scope 永远停在 DISCOVERED，
+                // 于是
+                //   · lifecycle().state() 恒为 DISCOVERED，
+                //     ABI 的 allowsNewWork() 对它返回 false；
+                //   · 生命周期监听器一次都不会被调用（没有迁移就没有事件）；
+                //   · LifecycleManager.startAll() 看不到任何受管 Scope。
+                // 症状是「Mod 的 lifecycle 回调永远不触发」，且没有任何日志。
+                mod.scope().driveToRunning();
 
                 // 只记成功路径：失败的 Mod 会立刻抛出并终止整个启动，
                 // 那时最重要的信息是异常本身，不是它花了多久。用 mark 而不是
@@ -626,6 +666,16 @@ public class LoaderMain {
     /** 已装配的 runtime ModContext，供关闭阶段与诊断使用。 */
     private final Map<String, ModContext> modContexts = new LinkedHashMap<>();
 
+    /**
+     * 已装配的契约视图（每个 Mod 一个，构造时创建）。
+     *
+     * <p>必须缓存而不是每次现造：{@code ApiModContext} 会把事件视图注册为
+     * Mod 的 Scope 资源，每次新建都会追加一条资源记录 ——
+     * 一个频繁调用 {@code Mili.mod(...)} 的 Mod 会让 Scope 的资源表无限增长，
+     * 且关闭时对同一批监听器反复尝试注销。
+     */
+    private final Map<String, org.loader.api.ModContext> apiContexts = new LinkedHashMap<>();
+
     /** per-mod 持久化存储；在 Mod 初始化之前装配，在关停时落盘。 */
     private org.loader.runtime.storage.ModStorageService storageService;
 
@@ -641,6 +691,25 @@ public class LoaderMain {
                 + (storageService.persistent()
                 ? storageService.directory().toString()
                 : "仅内存（目录不可写）"));
+
+        // 配置服务 —— 必须在 Mod 的 initialize() 之前装配。
+        //
+        // 以前它装在 MinecraftGameProvider.launch() 里，也就是 Mod 初始化
+        // <b>之后</b>。于是任何在 initialize() 里调用 ConfigService.load()
+        // 的 Mod 都会收到 ConfigUnavailableException，而错误信息说的是
+        // 「平台尚未启动到运行期」—— 与实际原因（装配顺序）完全不符。
+        org.loader.api.config.ConfigService.registerProvider(
+                new org.loader.runtime.config.PropertiesConfigStore(
+                        gameDir.resolve("config").resolve("mili")));
+        PlatformLog.info("[Mili] 配置服务: "
+                + gameDir.resolve("config").resolve("mili"));
+
+        // 事件监听器异常接到平台日志 —— 否则「某个 Mod 的监听器每 tick 抛一次」
+        // 只会在内存里留一个计数，日志里一条都没有。
+        runtime.events().setErrorSink((busId, listener, event, error) ->
+                PlatformLog.warn("事件监听器异常 [" + busId + "] "
+                        + event.getClass().getName() + " -> "
+                        + listener.getClass().getName() + ": " + error));
 
         // 客户端服务（屏幕 / 按键）也必须在这里装配。
         //
@@ -791,6 +860,10 @@ public class LoaderMain {
             }
         }
         loadedMods.clear();
+        // 契约视图持有 Mod 的对象图（事件视图、服务代理视图），
+        // 不清掉会让整条链在 Loader 实例上继续可达。
+        apiContexts.clear();
+        modContexts.clear();
 
         // Mod 全部关闭后再落盘：此时 Mod 的 shutdown 钩子已经把最终状态写进内存。
         if (storageService != null) {
@@ -823,6 +896,163 @@ public class LoaderMain {
         }
 
         reportShutdownAudit(classesPerMod);
+    }
+
+    /**
+     * 装配 {@link org.loader.api.Mili} 的 provider。
+     *
+     * <h2>为什么这一步不能省</h2>
+     * {@code Mili} 是契约里声明的「Primary entry point to the Mili public API」，
+     * 但 {@code Mili.registerProvider} 在生产代码里<b>零调用者</b> ——
+     * 于是 {@code Mili.mod(this)} 恒为空、{@code Mili.apiVersion()} 之外的
+     * 一切门面方法都不可用。这类「声明了但没接线」的 API 比没有更糟：
+     * 调用方看到的是 {@code Optional.empty()}，会以为「我的 Mod 没被识别」，
+     * 而实际是平台没装 provider。
+     */
+    private void installMiliFacade() {
+        org.loader.api.Mili.registerProvider(new org.loader.api.Mili.MiliProvider() {
+            @Override
+            public java.util.Optional<org.loader.api.ModContext> findMod(Object modInstance) {
+                if (modInstance == null) {
+                    return java.util.Optional.empty();
+                }
+                for (Mod m : loadedMods) {
+                    ModContext ctx = modContexts.get(m.id());
+                    if (ctx == null) {
+                        continue;
+                    }
+                    // 实例 → 上下文：Mod 的入口类由自己的 ClassLoader 定义，
+                    // 因此按「加载器」匹配，而不是按对象身份
+                    // （同一个 Mod 可能被多次实例化，例如测试）。
+                    ClassLoader instanceLoader = modInstance.getClass().getClassLoader();
+                    if (instanceLoader == ctx.classLoader()) {
+                        return java.util.Optional.ofNullable(apiContexts.get(m.id()));
+                    }
+                }
+                return java.util.Optional.empty();
+            }
+
+            @Override
+            public java.util.Optional<org.loader.api.ModContext> findMod(String modId) {
+                return modId == null
+                        ? java.util.Optional.empty()
+                        : java.util.Optional.ofNullable(apiContexts.get(modId));
+            }
+
+            @Override
+            public org.loader.api.event.EventBus events() {
+                return new PlatformBusView(runtime);
+            }
+
+            @Override
+            public java.util.List<String> modIds() {
+                return loadedMods.stream().map(Mod::id).toList();
+            }
+        });
+        PlatformLog.info("[Mili] 契约门面已接通: " + loadedMods.size() + " 个 Mod");
+    }
+
+    /**
+     * 无归属的平台总线视图 —— {@link org.loader.api.Mili#events()} 的返回值。
+     *
+     * <p>与 {@code ctx.events()} 的区别：这里注册的监听器<b>不随任何 Mod
+     * 注销</b>。它面向的是「拿不到 context 的位置」（静态工具类、
+     * 转换器回调），调用方必须自己负责生命周期。
+     */
+    private static final class PlatformBusView implements org.loader.api.event.EventBus {
+
+        private final org.loader.runtime.service.EventBus bus;
+
+        PlatformBusView(org.loader.runtime.kernel.Runtime runtime) {
+            this.bus = runtime.events();
+        }
+
+        @Override
+        public <T> void addListener(Class<T> eventType,
+                                    org.loader.api.event.EventListener<T> listener) {
+            bus.addListener(eventType, listener::onEvent);
+        }
+
+        @Override
+        public <T> void removeListener(Class<T> eventType,
+                                       org.loader.api.event.EventListener<T> listener) {
+            // 无归属视图无法反查包装器 —— 如实说明限制，而不是假装移除了。
+            throw new UnsupportedOperationException(
+                    "Mili.events() 注册的监听器不支持按身份移除（无法反查包装器）。"
+                            + "需要可退订时请用 ctx.events().subscribe(...) 拿 Subscription。");
+        }
+
+        @Override
+        public <T> org.loader.api.event.Subscription subscribe(
+                Class<T> eventType, org.loader.api.event.EventListener<T> listener) {
+            org.loader.runtime.service.EventBus.EventListener<T> forward = listener::onEvent;
+            bus.addListener(eventType, forward);
+            return new org.loader.api.event.Subscription() {
+                private volatile boolean active = true;
+
+                @Override
+                public void unsubscribe() {
+                    if (active) {
+                        active = false;
+                        bus.removeListener(eventType, forward);
+                    }
+                }
+
+                @Override
+                public boolean isActive() {
+                    return active;
+                }
+            };
+        }
+
+        @Override
+        public <T> void post(T event) {
+            bus.post(event);
+        }
+
+        @Override
+        public <T> java.util.concurrent.CompletableFuture<Void> postAsync(T event) {
+            return bus.postAsync(event);
+        }
+
+        @Override
+        public boolean hasListeners(Class<?> eventType) {
+            return bus.hasListeners(eventType);
+        }
+
+        @Override
+        public int listenerCount() {
+            return bus.listenerCount();
+        }
+
+        @Override
+        public void close() {
+            // 平台总线由 Runtime 关闭，这里不提供关闭入口
+            throw new UnsupportedOperationException(
+                    "平台总线由 Runtime 管理，不能由 Mod 关闭");
+        }
+    }
+
+    /**
+     * runtime 生命周期状态 → 契约状态。
+     *
+     * <p>两侧枚举同名同序，但仍显式 switch：用 {@code valueOf(name())}
+     * 会在任一侧新增枚举值时静默抛 {@code IllegalArgumentException}
+     * （发生在事件发布路径上，会被吞掉），而 switch 会编译失败。
+     */
+    private static org.loader.api.lifecycle.LifecycleState apiLifecycleState(
+            org.loader.runtime.kernel.LifecycleState state) {
+        return switch (state) {
+            case DISCOVERED -> org.loader.api.lifecycle.LifecycleState.DISCOVERED;
+            case RESOLVED -> org.loader.api.lifecycle.LifecycleState.RESOLVED;
+            case LOADED -> org.loader.api.lifecycle.LifecycleState.LOADED;
+            case INITIALIZED -> org.loader.api.lifecycle.LifecycleState.INITIALIZED;
+            case REGISTERED -> org.loader.api.lifecycle.LifecycleState.REGISTERED;
+            case RUNNING -> org.loader.api.lifecycle.LifecycleState.RUNNING;
+            case STOPPING -> org.loader.api.lifecycle.LifecycleState.STOPPING;
+            case STOPPED -> org.loader.api.lifecycle.LifecycleState.STOPPED;
+            case FAILED -> org.loader.api.lifecycle.LifecycleState.FAILED;
+        };
     }
 
     /**

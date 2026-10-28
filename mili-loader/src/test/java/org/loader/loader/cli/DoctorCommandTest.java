@@ -70,7 +70,8 @@ class DoctorCommandTest {
         if (depsJson != null) {
             sb.append(",\"dependencies\":").append(depsJson);
         }
-        sb.append(",\"mili\":{\"platform\":\"0.1.0\",\"abi\":1,\"minecraft\":\"26.2\"}}");
+        sb.append(",\"mili\":{\"platform\":\"0.1.0\",\"abi\":").append(
+                org.loader.api.VersionInfo.ABI_VERSION).append(",\"minecraft\":\"26.2\"}}");
         return sb.toString();
     }
 
@@ -198,7 +199,8 @@ class DoctorCommandTest {
     @Test
     @DisplayName("ABI 不匹配：MOD_ABI_MISMATCH")
     void abiMismatch() {
-        String wrongAbi = manifest("wrongabi", null).replace("\"abi\":1", "\"abi\":99");
+        String wrongAbi = manifest("wrongabi", null)
+                .replace("\"abi\":" + org.loader.api.VersionInfo.ABI_VERSION, "\"abi\":99");
         writeJar(modsDir(), "wrongabi.jar", manifestOnly(wrongAbi));
         Out o = run(tmp.toString());
         assertEquals(1, o.code());

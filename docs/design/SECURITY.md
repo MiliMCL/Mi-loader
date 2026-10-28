@@ -126,7 +126,7 @@ META-INF/mili/minecraft.json     构建指纹（版本、artifact hash、registr
 ## Mod 可见性（与分发边界相关）
 
 即使 Minecraft 不在分发包中，Mod 也不得触碰平台实现。
-见 [CLASSLOADER.md](CLASSLOADER.md) 的可见性契约。
+见 [CLASSLOADER.md](../architecture/CLASSLOADER.md) 的可见性契约。
 
 要点：
 
@@ -149,7 +149,7 @@ Mod 必须精确声明平台绑定：
 {
   "mili": {
     "platform": "0.1.0",
-    "abi": 1,
+    "abi": 2,
     "minecraft": "26.2"
   }
 }

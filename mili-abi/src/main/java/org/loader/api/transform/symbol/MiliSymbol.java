@@ -157,6 +157,53 @@ public final class MiliSymbol {
             "init",
             "()V");
 
+    /**
+     * 屏幕渲染出口 —— 液态玻璃转场的绘制锚点。
+     *
+     * <p>坐标经 26.2 反编译源核实：
+     * <pre>
+     * net.minecraft.client.gui.screens.Screen#extractRenderStateWithTooltipAndSubtitles(
+     *         GuiGraphicsExtractor, int, int, float)V
+     * </pre>
+     *
+     * <p>{@code public final}、只在 {@code Screen} 定义一次、方法体无
+     * early return —— 对它 RETURN 注入，每帧在整屏（含 tooltip）画完之后
+     * 恰好触发一次，转换 Screen 一个类即覆盖全部屏幕。刻意<b>不用</b>
+     * Overlay：26.2 的 {@code Gui.extractRenderState} 对 overlay 与 screen
+     * 是 if / else if 互斥渲染，挂 Overlay 的瞬间旧屏就不再绘制，
+     * 「玻璃透出下层内容」的核心观感会直接消失。
+     */
+    public static final TargetMethod SCREEN_EXTRACT_RENDER_STATE = TargetMethod.of(
+            "net/minecraft/client/gui/screens/Screen",
+            "extractRenderStateWithTooltipAndSubtitles",
+            "(Lnet/minecraft/client/gui/GuiGraphicsExtractor;IIF)V");
+
+    /**
+     * 屏幕初始化出口 —— 液态玻璃转场的「按钮接管」锚点。
+     *
+     * <p>坐标经 26.2 反编译源核实：
+     * <pre>
+     * net.minecraft.client.gui.screens.Screen#init(int, int)V
+     * </pre>
+     *
+     * <p>{@code public final}、只在 {@code Screen} 定义一次；由
+     * {@code Gui} 的 setScreen 路径（与 resize）调用，方法体在
+     * {@code !initialized} 分支里先跑 {@code init()}（子类在此创建按钮）
+     * 再返回 —— 对它 RETURN 注入，回调触发时<b>原版按钮已存在</b>。
+     *
+     * <p>历史注记（2026-10-24 热修）：此锚点原为
+     * {@code TitleScreen#init()V}，但转换管线对同一类的多个转换器是
+     * 「各自基于原始字节独立转换、后者覆盖前者」，于是本转换器的
+     * TitleScreen 注入被注册序更靠后的 {@code mili-core-title-screen}
+     * （Mods 按钮，HEAD 注入同一方法）静默丢弃 —— 桥接类失去定义时机，
+     * 渲染钩子在加载遮罩阶段解析失败导致真机崩溃。挪到 Screen 基类后
+     * 本转换器是 Screen 的唯一转换器，冲突类别上消失。
+     */
+    public static final TargetMethod SCREEN_INIT = TargetMethod.of(
+            "net/minecraft/client/gui/screens/Screen",
+            "init",
+            "(II)V");
+
     // ── 引导 ───────────────────────────────────────────────────────────────
 
     /**
@@ -195,6 +242,8 @@ public final class MiliSymbol {
     public static boolean isClientOnly(TargetMethod symbol) {
         return CLIENT_LEVEL_TICK.equals(symbol) || CLIENT_MAIN.equals(symbol)
                 || CLIENT_TICK.equals(symbol)
-                || CLIENT_BRAND.equals(symbol) || TITLE_SCREEN_INIT.equals(symbol);
+                || CLIENT_BRAND.equals(symbol) || TITLE_SCREEN_INIT.equals(symbol)
+                || SCREEN_EXTRACT_RENDER_STATE.equals(symbol)
+                || SCREEN_INIT.equals(symbol);
     }
 }

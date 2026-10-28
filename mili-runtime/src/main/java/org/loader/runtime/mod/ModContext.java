@@ -1,13 +1,22 @@
 package org.loader.runtime.mod;
 
-import org.loader.runtime.kernel.*;
+import org.loader.api.service.ServiceBroker;
+import org.loader.api.tick.TickService;
 import org.loader.runtime.RuntimeEnvironment;
+import org.loader.runtime.kernel.*;
+// 显式导入：kernel.* 通配符会让 `Runtime` 在 java.lang.Runtime 与
+// kernel.Runtime 之间产生歧义（"对Runtime的引用不明确"）。
+import org.loader.runtime.kernel.Runtime;
 import org.loader.runtime.scheduler.Scheduler;
 import org.loader.runtime.scheduler.TaskHandle;
 import org.loader.runtime.scheduler.TaskPriority;
 import org.loader.runtime.service.*;
+import org.loader.runtime.tick.NoTickService;
+import org.loader.runtime.tick.TickEngineHolder;
+import org.loader.runtime.tick.TickServiceImpl;
 import org.loader.runtime.util.ModLogger;
 
+import java.nio.file.Path;
 import java.util.*;
 
 /**
@@ -19,30 +28,76 @@ import java.util.*;
  * ModContext
  * ├── lifecycle    (scope / isActive)
  * ├── scheduler    (submit tasks)
- * ├── events       (EventBus)
- * ├── registry     (typed Registry)
- * ├── configuration
+ * ├── events       (platform EventBus)
+ * ├── services     (inter-mod ServiceBroker)
+ * ├── tick         (tick-counted scheduling)
+ * ├── permissions  (permission queries)
+ * ├── registry     (Minecraft content registration)
  * ├── resources    (ResourceManager)
+ * ├── storage      (persistent KV)
  * ├── capabilities
  * ├── logger
  * └── environment  (RuntimeEnvironment)
  * </pre>
+ *
+ * <h2>两种构造方式</h2>
+ * <ul>
+ *   <li>{@link #ModContext(Mod)} —— <b>独立模式</b>：每个 Mod 拿一条自己的
+ *       事件总线、没有 tick 源。测试与纯 JVM 场景用这个。</li>
+ *   <li>{@link #ModContext(Mod, Runtime, TickEngine, Path)} —— <b>装配模式</b>：
+ *       接平台总线、服务代理、权限、tick 引擎与数据目录。Loader 用这个。</li>
+ * </ul>
+ * 两者行为差异只在「跨 Mod 可见性」，不涉及任何单 Mod 语义 ——
+ * 因此同一个 Mod 在两种模式下都能跑通自己的逻辑。
  */
 public class ModContext {
 
     private final Mod mod;
     private final ModLogger logger;
 
+    /** 装配模式下的平台组件；独立模式下为 {@code null}。 */
+    private final Runtime runtime;
+    /** tick 引擎迟绑定容器；独立模式下为 {@code null}。 */
+    private final TickEngineHolder tickHolder;
+    private final Path dataDir;
+
     // Lazily initialized SDK services
     private volatile Scheduler modScheduler;
     private volatile EventBus modEventBus;
     private volatile Registry<Object> modRegistry;
     private volatile ResourceManager modResourceManager;
+    private volatile ServiceBroker modServiceBroker;
+    private volatile TickService modTickService;
+    private volatile org.loader.api.permission.PermissionManager modPermissions;
     private volatile RuntimeEnvironment environment;
 
     public ModContext(Mod mod) {
-        this.mod = mod;
+        this(mod, null, null, null);
+    }
+
+    /**
+     * 装配模式构造。
+     *
+     * @param runtime    平台运行时；{@code null} 表示独立模式
+     * @param tickEngine tick 引擎；{@code null} 表示本环境没有 tick 源
+     * @param dataDir    Mod 的可写数据根目录；{@code null} 时用
+     *                   {@code config/mili/data/<modId>}
+     */
+    public ModContext(Mod mod, Runtime runtime, TickEngineHolder tickHolder, Path dataDir) {
+        this.mod = Objects.requireNonNull(mod, "mod");
         this.logger = new ModLogger(mod.id(), mod.scope());
+        this.runtime = runtime;
+        this.tickHolder = tickHolder != null
+                ? tickHolder
+                : (runtime != null ? runtime.tickEngine() : null);
+        this.dataDir = dataDir;
+    }
+
+    /**
+     * 便捷构造：从 Runtime 取 tick 容器。
+     */
+    public ModContext(Mod mod, Runtime runtime, Path dataDir) {
+        this(mod, runtime, runtime != null ? runtime.tickEngine() : null, dataDir);
     }
 
     /**
@@ -91,14 +146,21 @@ public class ModContext {
      * Gets a capability if the mod has been granted one.
      */
     public <T> Optional<T> getCapability(Class<T> capabilityType) {
-        return scope().getCapability(capabilityType).filter(CapabilityToken::isActive).map(CapabilityToken::get);
+        return scope().getCapability(capabilityType)
+                .filter(CapabilityToken::isActive)
+                .map(CapabilityToken::get);
     }
 
     /**
      * Gets all active capabilities for this mod.
+     *
+     * <p>旧实现返回 {@code List.of()} —— 一个永远为空的 API。
+     * 一个 Mod 无法知道平台给了自己什么，诊断面板也无法列出能力，
+     * 而调用方看到的是「合法但空」的结果，不会怀疑实现。
+     * 现在如实返回 Scope 上仍然有效的 token。
      */
     public Collection<CapabilityToken<?>> getAllCapabilities() {
-        return List.of();
+        return scope().capabilities();
     }
 
     /**
@@ -180,12 +242,27 @@ public class ModContext {
     }
 
     /**
-     * Returns an EventBus bound to this mod's scope.
-     * Events are automatically cleaned up when the mod stops.
+     * Returns the event bus bound to this mod.
      *
-     * @return a scope-bound EventBus instance
+     * <p><b>装配模式下返回平台总线</b>（而不是每个 Mod 一条私有总线）：
+     * 这是 Mod 之间、Mod 与平台之间能互相收到事件的唯一前提。
+     * 私有总线时期，Mod 订阅 {@code TickEvent} 永远收不到 ——
+     * 因为发布方在另一条总线上。
+     *
+     * <p>隔离性由<b>类型</b>保证：一个 Mod 发布的 {@code MyEvent}
+     * 只会到达订阅了 {@code MyEvent}（或其超类型）的监听器。
+     * 这与 Fabric / Forge 的共享事件总线语义一致。
+     *
+     * <p>装配模式下<b>不</b>把总线注册为本 Mod 的资源 —— 它属于平台，
+     * 由平台在关闭时释放。Mod 的监听器由 {@code ApiModContext}
+     * 的视图负责在 Mod 停止时注销。
+     *
+     * @return 事件总线
      */
     public EventBus events() {
+        if (runtime != null) {
+            return runtime.events();
+        }
         if (modEventBus == null) {
             synchronized (this) {
                 if (modEventBus == null) {
@@ -195,6 +272,81 @@ public class ModContext {
             }
         }
         return modEventBus;
+    }
+
+    /**
+     * 跨 Mod 服务代理。
+     *
+     * <p>装配模式下绑定到本 Mod 的 Scope（发布归属、停止自动失效）；
+     * 独立模式下给一个只属于本 Mod 的空代理（发现永远为空）。
+     */
+    public ServiceBroker services() {
+        if (modServiceBroker == null) {
+            synchronized (this) {
+                if (modServiceBroker == null) {
+                    modServiceBroker = runtime != null
+                            ? runtime.services().forScope(scope())
+                            : new ServiceBrokerImpl(scope());
+                }
+            }
+        }
+        return modServiceBroker;
+    }
+
+    /**
+     * Tick 服务 —— 按 tick 计数调度。
+     *
+     * <p>没有 tick 源时（专用服务器未启动世界、纯 JVM 测试）返回一个
+     * {@code isAvailable() == false} 的实现：提交会抛
+     * {@link IllegalStateException} 并说明原因，而不是静默排队等一个
+     * 永远不会到来的 tick。
+     */
+    public TickService tick() {
+        if (modTickService == null) {
+            synchronized (this) {
+                if (modTickService == null) {
+                    modTickService = tickHolder != null
+                            ? new TickServiceImpl(tickHolder, scope())
+                            : new NoTickService(scope());
+                }
+            }
+        }
+        return modTickService;
+    }
+
+    /**
+     * 权限查询视图（绑定到本 Mod 的 Scope）。
+     *
+     * <p>独立模式下没有任何策略，全部返回 {@code false} ——
+     * 与「拒绝即默认」一致。
+     */
+    public org.loader.api.permission.PermissionManager permissions() {
+        if (modPermissions == null) {
+            synchronized (this) {
+                if (modPermissions == null) {
+                    modPermissions = runtime != null
+                            ? runtime.permissionManager().viewFor(scope())
+                            : new org.loader.api.permission.PermissionManager() {
+                        @Override
+                        public void registerPolicy(String permission,
+                                                   org.loader.api.permission.PermissionManager.PermissionPolicy policy) {
+                            throw new UnsupportedOperationException("独立模式下没有权限系统");
+                        }
+
+                        @Override
+                        public boolean hasPermission(String permission) {
+                            return false;
+                        }
+
+                        @Override
+                        public boolean isClosed() {
+                            return scope().isStopped();
+                        }
+                    };
+                }
+            }
+        }
+        return modPermissions;
     }
 
     /**
@@ -217,15 +369,20 @@ public class ModContext {
 
     /**
      * Returns a ResourceManager bound to this mod's scope.
-     * Provides path-based resource loading with security checks.
      *
-     * @return a scope-bound ResourceManager instance
+     * <p>来源顺序：<b>Mod JAR 优先，可写数据目录兜底</b>。
+     * 旧实现只给了一个相对路径 {@code mods/<modId>} —— 在分发包布局下
+     * 根本不存在，于是 Mod 读自己打进 JAR 的贴图也会失败。
      */
     public ResourceManager resources() {
         if (modResourceManager == null) {
             synchronized (this) {
                 if (modResourceManager == null) {
-                    modResourceManager = new ResourceManager(mod.id() + "-resources", scope(), java.nio.file.Path.of("mods/" + mod.id()));
+                    Path base = dataDir != null
+                            ? dataDir.resolve(mod.id())
+                            : Path.of("config", "mili", "data", mod.id());
+                    modResourceManager = new ResourceManager(
+                            mod.id() + "-resources", scope(), base, mod.classLoader());
                     scope().registerResource(modResourceManager);
                 }
             }
@@ -237,7 +394,7 @@ public class ModContext {
      * Returns the runtime environment (SERVER, CLIENT, DEDICATED_SERVER).
      * Walks up the scope tree to find the environment flag registered by MinecraftBootstrap.
      *
-     * @return the RuntimeEnvironment, defaults to DEDICATED_SERVER
+     * @return the RuntimeEnvironment
      */
     /**
      * 显式注入运行环境。

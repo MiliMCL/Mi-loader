@@ -1,51 +1,250 @@
-# Mili ABI Contract
+# Mili ABI 契约
 
-`org.loader.api` 是 Mili Platform 的稳定契约面。所有 Mod 只编译 `mili-abi`，运行时由 Loader 注入具体实现。`mili-abi` 模块本身零运行时依赖，不引用任何 Minecraft 类、第三方库或 Mili 内部组件。一旦接口进入 1.0 版本，即视为 ABI 稳定——任何破坏性变更必须提升 `ABI_VERSION`，不接受 Patch 级别的隐式变更。`VersionInfo` 常量表是版本信息的唯一权威来源：`CURRENT_VERSION="0.1.0"` 代表 Loader 实现版本，`ABI_VERSION=1` 代表 Mod 契约版本（整数），`TARGET_JAVA=25`（整数）与 `TARGET_MINECRAFT="26.2"` 锁定平台基线。Loader 在启动时读取这些常量并执行版本三元组校验，任何不匹配都会导致加载流程中止，同时生成结构化的错误报告供用户参考。
+`org.loader.api` 是 Mili Platform 的稳定契约面。所有 Mod 只编译 `mili-abi`，运行时由 Loader 注入具体实现。
 
-## 主要接口描述
+`mili-abi` 模块零运行时依赖：不引用 Minecraft、不引用第三方库、不引用 Mili 内部组件。它的唯一编译期依赖是 JDK 标准库。
 
-每个 Mod 加载后会收到一个 `ModContext` 实例，它是 Mod 与整个平台交互的主要 SDK 门面，提供日志、配置、资源访问与生命周期查询。ModContext 是 Mod 进入整个 Mili 运行时的唯一入口，任何试图绕过 ModContext 直接访问底层服务的行为都会导致平台级异常。`ModMetadata` 承载元数据（id、名称、版本、环境），声明式描述 Mod 自身信息，由 Loader 在加载期解析。ModMetadata 中的 id 字段全局唯一，重复的 id 会导致后续 Mod 被拒绝加载。所有 Mod 入口点类必须实现 `Mod` 标记接口，Loader 通过该接口识别加载入口并调用其生命周期回调。
+## 版本
 
-`Environment` 枚举区分 `CLIENT` 与 `SERVER`，Mod 可据此在加载期裁剪逻辑，避免在错误的端上初始化不该初始化的子系统。`Logger` 提供结构化日志输出，Mod 不应直接使用 `System.out`——直接写入控制台会导致日志上下文缺失（时间戳、Mod ID 前缀、级别），在排查问题时极不友好。日志级别共有六级：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR`、`FATAL`，默认启用级别为 `INFO`，通过 Loader 的全局配置可以向下调整。每个日志事件都会携带时间戳、Mod ID 与日志级别，格式统一的输出使得在复杂多 Mod 环境中快速定位问题成为可能。
+| 常量 | 值 | 含义 |
+|---|---|---|
+| `VersionInfo.CURRENT_VERSION` | `"0.1.0"` | Loader 实现版本（语义化） |
+| `VersionInfo.ABI_VERSION` | `2` | Mod 契约版本（整数，从 1 递增） |
+| `VersionInfo.TARGET_JAVA` | `25` | 运行时最低 Java 主版本 |
+| `VersionInfo.TARGET_MINECRAFT` | `"26.2"` | 唯一支持的 Minecraft 版本 |
+| `VersionInfo.PLATFORM_ID` | `"mili-0.1.0-mc26.2"` | 平台稳定标识 |
 
-`Mili` 是静态门面类，提供 `apiVersion()`、`runtimeVersion()` 查询版本信息，支持通过 `mod(context)` 获取运行时上下文，以及 `registerProvider()` 注册自有服务。Mod 调用 `Mili.registerProvider()` 将自己暴露给其他 Mod 发现的接口实例。门面方法在 Loader 未加载时会抛出 `IllegalStateException`——这意味着它们不能在静态初始化块或类加载时调用，必须等待 Loader 完全启动后才能安全使用。Mili 门面实现为单例模式，Loader 在启动时会将自身实例注入其中，后续所有调用都路由到同一 Loader 实例。
+`gradle.properties` 是唯一权威来源，`./gradlew check` 中的 `verifyVersionConstants` 会校验 `VersionInfo` 与它逐字段一致。三处出现同一个版本数字（gradle.properties、VersionInfo、MiliSymbol.MINECRAFT_VERSION）是有意为之：任何一处漂移都会让已编译的 Mod 无法加载，因此必须在构建期失败而不是运行期。
 
-`Lifecycle` 与 `LifecycleState` 定义了 Mod 的状态机：从加载、初始化、活跃到卸载，状态转换不可逆。当需要查询状态时，`Lifecycle.state()` 返回当前 `LifecycleState` 实例。状态转换通知通过 `LifecycleListener` 传递——Mod 可以注册监听器以响应自己或其他 Mod 的状态变化。监听器抛出的异常会捕获并记录，但不阻止状态转换的继续。状态机的不可逆性是一个核心约束：在 Mod 系统的语境下，"加载失败后重试"的状态机循环只会让问题被掩盖而非解决，因此 Loader 要求重试逻辑必须显式地经 `Lifecycle.unload()` 后再进入 `Lifecycle.load()`，即重新加载的语义是全新实例而非状态回溯。
+Loader 在加载每个 Mod 时校验三元组（platform / abi / minecraft），任一不匹配即拒绝并给出结构化错误（`MOD_PLATFORM_MISMATCH` / `MOD_ABI_MISMATCH` / `MOD_MINECRAFT_MISMATCH`）。没有模糊的兼容区间。
 
-`TaskHandle` 代表一个已提交的异步任务，`TaskPriority` 决定调度权重（`CRITICAL` > `HIGH` > `NORMAL` > `LOW` > `IDLE`），`TaskState` 反映执行状态（等待、运行、完成、取消）。`Handle.result()` 在任务完成后返回结果，未完成任务调用会阻塞。`Handle.cancel()` 发送取消信号但不保证立即终止——任务必须在安全点检查取消状态并自行退出。任务抛出异常会被捕获并封装在 `Handle.exception()` 中，不会传播到线程池。Handle 的阻塞等待有默认超时——由 Scope 配置中的 `defaultTimeoutMillis` 决定，超时后抛出 `TaskTimeoutException`，异常的 `TaskHandle` 引用可让调用方判断超时的具体任务。
+## 契约清单
 
-`EventBus` 提供发布-订阅机制，`EventListener` 标记处理器，`Subscription` 句柄用于取消注册。事件类型通过泛型在编译时绑定，`EventBus.subscribe(Class<T>, EventListener<T>)` 返回 `Subscription<T>`。处理器抛出异常不会终止事件传播链，Loader 会记录异常后继续调用下一个处理器。如果一个事件类型上注册了超过十个处理器且其中连续三个在同一事件上抛错，Loader 会触发频率熔断并临时跳过后续传播。熔断机制是防止"一个坏处理器拖垮整个事件链路"的防御策略，同时也会在日志中输出详细的异常堆栈，帮助 Mod 作者定位问题。
+### 入口与上下文
 
-`CapabilityToken` 是能力声明与消费的基础凭证，Capability 系统的基础操作单元。Token 实例必须在 ABI 模块中声明为 `public static final`，确保提供者与消费者引用的是同一对象。注册时提供 Token 与实现接口引用，Loader 在加载期校验 Token 与接口的兼容性。未消费的 Token 不会被拒绝——它们表示"声明但不强制要求"的能力，消费者可以选择是否依赖。Token 的泛型参数 `<T>` 不仅标记了能力的语义类型，也是 Loader 在匹配时的类型校验依据——一个声明为 `CapabilityToken<NetworkProvider>` 的消费者不能接受 `CapabilityToken<RenderProvider>` 的供应。
+| 类型 | 说明 |
+|---|---|
+| `Mod` | 唯一入口点接口：`void initialize(ModContext)` |
+| `ModContext` | Mod 与平台交互的唯一门面（见下） |
+| `ModMetadata` | 只读元数据：id / name / version / author / description / dependencies / entrypoint |
+| `ModDependency` | `modId()` / `versionRange()` / `required()` |
+| `Environment` | `CLIENT` / `SERVER` / `DEDICATED_SERVER`，带 `isClient()` / `isServer()` |
+| `Logger` | `info` / `warning` / `severe` / `severe(msg, throwable)` / `fine` / `finer` / `finest` |
+| `Mili` | 静态门面：`apiVersion()` / `platformVersion()` / `mod(...)` / `events()` / `modIds()` / `isLoaded(...)` / `registerProvider(...)` |
 
-`Resource` 与 `ResourceManager` 管理 Mod 的资产访问，包括配置文件、语言文件、数据资源与原生库。`Resource.get()` 返回不可变的内容快照——文件更新后必须重新调用 `get()` 获取最新内容。`ResourceWatcher` 在开发模式下提供变更通知，生产模式下禁用。资源查找路径为：Mod 自身 JAR 优先，平台补丁次之，Minecraft 原生最后。资源管理器还有一个有趣的特性：同一资源路径可以被多个 Mod"预处理"，Loader 会按照 Mod 依赖图的拓扑顺序依次调用各 Mod 的预处理拦截器，最终的资源内容是所有拦截器依次作用后的结果。
+`ModContext` 的成员：
 
-`Permission` 与 `PermissionManager` 构成运行时的权限校验层，拒绝未声明的操作。权限声明为字符串常量，遵循 `域:动作` 格式（如 `"network:http_get"` 或 `"filesystem:write_config"`）。管理员可以在全局配置文件中通过 `allow` 或 `deny` 规则覆盖默认行为。权限检查发生在 API 入口，Mod 无法绕过。权限的审计日志会记录每次拒绝与通过事件，可通过全局配置的审计级别调整详细程度。审计日志默认关闭，开启后会带来可感知的 I/O 开销——在生产环境中建议仅开启 `DENY` 级别的审计，关闭 `ALLOW` 级别的审计。
+```
+modId()            metadata()      lifecycle()      environment()
+scheduler()        events()        tick()           services()
+config()           storage()       permissions()    resources()
+registry()         world()         logger()         metrics()    performance()
+getCapability(Class)               isActive()       submit(...)
+```
 
-`MiliException` 是所有异常的基类。`ModLoadException` 表示加载期问题，包含缺失的类或依赖信息；`CapabilityException` 表示能力匹配冲突，包含声明与期望能力的差异；`ApiException` 表示运行时 API 调用中的错误，通常是参数不合法或状态机转换非法。所有子类均提供结构化上下文（键值对映射），便于序列化到日志与启动报告。异常的 `reason` 字段统一使用英文，以方便跨语言开发者查阅——但 `message` 字段支持本地化，当前支持简体中文与英文两种版本。
+其中 `config()` / `storage()` / `metrics()` / `performance()` / `isActive()` / `submit(...)` 是 `default` 方法，其余由平台实现。
+
+`registry()` 与 `world()` 在环境不具备时返回 `null`（契约要求 Mod 判空），而不是返回一个「能调但不生效」的空实现。
+
+### 生命周期
+
+| 类型 | 说明 |
+|---|---|
+| `Lifecycle` | `state()` / `addListener(LifecycleListener)` / `removeListener(...)` / `isTerminal()` / `allowsNewWork()` |
+| `LifecycleState` | `DISCOVERED` → `RESOLVED` → `LOADED` → `INITIALIZED` → `REGISTERED` → `RUNNING` → `STOPPING` → `STOPPED` / `FAILED` |
+
+`addListener` 与 `removeListener` 都可用：平台内部维护「Mod 监听器 → 运行时包装器」映射，`removeListener` 按身份精确移除（见 `ApiModContext.LifecycleView`）。
+
+### 事件
+
+| 类型 | 说明 |
+|---|---|
+| `EventBus` | `addListener` / `removeListener` / `subscribe` / `post` / `postAsync` / `hasListeners` / `listenerCount` / `close` |
+| `EventListener<T>` | 函数式接口 `void onEvent(T)` |
+| `Subscription` | `unsubscribe()` / `isActive()` |
+| `TickEvent` | `record(long tick, TickPhase phase, long durationNanos)`，带 `isEnd()` / `durationMs()` |
+| `TickPhase` | `START` / `END` |
+| `ModLifecycleEvent` | `record(String modId, LifecycleState from, LifecycleState to)`，带 `isStarted()` / `isStopped()` |
+| `PlatformEvent` | `record(PlatformStage stage, String platformVersion, int modCount)` |
+| `PlatformStage` | `BOOTSTRAPPING` / `READY` / `STOPPING` / `STOPPED` |
+
+**派发语义**：先精确类型，再沿继承链自下而上（超类 → 接口 → `Object`）。同一个事件不会在同一个监听器数组里被派发两次，但同一个监听器若注册到多个类型，会按各类型分别收到一次。
+
+监听器抛异常不中断分发，异常会送到平台的 `ErrorSink`（接到 `logs/mili-platform.log`）。
+
+### 调度
+
+| 类型 | 说明 |
+|---|---|
+| `Scheduler` | `submit(Runnable)` / `submit(Runnable, TaskPriority)` / `submitRepeating(...)` / `cancel(TaskHandle)` / `close()` |
+| `TaskHandle` | `taskId()` / `state()` / `priority()` / `cancel()` / `future()` / `await()` / `isActive()` / `isFinished()` |
+| `TaskState` | `CREATED` / `QUEUED` / `RUNNING` / `COMPLETED` / `CANCELLED` / `FAILED` |
+| `TaskPriority` | `LOW(0)` / `NORMAL(5)` / `HIGH(10)` / `CRITICAL(20)`，值越小越优先 |
+
+`TaskHandle.state()` 返回**实时**状态（读原子引用），不是提交时的快照。`await()` 在任务失败时抛运行时异常，在任务取消时抛 `CancellationException`。
+
+`Scheduler.close()` 取消本 Mod 提交的全部任务，但不关闭调度器本身——调度器是 Scope 的资源，由 Scope 释放。
+
+### Tick
+
+| 类型 | 说明 |
+|---|---|
+| `TickService` | `currentTick()` / `runNextTick(Runnable)` / `runAfterTicks(int, Runnable)` / `runEveryTick(Runnable)` / `isAvailable()` |
+| `TickService.TickTask` | `taskId()` / `isActive()` / `cancel()` |
+
+没有 tick 源时（专用服务器未进入世界、纯 JVM 测试、平台尚未接管 tick），`isAvailable()` 返回 `false`，提交抛 `IllegalStateException` 并说明原因。不会静默排队等一个永远不会到来的 tick。
+
+### 跨 Mod 服务
+
+| 类型 | 说明 |
+|---|---|
+| `ServiceBroker` | `provide(Class<T>, T)` / `withdraw(Class)` / `discover(Class<T>)` / `require(Class<T>)` / `publishedTypes()` / `providedByMe()` |
+| `ServiceUnavailableException` | 继承 `IllegalStateException`，带 `serviceType()` |
+
+同一接口只允许一个提供方。跨 Scope 冲突在 `provide` 时抛 `IllegalStateException` 并指出双方 scope id；同 Scope 重复发布视为替换自己的实现。提供方 Scope 停止后 `discover` 返回空。
+
+### 权限
+
+| 类型 | 说明 |
+|---|---|
+| `Permission` | 内置权限枚举：`RESOURCE_READ` / `RESOURCE_WRITE` / `NETWORK_ACCESS` / `NATIVE_ACCESS` / `CAPABILITY_REGISTER` / `INTERMOD_COMMUNICATION` / `TRANSFORM_CLASS` / `TRANSFORM_OTHER_MODS` / `TRANSFORM_MINECRAFT` / `TRANSFORM_CORE` / `OVERWRITE_METHOD` |
+| `PermissionManager` | `hasPermission(...)` / `checkPermission(...)` / `isClosed()`；`registerPolicy` 对 Mod 抛 `UnsupportedOperationException` |
+
+默认策略：`resource.read` / `resource.write` / `intermod.communication` 允许，其余全部拒绝。Mod 侧只能查询，不能注册策略——那等于自己给自己发权限。
+
+### 配置与存储
+
+| 类型 | 说明 |
+|---|---|
+| `ConfigService` | `load(String modId)` → `ModConfig`（同 modId 同实例） |
+| `ModConfig` | `getString/getInt/getBoolean/getDouble(key, default)` / `set*` / `has` / `keys` / `save()` |
+| `ModStorage` / `StorageService` | 平台托管的小状态 KV，`<gameDir>/config/mili/storage/<modId>.properties` |
+
+两者都是 Properties，但语义不同：config 是玩家会手改的文件（解析失败回退默认值），storage 是平台替你管的少量状态（启动次数、窗口位置）。
+
+### 资源
+
+| 类型 | 说明 |
+|---|---|
+| `Resource` | `id()` / `isClosed()` / `close()` |
+| `ResourceManager` | `basePath()` / `resolve()` / `readAllBytes()` / `readString()` / `exists()` |
+
+读取顺序固定为 **Mod JAR 优先，可写数据目录兜底**。`readString` 固定 UTF-8（不随平台默认字符集漂移）。`resolve` 在 `normalize()` 之后校验前缀，路径逃逸抛 `SecurityException`。
+
+### 内容注册
+
+| 类型 | 说明 |
+|---|---|
+| `MinecraftRegistry` | `block(BlockSpec)` / `item(ItemSpec)` / `blocks()` / `items()` / `findBlock(path)` / `isOpen()` |
+| `BlockSpec` / `BlockPropertySpec` / `ItemSpec` | 声明式内容描述（builder 形式） |
+| `BlockHandle` / `ItemHandle` | 注册结果：`id()` / `path()` / `modId()` |
+| `WorldView` / `BlockHandle` / `BlockPos` / `Direction` / `BlockEntityView` / `MiliBlock` | 世界只读视图 |
+
+注册窗口只在 Mod 初始化期开放；平台在世界加载前关闭它（Minecraft 的注册表在那一刻冻结）。窗口关闭后再注册会失败并说明原因，而不是静默丢弃。
+
+### 客户端服务
+
+| 类型 | 说明 |
+|---|---|
+| `ScreenService` | `open(ScreenSpec, ScreenListener)` / `closeCurrent()` / `isShowing()` |
+| `ScreenSpec` | 声明式界面描述（尺寸、标签、按钮、暂停策略、HUD 模式） |
+| `ScreenListener` | `onOpen()` / `onClick(widgetId)` / `onClose(cancelled)` |
+| `KeyBindingService` | `register(KeyBindingSpec, Consumer<KeyEventType>)` → `KeyBinding` |
+| `KeyBindingSpec` / `KeyEventType` / `KeyBinding` | 按键描述、事件类型、注册句柄 |
+
+服务端或未装配时抛 `ScreenUnavailableException` / `KeyBindingUnavailableException`——显式失败优于静默无效。
+
+### 字节码转换
+
+| 类型 | 说明 |
+|---|---|
+| `@transform.annotation.MiliTransformer(target = "...")` | 声明式转换器，`phase` 默认 `MOD` |
+| `@transform.annotation.MiliInject(at = InjectionPoint.X, ...)` | 声明注入点与回调 |
+| `InjectionPoint` | `HEAD` / `RETURN` / `BEFORE_INVOKE` / `AFTER_INVOKE` / `MODIFY_RETURN` / `MODIFY_CONSTANT` |
+| `TransformationPhase` | `CORE` / `MOD` |
+| `InjectionContext` / `InjectionCallback` / `ExecutionContext` | 回调上下文 |
+| `TargetMethod` / `TargetField` / `TargetInvocation` | 坐标类型（ABI 内部使用，Mod 不直接引用 Minecraft 坐标） |
+| `MiliSymbol` / `MiliMapping` | 逻辑符号 → 真实坐标，供平台与 CI 校验 |
+
+Mod 的 classpath 里**永远没有 ASM**。Mod 写注解，平台在加载期扫描、校验并合成转换器——校验失败在加载期以「MyMod 的 onTick 回调签名非法：…」的形式出现，而不是在 `defineClass` 时抛指向 Minecraft 的 `VerifyError`。
+
+### 诊断
+
+| 类型 | 说明 |
+|---|---|
+| `PlatformMetrics` | 堆、GC、线程、类数、Mod 数 |
+| `MetricsService` / `PerformanceService` | provider 持有者，未装配时返回零值快照 |
+| `PerformanceSnapshot` | 窗口化 TPS / tick 延迟 / FPS |
+
+### 异常
+
+| 类型 | 说明 |
+|---|---|
+| `MiliException` | 基类 |
+| `ModException` | Mod 相关错误 |
+| `CapabilityDeniedException` | 能力被拒绝 |
+| `PermissionDeniedException` | 权限被拒绝 |
+| `ScreenUnavailableException` / `KeyBindingUnavailableException` | 客户端服务不可用 |
+| `StorageUnavailableException` / `ConfigUnavailableException` / `ConfigWriteException` | 存储与配置错误 |
+
+## ABI 2 相对 ABI 1 的变更
+
+ABI 2 是一次**纯新增**的契约升级：没有任何 ABI 1 的公开方法被移除或改签名。已有 Mod 只需把 `mod.json` 的 `"abi": 1` 改为 `"abi": 2` 并重新编译即可。
+
+### 新增类型
+
+| 类型 | 用途 |
+|---|---|
+| `event.TickEvent` / `event.TickPhase` | 平台 tick 事件（每 tick 两次） |
+| `event.ModLifecycleEvent` | 任意 Mod 的状态迁移（平台总线可见） |
+| `event.PlatformEvent` / `event.PlatformStage` | 平台整体阶段 |
+| `service.ServiceBroker` | 跨 Mod 服务代理 |
+| `service.ServiceUnavailableException` | 服务缺失 |
+| `tick.TickService` / `TickService.TickTask` | 按 tick 计数调度 |
+
+### 新增方法
+
+| 类型 | 新增 |
+|---|---|
+| `ModContext` | `services()` / `tick()` / `permissions()` / `config()`（后两者中 `config()` 是 default） |
+| `EventBus` | `hasListeners(Class)` / `listenerCount()`（均为 default） |
+| `Mili` | `events()` / `modIds()` / `isLoaded(String)`；`MiliProvider` 新增两个 default 方法 |
+| `MiliProvider` | `events()` / `modIds()`（default，旧实现无需改动） |
+
+### 语义修正（不破坏二进制兼容，但行为变了）
+
+这些修正针对的是「声明了但从未真正工作」的部分：
+
+| 项 | ABI 1 | ABI 2 |
+|---|---|---|
+| `TaskHandle.state()` | 恒返回提交时的快照（`QUEUED`） | 返回实时状态 |
+| `Lifecycle.removeListener()` | 抛 `UnsupportedOperationException` | 按身份精确移除 |
+| `Scheduler.close()` | 空操作 | 取消本 Mod 的全部任务 |
+| `EventBus` 类型匹配 | 仅精确类 | 精确类 + 继承链 + `Object` |
+| `ModContext.events()` | 每个 Mod 一条私有总线 | 平台共享总线（类型隔离） |
+| `ModContext.resources()` | 读一个不存在的相对路径 | JAR 优先 + 数据目录兜底 |
+| `ModContext` 的 Scope 状态 | 永远停在 `DISCOVERED` | 初始化成功后推进到 `RUNNING` |
+
+### 为什么升主版本号
+
+ABI 2 引入了三个 `ModContext` 抽象方法。Mod 不实现 `ModContext`（平台提供实现），因此对 Mod **源码与二进制都兼容**。升版本的理由是契约本身的承诺变了：`events()` 的语义从「Mod 私有总线」变成「平台共享总线」，`TaskHandle.state()` 从「快照」变成「实时」——这两条都会改变已有代码的可观察行为，必须让 Mod 作者显式确认，而不是悄悄改掉。
 
 ## 破坏性变更策略
 
-ABI 版本号仅在以下情形递增主版本号：移除已有的公开接口或方法，修改方法签名（返回值类型、参数类型、参数数量或参数顺序），改变方法语义导致已有调用方无法正常工作，改变类的继承关系或接口实现约定，移除或重命名 `CapabilityToken` 常量，或修改 `VersionInfo` 中任何常量的值。
+**递增 `ABI_VERSION` 的情形**：移除公开接口或方法；修改方法签名；改变方法语义导致已有调用方无法正常工作；改变类/接口的继承关系；移除或重命名 `CapabilityToken` 常量；修改 `VersionInfo` 中任何常量的值；新增抽象方法（即使 Mod 通常不实现该接口）。
 
-以下变更不视为破坏性变更，仅增加次版本号即可：新增接口或新方法（保持原有方法不变），新增默认方法（default method），性能优化不影响可观察行为，`@Deprecated` 注解标记为保留兼容而存在的过渡期方法，新增 `CapabilityToken` 常量，泛型参数边界放宽，新增可选参数（仅限于在最后一个参数位置新增、且默认值为 `null` 的情况）。
+**不递增（可随平台次版本发布）的情形**：新增独立接口；新增 `default` 方法；纯性能优化；`@Deprecated` 标注过渡期方法；新增枚举常量（调用方的 `switch` 若未写 `default` 会编译失败，因此这类变更需在发布说明中标注）。
 
-所有破坏性变更必须在 [MOD_DEVELOPMENT.md](MOD_DEVELOPMENT.md) 的迁移指南章节中明确记录，包含旧代码片段、新代码片段与迁移原因说明。每个废弃项在真正移除之前必须经历至少一个次版本号的过渡期——在此期间方法仍可用但标记为 `@Deprecated`，并附带迁移建议的 Javadoc。废弃公告会在 Mili Platform 的官方渠道同步发布，确保 Mod 开发者有充足时间适配。破坏性变更的发布必须在新版本发布前至少一个月提前公告，给依赖方流出充分的异步迁移窗口。
+**流程**：提案（RFC）→ 过渡期（旧 API 标 `@Deprecated` 并给迁移指引，至少一个次版本）→ 移除。迁移指南记录在 [MOD_DEVELOPMENT.md](MOD_DEVELOPMENT.md#从-abi-1-迁移到-abi-2)。
 
 ## 实现约束
 
-`mili-abi` 模块不得引入任何 compile-scope 依赖。所有公开类型必须是接口或 `final` 值类型（`record` 或枚举），保持序列化友好，不允许循环引用。注解使用 `RetentionPolicy.RUNTIME`，确保 Loader 能通过反射在运行时访问并解析。公开接口中的文档注释是契约的一部分——如果 Javadoc 声明"该方法不会返回 `null`"，则实现必须遵守，调用方可以依赖这个保证而不需要额外的空值检查。
+`mili-abi` 的约束由构建强制，而不是靠自觉：
 
-`VersionInfo` 的常量值在编译期被压缩为字面量，禁止反射动态访问。Mod 中的版本检查应当使用常量比较而非语义化版本工具类，以避免引入不必要的版本解析逻辑。Loader 在加载 Mod 时只检查编译时 embeds 的版本常量，不读取运行时动态生成的版本字符串——这意味着 Mod 不能通过反射替换 `VersionInfo` 中的值来绕过版本校验。Loader 自身的版本校验完全基于 `VersionInfo` 的字面量，保证了校验的不可绕过性。
+- **零 compile 依赖**：`mili-abi/build.gradle.kts` 不声明任何 `api` / `implementation` 依赖。
+- **不引用 Minecraft**：Minecraft 坐标只出现在 `MiliSymbol` 的字符串里，且由构建期用真实 JAR 校验。
+- **公开类型是接口、`record` 或 `enum`**：没有可变字段的公开类。
+- **注解 `RetentionPolicy.RUNTIME`**：平台在加载期通过反射读取。
+- **Javadoc 是契约的一部分**：如果 Javadoc 声明「不会返回 null」，实现必须遵守。
 
-Loader 实现类不得直接被 Mod 引用——所有实现类均位于 `org.loader.internal` 子包中。对 `org.loader.internal` 包中任何类型的访问在编译期不会报错（Java 没有真正的包私有约束），但在运行时会导致 `IllegalAccessError`。如果发现某个内部类被 Mod ABI 代码引用，应视为框架的 Bug 并尽快报告。`org.loader.internal` 包中的任何类型都被视为不稳定实现细节，次版本变更中可以任意修改甚至移除。
-
-## 扩展点
-
-Mod 可以通过 `Mili.registerProvider()` 注册自己的服务实例。这些服务通过能力系统（Capability）被其他 Mod 发现。注册时需同时提供 `CapabilityToken` 与服务实现的 ABI 接口引用——Loader 在注册层面就校验接口与 token 的一致性，不匹配则抛出 `CapabilityException`。一个 Token 可以注册多个实现，消费者获取时可以通过附加标签（`qualifier`）区分不同变体。注册的实现以懒加载的方式实例化——首次被消费者访问时才触发构造，避免了启动时的不必要的初始化开销。
-
-如果需要引入新的扩展点（即新的接口），应先在 `mili-abi` 中声明，经过至少一个版本号的"试验期"标记（`@ExperimentalApi`），待接口形式稳定后再移除 `@ExperimentalApi` 标记并正式进入稳定契约。试验期接口的变更不触发版本号递增——它们本就不在稳定契约的范围内，Mod 使用试验期接口时需要自行承担未来不兼容变更的风险。每个试验期接口的 Javadoc 都包含一个 `@since` 标签，表示该接口进入试验期的版本号，以及一个 `@maturity` 标签，指示当前稳定性等级（在 `UNSTABLE`、`TESTING`、`STABLE_CANDIDATE` 三者之一）。
-
-## 规范遵循
-
-ABI 设计遵循以下原则：最小化接口数量（每个概念一个接口）、最大化组合兼容性（接口可以组合但不应强制继承层次）、最小化平台层耦合（ABI 不引用任何非 API 模块的类型）、最大化 ABI 稳定性（变更频率已被显式约束）。这些原则在评审任何 ABI 新增提案时作为检查清单使用——如果某个提案与其中一条或多条原则冲突，提案作者需要显式论证冲突的理由。
+平台实现类位于 `org.loader.runtime.*`、`org.loader.loader.*`、`org.loader.runtime.minecraft.*`。Mod 引用它们不会在编译期报错（这些包不在 Mod 的 compile classpath 上，实际上根本编译不过），运行期也不会出现在 Mod 的 ClassLoader 可见范围内。

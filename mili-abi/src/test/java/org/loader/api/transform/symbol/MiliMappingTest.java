@@ -54,11 +54,12 @@ class MiliMappingTest {
     void entryCountMatchesSymbolTable() {
         // 少一条意味着某个符号没进映射表 —— 那个符号对应的转换器
         // 在「按名解析」时会被判为未知符号。
-        assertEquals(8, MiliMapping.entries().size(),
-                "映射表应覆盖 MiliSymbol 的全部 8 个符号"
+        assertEquals(10, MiliMapping.entries().size(),
+                "映射表应覆盖 MiliSymbol 的全部 10 个符号"
                         + "（SERVER_TICK / SERVER_TICK_CHILDREN / "
                         + "CLIENT_LEVEL_TICK / CLIENT_TICK / CLIENT_BRAND / "
-                        + "TITLE_SCREEN_INIT / CLIENT_MAIN / SERVER_MAIN）");
+                        + "TITLE_SCREEN_INIT / SCREEN_INIT / "
+                        + "SCREEN_EXTRACT_RENDER_STATE / CLIENT_MAIN / SERVER_MAIN）");
     }
 
     @Test
@@ -76,6 +77,8 @@ class MiliMappingTest {
                 MiliSymbol.CLIENT_TICK,
                 MiliSymbol.CLIENT_BRAND,
                 MiliSymbol.TITLE_SCREEN_INIT,
+                MiliSymbol.SCREEN_INIT,
+                MiliSymbol.SCREEN_EXTRACT_RENDER_STATE,
                 MiliSymbol.CLIENT_MAIN,
                 MiliSymbol.SERVER_MAIN};
         for (TargetMethod symbol : symbols) {

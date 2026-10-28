@@ -3,81 +3,84 @@ package org.loader.runtime.mod;
 import org.loader.api.Environment;
 import org.loader.api.Logger;
 import org.loader.api.ModMetadata;
+import org.loader.api.event.EventListener;
+import org.loader.api.event.Subscription;
 import org.loader.api.lifecycle.Lifecycle;
 import org.loader.api.lifecycle.LifecycleState;
+import org.loader.api.permission.PermissionManager;
 import org.loader.api.registry.MinecraftRegistry;
 import org.loader.api.scheduler.Scheduler;
 import org.loader.api.scheduler.TaskHandle;
 import org.loader.api.scheduler.TaskPriority;
+import org.loader.api.service.ServiceBroker;
+import org.loader.api.tick.TickService;
 import org.loader.api.world.WorldView;
+import org.loader.runtime.kernel.Scope;
+import org.loader.runtime.service.EventBus;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * {@link org.loader.api.ModContext} 契约的<b>门面适配层</b>。
  *
  * <h2>为什么需要它</h2>
- *
- * <p>契约接口自己的 Javadoc 写得很清楚：
- * <blockquote>
- * This interface delegates to the internal runtime implementation
- * ({@code org.loader.runtime.mod.ModContext}).
- * </blockquote>
- *
- * <p>也就是说<b>两套类型并存是契约设计的本意</b>，不是历史遗留的混乱：
- * Mod 面向 {@code org.loader.api.*} 这个稳定窄接口编程，
- * 平台内部用自己更宽的 {@link ModContext}（含 Scope、配置、能力等）。
+ * 契约接口自己的 Javadoc 写得很清楚：Mod 面向 {@code org.loader.api.*}
+ * 这个稳定窄接口编程，平台内部用自己更宽的 {@link ModContext}。
  * 缺的只是一个把后者翻译成前者的类。
  *
  * <p><b>在此之前</b>，{@code LoaderMain} 直接把 runtime 的
  * {@link ModContext} 传给 Mod，于是
  * {@code getMethod("initialize", runtime.ModContext.class)} 在只声明了
  * {@code initialize(org.loader.api.ModContext)} 的 Mod 上必然抛
- * {@code NoSuchMethodException}。
- * 也就是说：<b>契约里那条唯一的入口，从未被真正接上</b>。
+ * {@code NoSuchMethodException} —— 契约里那条唯一的入口，从未被真正接上。
  *
- * <h2>映射原则</h2>
+ * <h2>视图复用</h2>
+ * 所有视图对象在构造时创建一次。这些 getter 会被 Mod 在热路径上访问
+ * （每 tick 一次 {@code ctx.events()} / {@code ctx.scheduler()}），
+ * 每次 new 一个视图意味着每 tick 若干次分配 —— 一小时游戏下来是
+ * 数百万个短命对象，表现为「明明没做什么却每隔几秒掉一帧」。
  *
- * <p>凡是契约有、runtime 没有对应物的（如 {@code registry()}），
- * 一律<b>如实反映「未接通」</b>而不是编一个假实现 ——
- * 返回一个空 Map 的注册表会让 Mod 以为注册成功了。
- *
- * @see ModContext runtime 侧的内部实现
+ * <h2>监听器归属</h2>
+ * 事件总线是<b>平台共享</b>的，因此「Mod 停止时注销它注册的监听器」
+ * 必须由本类负责：{@link EventBusView} 记录自己注册过的每一对
+ * (类型, 转发器)，并作为 Scope 资源在关闭时逐个摘除。
+ * 漏掉这一步的后果是：Mod 卸载后监听器还在跑，抓着已释放的对象图 ——
+ * 既泄漏内存，又会在下一次事件里抛 {@code NullPointerException}。
  */
 public final class ApiModContext implements org.loader.api.ModContext {
 
     private final ModContext delegate;
 
-    /**
-     * 视图对象在构造时一次性创建并复用。
-     *
-     * <h2>为什么不是每次 getter 现造</h2>
-     * 这些视图的返回值会被 Mod 在<b>热路径</b>上访问 —— 典型的用法是
-     * {@code ctx.scheduler().submit(...)} 每 tick 调用，或者
-     * {@code ctx.events().subscribe(...)} 在事件里续订。
-     * 每次调用都 new 一个视图（{@code EventBusView} 还会连带创建一个
-     * {@code ConcurrentHashMap}）意味着每 tick 若干次分配，
-     * 一小时游戏下来是数百万个短命对象 —— 全部由 Young GC 买单，
-     * 表现为「明明没做什么，却每隔几秒掉一帧」。
-     *
-     * <p>视图本身无状态（只有对 delegate 的引用），复用不引入任何
-     * 语义变化。{@code metadata()} 的注释说「视图优于副本，因为清单
-     * 加载后不再变」—— 同一条理由在这里更强：视图连创建都可以省掉。
-     */
     private final ModMetadata metadataView;
     private final Lifecycle lifecycleView;
     private final Scheduler schedulerView;
-    private final org.loader.api.event.EventBus eventsView;
+    private final EventBusView eventsView;
+    private final ResourceManagerView resourcesView;
+    private final LoggerView loggerView;
+    private final ServiceBroker servicesView;
+    private final TickService tickView;
+    private final PermissionManager permissionsView;
 
     public ApiModContext(ModContext delegate) {
-        this.delegate = java.util.Objects.requireNonNull(delegate, "delegate");
+        this.delegate = Objects.requireNonNull(delegate, "delegate");
         this.metadataView = new MetadataView(delegate.manifest());
         this.lifecycleView = new LifecycleView(delegate.scope());
         this.schedulerView = new SchedulerView(delegate);
         this.eventsView = new EventBusView(delegate);
+        this.resourcesView = new ResourceManagerView(delegate.resources());
+        this.loggerView = new LoggerView(delegate.logger());
+        this.servicesView = delegate.services();
+        this.tickView = delegate.tick();
+        this.permissionsView = delegate.permissions();
+
+        // 事件视图必须随 Mod 的 Scope 一起释放，否则共享总线上的
+        // 监听器会永远指向一个已卸载的 Mod。
+        delegate.scope().registerResource(eventsView);
     }
 
     /** 底层 runtime 实现 —— 平台内部使用，Mod 不应触碰。 */
@@ -90,12 +93,6 @@ public final class ApiModContext implements org.loader.api.ModContext {
         return delegate.modId();
     }
 
-    /**
-     * 把 runtime 的 {@link ModManifest} 投影成契约的只读视图。
-     *
-     * <p>刻意做成视图而非副本：清单在加载后不再变，投影没有过期风险；
-     * 而每 Mod 存一份副本会在 Mod 数量上去后变成纯浪费。
-     */
     @Override
     public ModMetadata metadata() {
         return metadataView;
@@ -116,18 +113,21 @@ public final class ApiModContext implements org.loader.api.ModContext {
         return eventsView;
     }
 
-    /**
-     * {@inheritDoc}
-     *
-     * <p><b>当前如实返回 {@code null}</b>：runtime 侧尚未把 Minecraft 注册表
-     * 接到这条路径上。与其给一个「能调但不写进游戏」的注册表，
-     * 不如让 Mod 在首次调用处就撞到明确的空值 —— 契约本身也要求
-     * Mod 对可能为 null 的能力做判空。
-     *
-     * <p>接通方式见 {@code mili-minecraft-integration} 的
-     * {@code ApiMinecraftRegistry}：由平台在注册表可用时装配进
-     * runtime 的 ModContext，而不是由 Mod 自己去 new。
-     */
+    @Override
+    public ServiceBroker services() {
+        return servicesView;
+    }
+
+    @Override
+    public TickService tick() {
+        return tickView;
+    }
+
+    @Override
+    public PermissionManager permissions() {
+        return permissionsView;
+    }
+
     @Override
     public MinecraftRegistry registry() {
         return delegate.apiRegistry();
@@ -140,12 +140,12 @@ public final class ApiModContext implements org.loader.api.ModContext {
 
     @Override
     public org.loader.api.resource.ResourceManager resources() {
-        return new ResourceManagerView(delegate.resources());
+        return resourcesView;
     }
 
     @Override
     public Logger logger() {
-        return new LoggerView(delegate.logger());
+        return loggerView;
     }
 
     @Override
@@ -223,8 +223,7 @@ public final class ApiModContext implements org.loader.api.ModContext {
      * runtime {@link org.loader.runtime.kernel.LifecycleState} →
      * 契约 {@link LifecycleState} 的映射。
      *
-     * <p>两侧枚举<b>不是</b>一一对应（runtime 有 CREATED，契约没有；
-     * 契约有 INITIALIZED/REGISTERED，runtime 的对应名不同）。
+     * <p>两侧枚举<b>不是</b>一一对应（runtime 有 DISCOVERED 之前的内部态）。
      * 用显式 switch 而不是 {@code name()} 硬转，是为了让「改名即编译失败」——
      * 枚举加值时 switch 会漏编译，字符串硬转则静默走 else 分支。
      */
@@ -242,12 +241,25 @@ public final class ApiModContext implements org.loader.api.ModContext {
         };
     }
 
-    /** 把 runtime 的 Scope 状态变化翻译成契约的 {@link Lifecycle}。 */
+    /**
+     * 把 runtime 的 Scope 状态变化翻译成契约的 {@link Lifecycle}。
+     *
+     * <h2>为什么必须维护「监听器 → 包装器」映射</h2>
+     * runtime 的 {@code ScopeListener} 是三参（scope, from, to），契约是两参，
+     * 因此注册时必然要包一层 lambda。而 {@code Scope.removeListener}
+     * 按<b>身份</b>移除 —— 如果每次 {@code addListener} 都新建一个包装器，
+     * 调用方拿着自己的监听器去 remove 永远匹配不上，退订静默失效。
+     *
+     * <p>旧实现的选择是直接抛 {@code UnsupportedOperationException}：
+     * 诚实，但让契约里声明的方法<b>永远不可用</b>。现在用映射表实现它。
+     */
     private static final class LifecycleView implements Lifecycle {
 
-        private final org.loader.runtime.kernel.Scope scope;
+        private final Scope scope;
+        private final Map<LifecycleListener, org.loader.runtime.kernel.ScopeListener> wrappers =
+                new ConcurrentHashMap<>();
 
-        LifecycleView(org.loader.runtime.kernel.Scope scope) {
+        LifecycleView(Scope scope) {
             this.scope = scope;
         }
 
@@ -259,24 +271,23 @@ public final class ApiModContext implements org.loader.api.ModContext {
         @Override
         public void addListener(LifecycleListener listener) {
             Objects.requireNonNull(listener, "listener");
-            // runtime 的 ScopeListener 是三参（scope, from, to），
-            // 契约只要两参 —— 丢弃 scope 即可，Mod 关心的是自己的 Scope。
-            scope.addListener((changed, from, to) ->
-                    listener.onStateChange(toApiState(from), toApiState(to)));
+            // computeIfAbsent：同一个监听器注册两次只挂一个包装器，
+            // 避免「注册两次、只移除一次」留下一个幽灵回调。
+            org.loader.runtime.kernel.ScopeListener wrapper = wrappers.computeIfAbsent(
+                    listener,
+                    l -> (changed, from, to) -> l.onStateChange(toApiState(from), toApiState(to)));
+            scope.addListener(wrapper);
         }
 
         @Override
         public void removeListener(LifecycleListener listener) {
-            // runtime 的 Scope 只支持 removeListener(ScopeListener)，
-            // 而 ScopeListener 没有身份可比，无法精确移除。
-            // 如实说明限制，好过提供一个「看起来删了其实没删」的方法 ——
-            // 那会让 Mod 以为自己解绑干净了。
-            throw new UnsupportedOperationException(
-                    "removeListener is not supported: the runtime Scope identifies"
-                            + " listeners by position, not by identity, so removing one"
-                            + " specific listener cannot be done reliably."
-                            + "\n  Listeners are detached automatically when the mod stops;"
-                            + " use isActive() to guard long-lived listeners instead.");
+            if (listener == null) {
+                return;
+            }
+            org.loader.runtime.kernel.ScopeListener wrapper = wrappers.remove(listener);
+            if (wrapper != null) {
+                scope.removeListener(wrapper);
+            }
         }
     }
 
@@ -314,10 +325,16 @@ public final class ApiModContext implements org.loader.api.ModContext {
                     && ctx.scheduler().cancel(v.delegate());
         }
 
+        /**
+         * 取消本 Mod 提交的全部任务。
+         *
+         * <p>旧实现是空操作 —— 一个 Mod 调 {@code close()} 期待「我的异步工作停了」，
+         * 实际什么都不会发生，任务继续跑在已释放的资源上。
+         * 调度器本身仍由 Scope 释放（这里不能 close 它）。
+         */
         @Override
         public void close() {
-            // 不关闭 Mod 的 scheduler —— 它是 scope 的资源，由 scope 生命周期
-            // 统一释放。Mod 调close() 只应停止提交新任务。
+            ctx.scheduler().cancelAll(ctx.scope());
         }
     }
 
@@ -370,37 +387,36 @@ public final class ApiModContext implements org.loader.api.ModContext {
     }
 
     /**
-     * runtime {@link org.loader.runtime.service.EventBus} → 契约视图。
+     * 平台总线 → 契约视图。
      *
-     * <p>契约的 {@code EventListener<T>} 与 runtime 的同名嵌套接口是两个类型，
-     * 这里做一次 lambda 转发；契约的 {@code Subscription} 在 runtime 侧没有
-     * 对应物，用一个本地句柄实现（runtime 的 removeListener 也不支持按身份移除，
-     * 语义上本来就不是订阅式）。
+     * <h2>为什么不再是「每个 Mod 一条私有总线」</h2>
+     * 私有总线时期，Mod 无法收到任何平台事件（tick、生命周期、平台阶段），
+     * 也无法与另一个 Mod 通信 —— 发布方和订阅方永远不在同一条总线上。
+     * 这不是配置错误，是架构断链。
+     *
+     * <p>现在监听器注册在<b>平台总线</b>上，本视图负责：
+     * <ul>
+     *   <li>把契约的 {@code EventListener} 包成 runtime 的（类型不同）；</li>
+     *   <li>记录每一对 (类型, 包装器)，让退订能精确命中；</li>
+     *   <li>作为 Scope 资源，在 Mod 停止时把<b>全部</b>注册项摘掉。</li>
+     * </ul>
+     *
+     * <h2>为什么按 (类型, 监听器) 做键</h2>
+     * 旧实现只按监听器做键：同一个监听器注册到两个事件类型时，第二次
+     * {@code put} 会覆盖第一次的记录 —— 于是退订时只摘掉一个，
+     * 另一个永久留在总线上。键里带类型就消除了这个歧义。
      */
-    private static final class EventBusView implements org.loader.api.event.EventBus {
+    private static final class EventBusView implements org.loader.api.event.EventBus,
+            org.loader.runtime.kernel.Resource {
 
         private final ModContext ctx;
-        private final org.loader.runtime.service.EventBus bus;
+        private final EventBus bus;
 
-        /**
-         * 契约监听器 → runtime 监听器的映射表。
-         *
-         * <p><b>为什么必须有这张表</b>：runtime 的
-         * {@code removeListener(type, listener)} 按<b>身份</b>移除
-         * （{@code List.remove(Object)}），而契约要求
-         * {@code addListener(Class, EventListener)} 传进来的那个对象之后能
-         * 被 {@code removeListener} / {@code unsubscribe} 精确撤掉。
-         *
-         * <p>但 runtime 侧存的是转发用的包装 lambda，与 Mod 传入的
-         * {@code EventListener} 不是同一个对象，直接转发 remove 会永远匹配不上 ——
-         * 退订静默失效，Mod 停掉后监听器还在跑。
-         *
-         * <p>所以在注册时把「契约监听器 → runtime 监听器」记下来，
-         * 退订时用表里的实例去移除，才能真正对上。
-         */
-        private final java.util.Map<org.loader.api.event.EventListener<?>,
-                org.loader.runtime.service.EventBus.EventListener<?>> forwarding =
-                new java.util.concurrent.ConcurrentHashMap<>();
+        private record Key(Class<?> type, EventListener<?> listener) {
+        }
+
+        private final Map<Key, EventBus.EventListener<?>> forwarding = new ConcurrentHashMap<>();
+        private volatile boolean closed;
 
         EventBusView(ModContext ctx) {
             this.ctx = ctx;
@@ -408,33 +424,59 @@ public final class ApiModContext implements org.loader.api.ModContext {
         }
 
         @Override
-        public <T> void addListener(Class<T> eventType,
-                                    org.loader.api.event.EventListener<T> listener) {
-            org.loader.runtime.service.EventBus.EventListener<T> forward = listener::onEvent;
-            forwarding.put(listener, forward);
+        public String id() {
+            return ctx.modId() + "-event-view";
+        }
+
+        @Override
+        public Scope owner() {
+            return ctx.scope();
+        }
+
+        @Override
+        public boolean isClosed() {
+            return closed || bus.isClosed();
+        }
+
+        @Override
+        public <T> void addListener(Class<T> eventType, EventListener<T> listener) {
+            Objects.requireNonNull(eventType, "eventType");
+            Objects.requireNonNull(listener, "listener");
+            if (closed) {
+                throw new IllegalStateException(
+                        "Mod '" + ctx.modId() + "' 已停止，不能再注册事件监听器");
+            }
+            Key key = new Key(eventType, listener);
+            EventBus.EventListener<T> forward = listener::onEvent;
+            EventBus.EventListener<?> previous = forwarding.put(key, forward);
+            if (previous != null) {
+                // 同一 (类型, 监听器) 重复注册 —— 先摘掉旧的，避免重复回调
+                @SuppressWarnings("unchecked")
+                EventBus.EventListener<T> old = (EventBus.EventListener<T>) previous;
+                bus.removeListener(eventType, old);
+            }
             bus.addListener(eventType, forward);
         }
 
         @Override
-        public <T> void removeListener(Class<T> eventType,
-                                       org.loader.api.event.EventListener<T> listener) {
-            org.loader.runtime.service.EventBus.EventListener<?> forward =
-                    forwarding.remove(listener);
+        public <T> void removeListener(Class<T> eventType, EventListener<T> listener) {
+            if (eventType == null || listener == null) {
+                return;
+            }
+            EventBus.EventListener<?> forward = forwarding.remove(new Key(eventType, listener));
             if (forward == null) {
                 throw new IllegalArgumentException(
                         "Listener was never added through this EventBus: " + listener);
             }
             @SuppressWarnings("unchecked")
-            org.loader.runtime.service.EventBus.EventListener<T> typed =
-                    (org.loader.runtime.service.EventBus.EventListener<T>) forward;
+            EventBus.EventListener<T> typed = (EventBus.EventListener<T>) forward;
             bus.removeListener(eventType, typed);
         }
 
         @Override
-        public <T> org.loader.api.event.Subscription subscribe(
-                Class<T> eventType, org.loader.api.event.EventListener<T> listener) {
+        public <T> Subscription subscribe(Class<T> eventType, EventListener<T> listener) {
             addListener(eventType, listener);
-            return new org.loader.api.event.Subscription() {
+            return new Subscription() {
                 private volatile boolean active = true;
 
                 @Override
@@ -443,15 +485,12 @@ public final class ApiModContext implements org.loader.api.ModContext {
                         return;
                     }
                     active = false;
-                    // 通过上面的映射表退订真正注册的转发实例，
-                    // 而不是另造一个 no-op 去 remove（那样只是移走一个从未注册的对象，
-                    // 原监听器会继续跑 —— 看起来退订成功了，实际没有）。
                     EventBusView.this.removeListener(eventType, listener);
                 }
 
                 @Override
                 public boolean isActive() {
-                    return active;
+                    return active && !closed;
                 }
             };
         }
@@ -467,9 +506,35 @@ public final class ApiModContext implements org.loader.api.ModContext {
         }
 
         @Override
+        public boolean hasListeners(Class<?> eventType) {
+            return bus.hasListeners(eventType);
+        }
+
+        @Override
+        public int listenerCount() {
+            return bus.listenerCount();
+        }
+
+        /**
+         * 注销本 Mod 注册的全部监听器。
+         *
+         * <p>不关闭总线本身 —— 它属于平台，其他 Mod 还在用。
+         */
+        @Override
         public void close() {
-            // 同 SchedulerView.close()：生命周期归 scope。
-            // 这里不清 forwarding —— 它随 EventBusView 一起被 GC。
+            if (closed) {
+                return;
+            }
+            closed = true;
+            for (Map.Entry<Key, EventBus.EventListener<?>> entry : forwarding.entrySet()) {
+                removeTyped(entry.getKey().type(), entry.getValue());
+            }
+            forwarding.clear();
+        }
+
+        @SuppressWarnings("unchecked")
+        private <T> void removeTyped(Class<?> type, EventBus.EventListener<?> forward) {
+            bus.removeListener((Class<T>) type, (EventBus.EventListener<T>) forward);
         }
     }
 

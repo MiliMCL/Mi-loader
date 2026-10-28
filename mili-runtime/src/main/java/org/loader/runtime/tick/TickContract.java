@@ -348,6 +348,15 @@ public final class TickContract {
     public static final class TickTask {
         private final String id;
         private final Runnable work;
+        /**
+         * 任务实现的类 —— 归因的钥匙。
+         *
+         * <p>在构造时取一次而不是执行时取：{@code getClass()} 本身很便宜，
+         * 但归因要拿它去查 {@code ModOwners}，而查表结果按类缓存；
+         * 提前取一次能让热路径只做数组索引，也避免在 {@code finally} 里
+         * 依赖一个可能已被置空的引用。
+         */
+        private final Class<?> workType;
         private final TaskPriority priority;
         private final AtomicReference<TaskState> state = new AtomicReference<>(TaskState.CREATED);
         private final AtomicBoolean cancelRequested = new AtomicBoolean(false);
@@ -359,7 +368,13 @@ public final class TickContract {
         TickTask(String id, Runnable work, TaskPriority priority) {
             this.id = id;
             this.work = work;
+            this.workType = work != null ? work.getClass() : Runnable.class;
             this.priority = priority;
+        }
+
+        /** 任务实现的类；供平台按 ClassLoader 归因到 Mod。 */
+        public Class<?> workType() {
+            return workType;
         }
 
         public String id() {

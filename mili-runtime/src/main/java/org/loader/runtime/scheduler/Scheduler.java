@@ -1,9 +1,7 @@
 package org.loader.runtime.scheduler;
 
 import org.loader.runtime.kernel.Scope;
-import org.loader.runtime.kernel.ScopeShutdownException;
 
-import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -15,6 +13,25 @@ import java.util.concurrent.atomic.AtomicReference;
  * <p>
  * Mods must not create unmanaged background execution for ordinary Runtime work.
  * All async tasks must pass through the Scheduler.
+ *
+ * <h2>本类修掉的历史缺陷</h2>
+ * <ul>
+ *   <li><b>任务表只增不减</b>：旧实现把每个任务放进 {@code taskMap} 后
+ *       永不移除，跑一局游戏就是几十万条记录的常驻内存，而且
+ *       {@code metrics().active} 会算成负数。现在任务终结时（完成/失败/取消）
+ *       一律从表里摘除。</li>
+ *   <li><b>周期任务一个任务一条线程</b>：旧实现给每个
+ *       {@code submitRepeating} 新建一个 {@code ScheduledExecutorService}。
+ *       10 个 Mod 各挂 3 个周期任务就是 30 条常驻线程。现在全调度器
+ *       共用一个计时器线程。</li>
+ *   <li><b>周期任务的计时器不回收</b>：Scope 停止后周期任务自然终止，
+ *       但计时器线程没人关 —— 线程泄漏。现在任务终止时自动摘除计时器。</li>
+ *   <li><b>{@code submitChild} 的监听器泄漏</b>：旧实现每提交一个子任务
+ *       就往父 Scope 上永久挂一个监听器。现在子任务终结时摘掉。</li>
+ *   <li><b>取消被完成覆盖</b>：旧实现先 {@code set(RUNNING)} 再跑，
+ *       取消在跑的过程中到达会被随后的 {@code set(COMPLETED)} 抹掉。
+ *       现在终结状态一律走 CAS，先到先得。</li>
+ * </ul>
  */
 public class Scheduler implements org.loader.runtime.kernel.Resource {
 
@@ -25,6 +42,14 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
     private final ThreadPoolExecutor executor;
     /** 优先级工作队列：线程池直接从这里取任务，优先级得以保留。 */
     private final PriorityWorkQueue taskQueue;
+
+    /**
+     * 未终结任务表。
+     *
+     * <p>只装 CREATED / QUEUED / RUNNING 的任务；终结时立即摘除。
+     * 因此 {@code taskMap.size()} 就是「当前活跃任务数」，
+     * 不需要拿提交数去减完成数（那个减法在有任务被拒、被跳过时必然算错）。
+     */
     private final Map<String, ScheduledTask> taskMap = new ConcurrentHashMap<>();
     private final AtomicLong taskCounter = new AtomicLong(0);
 
@@ -35,14 +60,16 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
     private final AtomicLong cancelledTasks = new AtomicLong(0);
     private final AtomicLong totalExecutionTime = new AtomicLong(0);
 
-    // Sample collectors for percentile metrics (bounded to prevent memory leaks)
-    private final List<Long> waitTimeSamples = new CopyOnWriteArrayList<>();
-    private final List<Long> executionTimeSamples = new CopyOnWriteArrayList<>();
-    private static final int MAX_SAMPLES = 10_000;
+    // 采样器（定长环形缓冲）
+    private final LatencySamples waitTimeSamples = new LatencySamples(1024);
+    private final LatencySamples executionTimeSamples = new LatencySamples(1024);
 
-    /** 重复任务的计时器，关闭时一并清理，避免线程泄漏。 */
-    private final Set<java.util.concurrent.ScheduledExecutorService> repeatingTimers =
-            ConcurrentHashMap.newKeySet();
+    /**
+     * 全调度器共享的延时计时器。
+     *
+     * <p>惰性创建：没有任何周期任务时不占线程。关闭时统一 shutdownNow。
+     */
+    private volatile ScheduledExecutorService timer;
 
     public Scheduler(String id, Scope owner, int corePoolSize) {
         this.id = Objects.requireNonNull(id);
@@ -65,7 +92,6 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
                 // 队列无界，CallerRuns 不会因拒绝而丢弃任务；改为在调用线程执行以施加背压
                 new ThreadPoolExecutor.CallerRunsPolicy()
         );
-        startDispatcher();
     }
 
     public Scheduler(String id, Scope owner) {
@@ -117,9 +143,6 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
         // —— ThreadPoolExecutor 只在自己被调用 execute() 时才会创建线程。
         // 表现为 submit() 正常返回、handle.await() 永久阻塞，
         // 而且没有任何异常或日志，非常难查。
-        //
-        // 现在 taskQueue 就是 executor 的 workQueue，直接 execute 即可：
-        // 未达 corePoolSize 时第一个任务由新线程直接执行，之后从优先级队列取。
         try {
             executor.execute(scheduledTask);
         } catch (java.util.concurrent.RejectedExecutionException rejected) {
@@ -137,13 +160,19 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
                     rejected);
         }
 
-        return new TaskHandleImpl(taskId, scope, TaskState.QUEUED, priority, future, state,
+        return new TaskHandleImpl(taskId, scope, priority, future, state,
                 () -> removeFromQueue(scheduledTask));
     }
 
-    /** 从优先级队列中移除尚未开始的任务。 */
+    /**
+     * 取消一个尚未开始的任务：从优先级队列与活跃任务表里一并摘除。
+     *
+     * <p>只从队列移除是不够的 —— {@code taskMap} 是「活跃任务」的唯一来源，
+     * 漏掉它会让一个永远不会执行的任务永久占据 active 计数。
+     */
     private void removeFromQueue(ScheduledTask task) {
         taskQueue.remove(task);
+        taskMap.remove(task.taskId());
     }
 
     /**
@@ -155,101 +184,127 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
 
     /**
      * Submits a task that repeats at a fixed interval.
-     * The task re-schedules itself after each run until cancelled.
+     *
+     * <p>周期任务的全部执行都在共享计时器上完成，不占用线程池工作线程 ——
+     * 旧实现让工作线程 {@code sleep} 等下一个周期，corePoolSize 个周期任务
+     * 就能把整个池占满，其余任务全部饥饿。
      *
      * @param scope    the scope that owns the task
-     * @param work     the work to execute each tick
+     * @param work     the work to execute each interval
      * @param delayMs  initial delay in ms before first execution
      * @param periodMs period between executions in ms
      * @param priority execution priority
      * @return handle that cancels all future executions
      */
-    public TaskHandle submitRepeating(Scope scope, Runnable work, long delayMs, long periodMs, TaskPriority priority) {
+    public TaskHandle submitRepeating(Scope scope, Runnable work, long delayMs, long periodMs,
+                                      TaskPriority priority) {
         if (closed.get()) {
             throw new IllegalStateException("Scheduler is closed");
         }
+        if (scope.isStopped()) {
+            throw new IllegalStateException("Cannot submit to stopped scope: " + scope.id());
+        }
         final long period = Math.max(1L, periodMs);
         final long delay = Math.max(0L, delayMs);
-        // 重复任务使用独立守护计时器线程做延时触发，工作线程只执行 work，
-        // 绝不 sleep 占位 —— 否则 corePoolSize 个线程会被周期任务全部占满，
-        // 导致其他任务饥饿（这是历史实现的一个真实缺陷）。
-        java.util.concurrent.ScheduledExecutorService timer =
-                java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
-                    Thread t = new Thread(r, "runtime-scheduler-timer");
-                    t.setDaemon(true);
-                    return t;
-                });
 
-        java.util.concurrent.atomic.AtomicBoolean cancelled = new AtomicBoolean(false);
-        java.util.concurrent.ScheduledFuture<?>[] handleRef = new java.util.concurrent.ScheduledFuture<?>[1];
+        String taskId = id + "-repeating-" + taskCounter.incrementAndGet();
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        AtomicReference<TaskState> state = new AtomicReference<>(TaskState.QUEUED);
+        AtomicBoolean cancelled = new AtomicBoolean(false);
+        AtomicReference<ScheduledFuture<?>> handleRef = new AtomicReference<>();
+        AtomicBoolean scheduledOnce = new AtomicBoolean(false);
 
         Runnable tick = new Runnable() {
             @Override
             public void run() {
                 if (cancelled.get() || scope.isStopped() || closed.get()) {
-                    return; // 到此终止，计时器线程随之退出
+                    finish();
+                    return;
                 }
+                long start = System.nanoTime();
+                state.set(TaskState.RUNNING);
                 try {
                     work.run();
-                } catch (Throwable ignored) {
-                    // 周期任务的异常不得终止后续周期
+                } catch (Throwable t) {
+                    // 周期任务的异常不得终止后续周期，但必须计入失败数
+                    failedTasks.incrementAndGet();
+                } finally {
+                    long exec = System.nanoTime() - start;
+                    totalExecutionTime.addAndGet(exec);
+                    executionTimeSamples.add(exec);
                 }
-                if (!cancelled.get() && !scope.isStopped() && !closed.get()) {
-                    try {
-                        handleRef[0] = timer.schedule(this, period, TimeUnit.MILLISECONDS);
-                    } catch (java.util.concurrent.RejectedExecutionException ignored) {
-                        // 关闭竞态：忽略
-                    }
+                if (cancelled.get() || scope.isStopped() || closed.get()) {
+                    finish();
+                    return;
                 }
+                state.compareAndSet(TaskState.RUNNING, TaskState.QUEUED);
+                try {
+                    handleRef.set(timer().schedule(this, period, TimeUnit.MILLISECONDS));
+                } catch (RejectedExecutionException | IllegalStateException e) {
+                    // 关闭竞态：计时器已停，按取消处理
+                    finish();
+                }
+            }
+
+            /** 周期结束（取消 / Scope 停止 / 调度器关闭）——只执行一次。 */
+            private void finish() {
+                if (!scheduledOnce.compareAndSet(false, true)) {
+                    return;
+                }
+                state.set(TaskState.CANCELLED);
+                cancelledTasks.incrementAndGet();
+                taskMap.remove(taskId);
+                future.cancel(false);
             }
         };
 
+        taskMap.put(taskId, new ScheduledTask(this, taskId, scope, work, priority,
+                future, state, System.nanoTime(), 0L));
+
         try {
-            long initial = delay > 0 ? delay : period;
-            handleRef[0] = timer.schedule(tick, initial, TimeUnit.MILLISECONDS);
-        } catch (java.util.concurrent.RejectedExecutionException e) {
-            timer.shutdownNow();
+            handleRef.set(timer().schedule(tick, delay > 0 ? delay : period, TimeUnit.MILLISECONDS));
+        } catch (RejectedExecutionException e) {
+            taskMap.remove(taskId);
+            state.set(TaskState.CANCELLED);
+            future.cancel(false);
             throw new org.loader.runtime.error.SchedulerError(
-                    "周期任务调度失败", 
+                    "周期任务调度失败",
                     org.loader.runtime.error.ErrorContext.builder("scheduler")
                             .owner(id).operation("submitRepeating").build(), e);
         }
 
-        // 关闭时一并清理计时器
-        synchronized (repeatingTimers) {
-            repeatingTimers.add(timer);
-        }
-
-        CompletableFuture<Void> future = new CompletableFuture<>();
-        return new TaskHandleImpl(
-                id + "-repeating-" + taskCounter.incrementAndGet(),
-                scope, TaskState.QUEUED, priority, future,
-                new AtomicReference<>(TaskState.RUNNING), () -> {
-                    cancelled.set(true);
-                    java.util.concurrent.ScheduledFuture<?> h = handleRef[0];
-                    if (h != null) {
-                        h.cancel(false);
-                    }
-                    timer.shutdownNow();
-                    synchronized (repeatingTimers) {
-                        repeatingTimers.remove(timer);
-                    }
-                    future.complete(null);
-                });
+        return new TaskHandleImpl(taskId, scope, priority, future, state, () -> {
+            if (!cancelled.compareAndSet(false, true)) {
+                return;
+            }
+            ScheduledFuture<?> h = handleRef.get();
+            if (h != null) {
+                h.cancel(false);
+            }
+            state.set(TaskState.CANCELLED);
+            cancelledTasks.incrementAndGet();
+            taskMap.remove(taskId);
+            future.cancel(false);
+        });
     }
 
     /**
      * Creates a child task within a parent scope.
      * Implements structured concurrency: when parent stops, children stop.
+     *
+     * <p>父 Scope 上的监听器在任务终结时<b>会被摘掉</b> —— 旧实现永久挂载，
+     * 一个频繁提交子任务的 Mod 会让父 Scope 的监听器列表无限增长，
+     * 且每次状态迁移都要遍历这些死监听器。
      */
     public TaskHandle submitChild(Scope scope, Scope parentScope, Runnable work, TaskPriority priority) {
         TaskHandle handle = submit(scope, work, priority);
-        // Register child with parent scope
-        parentScope.addListener((s, from, to) -> {
+        org.loader.runtime.kernel.ScopeListener cancelOnStop = (s, from, to) -> {
             if (to == org.loader.runtime.kernel.LifecycleState.STOPPING) {
                 handle.cancel();
             }
-        });
+        };
+        parentScope.addListener(cancelOnStop);
+        handle.future().whenComplete((v, err) -> parentScope.removeListener(cancelOnStop));
         return handle;
     }
 
@@ -257,8 +312,7 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
      * Cancels a task by handle.
      */
     public boolean cancel(TaskHandle handle) {
-        ScheduledTask task = taskMap.get(handle.taskId());
-        if (task == null) {
+        if (handle == null) {
             return false;
         }
         return handle.cancel();
@@ -268,12 +322,21 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
      * Cancels all tasks owned by a scope.
      */
     public void cancelAll(Scope scope) {
-        taskMap.values().stream()
-                .filter(t -> t.ownerScope().equals(scope))
-                .forEach(t -> new TaskHandleImpl(
-                        t.taskId(), t.ownerScope(), t.state().get(),
-                        t.priority(), t.future(), t.state(), () -> {}
-                ).cancel());
+        for (ScheduledTask t : taskMap.values()) {
+            if (t.ownerScope() != null && t.ownerScope().equals(scope)) {
+                t.state().compareAndSet(TaskState.QUEUED, TaskState.CANCELLED);
+                t.state().compareAndSet(TaskState.RUNNING, TaskState.CANCELLED);
+                taskQueue.remove(t);
+                t.future().cancel(true);
+            }
+        }
+    }
+
+    /**
+     * 当前活跃（未终结）任务数。
+     */
+    public int activeTaskCount() {
+        return taskMap.size();
     }
 
     /**
@@ -285,24 +348,32 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
                 completedTasks.get(),
                 failedTasks.get(),
                 cancelledTasks.get(),
-                taskMap.size() - completedTasks.get() - failedTasks.get() - cancelledTasks.get(),
+                taskMap.size(),
                 totalExecutionTime.get(),
-                percentile(waitTimeSamples, 50) / 1_000_000.0,
-                percentile(waitTimeSamples, 95) / 1_000_000.0,
-                percentile(waitTimeSamples, 99) / 1_000_000.0,
-                percentile(executionTimeSamples, 50) / 1_000_000.0,
-                percentile(executionTimeSamples, 95) / 1_000_000.0,
-                percentile(executionTimeSamples, 99) / 1_000_000.0
+                waitTimeSamples.percentileMs(50),
+                waitTimeSamples.percentileMs(95),
+                waitTimeSamples.percentileMs(99),
+                executionTimeSamples.percentileMs(50),
+                executionTimeSamples.percentileMs(95),
+                executionTimeSamples.percentileMs(99)
         );
     }
 
-    private static double percentile(List<Long> samples, int p) {
-        if (samples.isEmpty()) return 0.0;
-        List<Long> sorted = new ArrayList<>(samples);
-        Collections.sort(sorted);
-        int index = (int) Math.ceil(p / 100.0 * sorted.size()) - 1;
-        index = Math.max(0, Math.min(index, sorted.size() - 1));
-        return sorted.get(index);
+    private ScheduledExecutorService timer() {
+        ScheduledExecutorService current = timer;
+        if (current != null) {
+            return current;
+        }
+        synchronized (this) {
+            if (timer == null) {
+                timer = Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "runtime-scheduler-timer-" + id);
+                    t.setDaemon(true);
+                    return t;
+                });
+            }
+            return timer;
+        }
     }
 
     /**
@@ -310,36 +381,83 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
      */
     @Override
     public void close() {
-        if (closed.compareAndSet(false, true)) {
-            // 标记并清空所有待执行任务
-            for (ScheduledTask t : taskQueue.drainAll()) {
-                t.state().set(TaskState.CANCELLED);
-                t.future().cancel(true);
-            }
+        if (!closed.compareAndSet(false, true)) {
+            return;
+        }
+        // 标记并清空所有待执行任务
+        for (ScheduledTask t : taskQueue.drainAll()) {
+            t.state().set(TaskState.CANCELLED);
+            t.future().cancel(true);
+            taskMap.remove(t.taskId());
+        }
 
-            // 清理重复任务的计时器线程
-            for (var timer : repeatingTimers) {
-                timer.shutdownNow();
-            }
-            repeatingTimers.clear();
+        ScheduledExecutorService t = timer;
+        if (t != null) {
+            t.shutdownNow();
+        }
 
-            // Try to cancel running tasks
-            taskMap.values().stream()
-                    .filter(t -> t.state().get() == TaskState.RUNNING)
-                    .forEach(t -> new TaskHandleImpl(
-                            t.taskId(), t.ownerScope(), t.state().get(),
-                            t.priority(), t.future(), t.state(), () -> {}
-                    ).cancel());
+        // Try to cancel running tasks
+        for (ScheduledTask task : taskMap.values()) {
+            task.state().compareAndSet(TaskState.RUNNING, TaskState.CANCELLED);
+            task.state().compareAndSet(TaskState.QUEUED, TaskState.CANCELLED);
+            task.future().cancel(true);
+        }
+        taskMap.clear();
 
-            executor.shutdown();
-            try {
-                if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
-                    executor.shutdownNow();
-                }
-            } catch (InterruptedException e) {
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
                 executor.shutdownNow();
-                Thread.currentThread().interrupt();
             }
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * 定长环形延迟采样器。
+     *
+     * <p>旧实现用 {@code CopyOnWriteArrayList} 存样本：每次 {@code add}
+     * 都要复制整个底层数组，在 10,000 个样本时是每次任务提交复制 10,000 个引用 ——
+     * 这条路径在每次 {@code submit()} 上，等于给热路径加了一次 O(n) 复制。
+     *
+     * <p>环形缓冲写入是 O(1)、零分配，代价是分位数基于最近 N 个样本
+     * （对「当前延迟水平」这个用途来说，这比历史全量更合适）。
+     */
+    private static final class LatencySamples {
+        private final long[] ring;
+        private int write;
+        private int filled;
+        private final Object lock = new Object();
+
+        LatencySamples(int capacity) {
+            this.ring = new long[capacity];
+        }
+
+        void add(long nanos) {
+            synchronized (lock) {
+                ring[write] = nanos;
+                write = (write + 1) % ring.length;
+                if (filled < ring.length) {
+                    filled++;
+                }
+            }
+        }
+
+        double percentileMs(int p) {
+            long[] copy;
+            synchronized (lock) {
+                if (filled == 0) {
+                    return 0.0;
+                }
+                copy = new long[filled];
+                System.arraycopy(ring, 0, copy, 0, filled);
+            }
+            Arrays.sort(copy);
+            int index = (int) Math.ceil(p / 100.0 * copy.length) - 1;
+            index = Math.max(0, Math.min(index, copy.length - 1));
+            return copy[index] / 1_000_000.0;
         }
     }
 
@@ -355,8 +473,6 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
             implements java.util.concurrent.BlockingQueue<Runnable> {
 
         private final java.util.concurrent.PriorityBlockingQueue<ScheduledTask> delegate;
-        /** 正在执行的任务，用于移除时按 ScheduledTask 定位。 */
-        private final java.util.Set<ScheduledTask> pending = ConcurrentHashMap.newKeySet();
 
         PriorityWorkQueue(Comparator<ScheduledTask> comparator) {
             this.delegate = new java.util.concurrent.PriorityBlockingQueue<>(256, comparator);
@@ -395,7 +511,6 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
             if (st == null) {
                 st = ScheduledTask.foreign(r);
             }
-            pending.add(st);
             return delegate.offer(st);
         }
 
@@ -408,17 +523,13 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
         }
 
         @Override
-        public void put(Runnable r) throws InterruptedException {
+        public void put(Runnable r) {
             offer(r);
         }
 
         @Override
         public Runnable poll() {
-            ScheduledTask st = delegate.poll();
-            if (st != null) {
-                pending.remove(st);
-            }
-            return st;
+            return delegate.poll();
         }
 
         @Override
@@ -428,30 +539,22 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
 
         @Override
         public Runnable take() throws InterruptedException {
-            ScheduledTask st = delegate.take();
-            pending.remove(st);
-            return st;
+            return delegate.take();
         }
 
         @Override
         public Runnable poll(long timeout, TimeUnit unit) throws InterruptedException {
-            ScheduledTask st = delegate.poll(timeout, unit);
-            pending.remove(st);
-            return st;
+            return delegate.poll(timeout, unit);
         }
 
         @Override
         public int drainTo(Collection<? super Runnable> c) {
-            int n = delegate.drainTo(c);
-            pending.clear();
-            return n;
+            return delegate.drainTo(c);
         }
 
         @Override
         public int drainTo(Collection<? super Runnable> c, int maxElements) {
-            int n = delegate.drainTo(c, maxElements);
-            pending.clear();
-            return n;
+            return delegate.drainTo(c, maxElements);
         }
 
         @Override
@@ -460,21 +563,18 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
             if (st == null) {
                 return false;
             }
-            pending.remove(st);
             return delegate.remove(st);
         }
 
         @Override
         public void clear() {
             delegate.clear();
-            pending.clear();
         }
 
         /** 清空并返回全部待执行任务（关闭时用于标记取消）。 */
         List<ScheduledTask> drainAll() {
             List<ScheduledTask> all = new ArrayList<>(delegate);
             delegate.clear();
-            pending.clear();
             return all;
         }
 
@@ -498,19 +598,6 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
         public <T> T[] toArray(T[] a) {
             return delegate.toArray(a);
         }
-    }
-
-    private void startDispatcher() {
-        // 优先级队列本身就是工作队列：线程池直接从它取任务执行。
-        // 历史上这里有一个额外的 dispatcher 线程把任务从优先级队列
-        // 搬到 FIFO 队列，优先级因此在执行层被抹平 —— 已移除。
-    }
-
-    private void addSample(List<Long> samples, long value) {
-        if (samples.size() < MAX_SAMPLES) {
-            samples.add(value);
-        }
-        // Once we hit MAX_SAMPLES we keep the existing samples for stable percentiles
     }
 
     /**
@@ -605,34 +692,55 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
             }
 
             long startTime = System.nanoTime();
+            scheduler.waitTimeSamples.add(startTime - createdAtNanos);
             try {
-                scheduler.addSample(scheduler.waitTimeSamples, startTime - createdAtNanos);
-
-                if (state.get() == TaskState.CANCELLED) {
+                // 取消与开始之间是竞态：用 CAS 抢 RUNNING，抢不到说明
+                // 在排队期间已经被取消 —— 绝不能把它改回 RUNNING。
+                if (!state.compareAndSet(TaskState.QUEUED, TaskState.RUNNING)) {
                     scheduler.cancelledTasks.incrementAndGet();
+                    scheduler.taskMap.remove(taskId);
                     future.cancel(true);
                     return;
                 }
                 if (ownerScope.isStopped() || scheduler.closed.get()) {
                     state.set(TaskState.CANCELLED);
                     scheduler.cancelledTasks.incrementAndGet();
+                    scheduler.taskMap.remove(taskId);
                     future.cancel(true);
                     return;
                 }
 
-                state.set(TaskState.RUNNING);
                 work.run();
-                state.set(TaskState.COMPLETED);
-                scheduler.completedTasks.incrementAndGet();
-                future.complete(null);
+
+                // 执行期间被取消（协作式取消），不得把 CANCELLED 覆盖成 COMPLETED
+                if (state.compareAndSet(TaskState.RUNNING, TaskState.COMPLETED)) {
+                    scheduler.completedTasks.incrementAndGet();
+                    // 先摘表再完成 future：否则调用方 future().join() 返回时
+                    // 任务还挂在活跃表里，activeTaskCount() 会短暂给出错误值 ——
+                    // 测试里是偶发失败，生产里是监控面板的假峰值。
+                    scheduler.taskMap.remove(taskId);
+                    future.complete(null);
+                } else {
+                    scheduler.cancelledTasks.incrementAndGet();
+                    scheduler.taskMap.remove(taskId);
+                    future.cancel(true);
+                }
             } catch (Throwable e) {
-                state.set(TaskState.FAILED);
-                scheduler.failedTasks.incrementAndGet();
-                future.completeExceptionally(e);
+                if (state.compareAndSet(TaskState.RUNNING, TaskState.FAILED)) {
+                    scheduler.failedTasks.incrementAndGet();
+                    scheduler.taskMap.remove(taskId);
+                    future.completeExceptionally(e);
+                } else {
+                    scheduler.cancelledTasks.incrementAndGet();
+                    scheduler.taskMap.remove(taskId);
+                    future.cancel(true);
+                }
             } finally {
                 long execNanos = System.nanoTime() - startTime;
                 scheduler.totalExecutionTime.addAndGet(execNanos);
-                scheduler.addSample(scheduler.executionTimeSamples, execNanos);
+                scheduler.executionTimeSamples.add(execNanos);
+                // 兜底：任何未覆盖的路径都不能让任务永久留在活跃表里
+                scheduler.taskMap.remove(taskId);
             }
         }
     }

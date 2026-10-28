@@ -78,9 +78,14 @@ IllegalArgumentException: Unsupported class file major version 69
 `endpointName` 硬编码为字符串 `"reflective"`；`ready` 标志只能靠 `markReady()` 手工置位，
 而 `markReady()` 在生产代码中**无人调用**。
 
-`docs/architecture/CURRENT.md` 自己已经承认了这点（第 241、256 行）：
+`docs/architecture/CURRENT.md` 当时已承认了这点（第 241、256 行）：
 > 「真实 Minecraft tick 入口注入 — `ReflectiveMinecraftTickSource` 目前只是…」
 > 「tick 入口尚未注入。」
+
+> **后续状态（2026-10-28）**：tick 入口注入已经接通。
+> `MiliTickTransformer` 在 `MinecraftServer#tickServer` 的方法头与每个返回前
+> 注入对 `TickCallbackDispatch` 的调用，`MinecraftBootstrap` 在启动时把
+> `TickBridge` 装进分发器。本节保留为「当时为什么判定为断链」的记录。
 
 ### 2.2 真实 tick 锚点已核实（修正了需求文档中的签名）
 

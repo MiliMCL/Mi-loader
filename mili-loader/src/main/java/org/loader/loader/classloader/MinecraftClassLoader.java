@@ -421,6 +421,43 @@ public final class MinecraftClassLoader extends URLClassLoader {
     }
 
     /**
+     * 把平台生成的桥接类<b>直接定义进本加载器</b>（幂等，先到先得）。
+     *
+     * <h2>它服务什么</h2>
+     * 注入到 Minecraft 类字节码里的回调若需要携带 Minecraft 类型参数
+     * （例如 {@code GuiGraphicsExtractor}），回调方法的描述符就必须出现
+     * 该类型 —— 而平台侧源码与 Minecraft 零编译期耦合，写不出这种签名。
+     * 唯一出路：平台在运行期生成一个桥接类的字节码，定义到<b>与目标
+     * Minecraft 类相同的加载器</b>上。解析发生在定义方（被转换的
+     * Minecraft 类）的加载器 —— 即本加载器；{@code GameHostDefiner} 的
+     * 子加载器方案对「平台类引用 Minecraft 类」方向有效，
+     * 对「Minecraft 类引用平台生成的类」方向无效（子加载器对父不可见）。
+     *
+     * <h2>为什么不破坏「org.loader.* 一律委派 parent」</h2>
+     * {@link #loadClass(String, boolean)} 的 {@code findLoadedClass} 检查
+     * 先于委派 —— 本方法定义的类会直接命中缓存，优先于委派。
+     * 影响面被限制在显式定义过的桥接类上，其余 {@code org.loader.*}
+     * 行为不变。
+     *
+     * <h2>幂等与并发</h2>
+     * 重复定义同名类会抛 {@code LinkageError}，因此走
+     * {@code findLoadedClass} 短路 + 类名锁，多线程竞争安全。
+     *
+     * @param name  二进制类名
+     * @param bytes 平台生成的类字节码
+     * @return 已定义（或先前已定义）的 Class
+     */
+    public Class<?> definePlatformBridge(String name, byte[] bytes) {
+        synchronized (getClassLoadingLock(name)) {
+            Class<?> existing = findLoadedClass(name);
+            if (existing != null) {
+                return existing;
+            }
+            return defineClass(name, bytes, 0, bytes.length);
+        }
+    }
+
+    /**
      * 读取 Minecraft classpath 中的资源（诊断/测试用）。
      *
      * <p>禁用 JVM 级 jar 缓存，理由同 {@link ModClassLoader#getResourceAsStream}：

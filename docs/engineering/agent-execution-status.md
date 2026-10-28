@@ -1,5 +1,10 @@
 # Agent 执行状态表（agent-execution-status.md）
 
+> **历史记录，不代表当前状态。**
+> 本目录存放执行过程记录（审计、状态表、最终报告），保留用于追溯决策脉络。
+> 其中引用的版本号（如 ABI 1）、缺陷清单与完成度自评均为**当时**的状态。
+> 当前实现状态只以 [`../architecture/CURRENT.md`](../architecture/CURRENT.md) 为准。
+
 - 维护人：AI 工程执行 Agent
 - 规则：状态仅可为 `NOT_STARTED / IN_PROGRESS / BLOCKED / DONE / DEFERRED_WITH_REASON`；
   完成标准 = 实现 + 测试 + 文档 + 验证证据齐全。

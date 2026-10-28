@@ -36,17 +36,32 @@ assertEquals(12, budget.ioBudgetMs());          // 50 / 4
 
 ## 执行模型
 
+生产路径（`TickBridge`）在注入回调的边界上推进阶段：
+
 ```text
 beginTick()                          新建契约，TICK_START → PRE_TICK，触发 PRE_TICK 回调
+  │                                  runEveryTickWork()（TickService.runEveryTick）
+  │                                  TickObserver.onTickStart → 发布 TickEvent(START)
   │
-  ├─ advanceToSchedule()             触发 SCHEDULE 回调 —— Mod 在此提交任务
-  ├─ advanceToCoreTick()             触发 CORE_TICK 回调 —— MC 真实世界/实体 tick
-  │    └─ runPendingTasks()          在驱动线程按提交顺序执行
-  ├─ advanceToAsyncCompletion(t)     awaitAllTasks(t)，触发 ASYNC_COMPLETION
-  ├─ advanceTo(TICK_END)路径         POST_TICK 回调 → TICK_END 回调
+  │   ... Minecraft 世界 / 实体 tick 在此发生 ...
   │
-endTick()                            complete() → TickMetrics
+endTick()  ┌─ advanceToSchedule()   触发 SCHEDULE 回调（幂等：已越过则空操作）
+           ├─ advanceToCoreTick()    触发 CORE_TICK 回调（幂等）
+           ├─ runPendingTasks()      在驱动线程按提交顺序执行本 tick 的任务
+           ├─ ASYNC_COMPLETION       触发回调
+           ├─ POST_TICK              触发回调
+           ├─ TICK_END               触发回调
+           └─ complete()             → TickMetrics
+                                     TickObserver.onTickEnd → 发布 TickEvent(END)
 ```
+
+**为什么 SCHEDULE / CORE_TICK 在 endTick 才推进**：注入点只能包住整个
+`tickServer`（方法头 + 每个 return 之前），无法把这两个阶段精确切到世界 tick
+的两侧。因此本 tick 提交的任务在**世界逻辑之后、POST_TICK 之前**执行。
+声称能在世界 tick 中间插进去、实际做不到，比晚一点执行要糟糕得多。
+
+**阶段推进是幂等的**：自定义 tick 源（测试、未来按 region 并行的调度器）
+可以自己提前推进，与 `TickBridge` 共存而不冲突。
 
 **endTick() 会自动补齐未推进的后续阶段**，因此即使调用方只做
 `beginTick(); endTick();` 也能得到完整阶段序列。

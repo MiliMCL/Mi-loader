@@ -96,6 +96,23 @@ public final class TickBridge implements Resource {
     /**
      * 标记真实 tick 结束，产出指标。
      *
+     * <p><b>这里补齐 SCHEDULE 与 CORE_TICK 两个阶段。</b>
+     * 注入点只能包住整个 {@code tickServer}（方法头 + 每个 return 之前），
+     * 无法把 SCHEDULE / CORE_TICK 精确切到世界 tick 的两侧。因此由本方法在
+     * tick 收尾时补推进这两步 —— 它们会依次触发阶段监听器、再执行本 tick
+     * 提交的任务（{@code TickEngine.endTick} 内部调用 {@code runPendingTasks}）。
+     *
+     * <p>在此之前这两个阶段只在测试里被推进过，生产路径上：
+     * <ul>
+     *   <li>SCHEDULE / CORE_TICK 监听器<b>一次都不会被调用</b>；</li>
+     *   <li>{@link #onTick(Runnable)} 提交的任务永远不执行
+     *       （{@code runPendingTasks} 零调用者）。</li>
+     * </ul>
+     * 两者都是静默失效：没有异常、没有日志，只是「Mod 的 tick 逻辑不生效」。
+     *
+     * <p>两个推进方法都是幂等的，因此自定义 tick 源（测试、
+     * 未来按 region 并行的调度器）可以自己提前推进，不会冲突。
+     *
      * @return 本 tick 指标；不在 tick 内返回 null
      */
     public TickContract.TickMetrics endTick() {
@@ -104,6 +121,8 @@ public final class TickBridge implements Resource {
             return null;
         }
         try {
+            engine.advanceToSchedule(contract);
+            engine.advanceToCoreTick(contract);
             return engine.endTick(contract);
         } finally {
             activeContract = null;

@@ -99,7 +99,9 @@ public final class MinecraftBootstrap {
         this.tickEngine = new TickEngine("minecraft-tick-engine", minecraftScope, performance);
         this.lifecycle = new MinecraftLifecycle(minecraftScope);
         this.tickBridge = new TickBridge(minecraftScope, tickEngine);
-        this.eventBridge = new MinecraftEventBridge(minecraftScope);
+        // 共用平台总线：Mod 的 ctx.events() 就是这条总线，
+        // 各建一条会让发布方与订阅方永远不相遇（历史断链）。
+        this.eventBridge = new MinecraftEventBridge(minecraftScope, runtime.events());
         this.registryBridge = new MinecraftRegistryBridge(minecraftScope);
         this.entityBridge = new EntityBridge(minecraftScope, minecraftScope);
         this.worldBridge = new WorldBridge(minecraftScope, minecraftScope);
@@ -272,13 +274,15 @@ public final class MinecraftBootstrap {
         // 「服务器要启动了」，紧接着看到启动失败 —— 顺序颠倒比失败本身更糟。
         current.requireTransitionTo(BootstrapState.RUNNING);
 
-        eventBridge.post(new MinecraftEventBridge.ServerStartingEvent());
+        // 按环境分派：客户端发 Client*，服务端发 Server*。
+        // 旧实现无论环境都发 Server*，客户端 Mod 只能靠猜。
+        eventBridge.postStarting(environment);
 
         transition(BootstrapState.RUNNING);
         driveScopeToRunning();
 
         lifecycle.onStart();
-        eventBridge.post(new MinecraftEventBridge.ServerStartedEvent());
+        eventBridge.postStarted(environment);
     }
 
     private void driveScopeToRunning() {
@@ -313,9 +317,9 @@ public final class MinecraftBootstrap {
             return;
         }
         state.set(BootstrapState.STOPPING);
-        eventBridge.post(new MinecraftEventBridge.ServerStoppingEvent());
+        eventBridge.postStopping(environment);
         lifecycle.onStop();
-        eventBridge.post(new MinecraftEventBridge.ServerStoppedEvent());
+        eventBridge.postStopped(environment);
         releaseAll();
         state.set(BootstrapState.STOPPED);
     }

@@ -101,7 +101,33 @@ public class EntryPointHook {
         MinecraftBootstrap mcBootstrap = new MinecraftBootstrap(runtime, env);
         bootstrap.set(mcBootstrap);
         this.minecraftScope.set(mcBootstrap.scope());
+        wireTickPipeline(runtime, mcBootstrap);
         installed = true;
+    }
+
+    /**
+     * 把 tick 引擎接到两个地方：Mod 侧的 {@code ctx.tick()}，以及平台总线。
+     *
+     * <h2>为什么必须在这里做</h2>
+     * Mod 的 {@code initialize()} 早于 {@code MinecraftBootstrap} 创建，
+     * 因此 {@code ModContext} 拿到的是 {@code Runtime} 上的
+     * <b>迟绑定容器</b>。引擎一创建就必须立刻装进去 ——
+     * 否则「Mod 在 initialize 里提交的 tick 任务」会永远等不到执行。
+     *
+     * <p>同时把 {@link org.loader.runtime.tick.TickEventBridge} 挂到引擎上：
+     * 没有它，{@code TickEvent} 在整条生产路径上零发布者，
+     * Mod 订阅了也永远收不到。
+     */
+    private void wireTickPipeline(Runtime runtime, MinecraftBootstrap mcBootstrap) {
+        if (runtime == null || mcBootstrap == null) {
+            return;
+        }
+        runtime.tickEngine().set(mcBootstrap.tickEngine());
+        org.loader.runtime.tick.TickEventBridge.install(
+                mcBootstrap.tickEngine(),
+                mcBootstrap.scope(),
+                runtime.events());
+        PlatformLog.info("[Mili] tick 管线已接通: 引擎 + TickEvent 桥接");
     }
 
     /**

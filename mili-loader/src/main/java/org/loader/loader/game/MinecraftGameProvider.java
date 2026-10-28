@@ -275,13 +275,11 @@ public class MinecraftGameProvider implements GameProvider {
         // initialize() 之前就必须可用。放在 launch() 里（Mod 初始化之后）
         // 会让 Mod 看到「服务未装配」，而那不是环境问题，是装配时序错误。
 
-        // 配置服务 —— 无 MC 依赖，客户端与服务端都可用。
-        //
-        // 存储服务与指标服务不在这里装配：它们的消费方是 Mod 的
-        // initialize()，而 initialize() 发生在 launch() 之前。
-        // 装配已上移到 LoaderMain.installRuntimeServices()。
-        org.loader.api.config.ConfigService.registerProvider(
-                new org.loader.runtime.config.PropertiesConfigStore());
+        // 配置服务已上移到 LoaderMain.installRuntimeServices()：
+        // 它的消费方是 Mod 的 initialize()，而 initialize() 发生在 launch() 之前。
+        // 在这里重复注册会新建一个 PropertiesConfigStore 实例，
+        // 把 Mod 在 initialize() 里已经加载的配置对象<b>整体替换掉</b> ——
+        // 「内存已改、磁盘未存」的状态会静默丢失。
 
         // F3 第一行的 launchedVersion 来自该系统属性；未设置时原样
         // 显示 "null"。仅在外部启动器未提供时补上，不覆盖外部值。
@@ -324,6 +322,14 @@ public class MinecraftGameProvider implements GameProvider {
                     null);
             registry.indexClass(
                     org.loader.runtime.minecraft.transform.MiliCreativeTabLayoutTransformer.SCREEN);
+
+            // 主菜单液态玻璃转场（docs/design/LIQUID_GLASS_MENU_TRANSITION.md）：
+            // TitleScreen#init RETURN 接管单人/多人按钮，
+            // Screen#extractRenderStateWithTooltipAndSubtitles RETURN 每帧绘制玻璃。
+            registry.register(
+                    new org.loader.runtime.minecraft.transform.MiliMenuTransitionTransformer(),
+                    null);
+            registry.indexClass(MiliSymbol.SCREEN_EXTRACT_RENDER_STATE.owner());
         }
         registry.indexClass(MiliSymbol.SERVER_TICK.owner());
         registry.indexClass(MiliSymbol.CLIENT_BRAND.owner());

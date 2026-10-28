@@ -3,9 +3,10 @@ package org.loader.test;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.loader.runtime.scheduler.TaskHandle;
-import org.loader.runtime.scheduler.TaskState;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Mod 测试基类 —— 管理 {@link MiliTestRuntime} 的生命周期。
@@ -48,23 +49,29 @@ public abstract class MiliTest {
         return runtime;
     }
 
-    // ── 常用断言（来自真实 TaskState，不做包装）────────────────────────
+    // ── 常用断言（基于可观察行为）──────────────────────────────────────
+    //
+    // 为什么断言行为而不是只看 TaskHandle.state()：
+    // 行为断言（await 不抛 / future 已取消 / await 抛）不依赖内部状态机的
+    // 具体取值，对实现变更更稳健；而 state() 现在是实时读原子引用
+    // （ABI 2 修复了「record 快照恒为 QUEUED」的缺陷），两者可以互相印证。
+    // 需要精确断言状态时请直接用 state()。
 
-    /** 断言任务已完成（COMPLETED）。 */
+    /** 断言任务已完成（await 正常返回）。 */
     protected static void assertCompleted(TaskHandle handle) {
-        assertEquals(TaskState.COMPLETED, handle.state(),
-                "任务应完成，实际 " + handle.state());
+        assertDoesNotThrow(() -> handle.await(),
+                "任务应正常完成（await 不抛出）");
     }
 
-    /** 断言任务已被取消（CANCELLED）。 */
+    /** 断言任务已被取消（future 进入 cancelled 状态）。 */
     protected static void assertCancelled(TaskHandle handle) {
-        assertEquals(TaskState.CANCELLED, handle.state(),
-                "任务应取消，实际 " + handle.state());
+        assertTrue(handle.future().isCancelled(),
+                "任务应取消（future.isCancelled）");
     }
 
-    /** 断言任务已失败（FAILED）。 */
+    /** 断言任务已失败（await 以非取消异常收场）。 */
     protected static void assertFailed(TaskHandle handle) {
-        assertEquals(TaskState.FAILED, handle.state(),
-                "任务应失败，实际 " + handle.state());
+        assertThrows(RuntimeException.class, handle::await,
+                "任务应失败（await 抛出执行异常）");
     }
 }
