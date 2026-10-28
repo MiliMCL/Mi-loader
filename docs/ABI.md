@@ -79,7 +79,7 @@ getCapability(Class)               isActive()       submit(...)
 | `Scheduler` | `submit(Runnable)` / `submit(Runnable, TaskPriority)` / `submitRepeating(...)` / `cancel(TaskHandle)` / `close()` |
 | `TaskHandle` | `taskId()` / `state()` / `priority()` / `cancel()` / `future()` / `await()` / `isActive()` / `isFinished()` |
 | `TaskState` | `CREATED` / `QUEUED` / `RUNNING` / `COMPLETED` / `CANCELLED` / `FAILED` |
-| `TaskPriority` | `LOW(0)` / `NORMAL(5)` / `HIGH(10)` / `CRITICAL(20)`，值越小越优先 |
+| `TaskPriority` | `LOW(0)` / `NORMAL(5)` / `HIGH(10)` / `CRITICAL(20)`，**值越大越优先** |
 
 `TaskHandle.state()` 返回**实时**状态（读原子引用），不是提交时的快照。`await()` 在任务失败时抛运行时异常，在任务取消时抛 `CancellationException`。
 

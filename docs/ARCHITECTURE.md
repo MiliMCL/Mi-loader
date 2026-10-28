@@ -61,7 +61,8 @@ Scope 是生命周期边界，也是资源所有权边界。关闭协议有四�
 
 ### 2.2 Scheduler
 
-- **优先级队列即工作队列**：`ThreadPoolExecutor` 直接从 `PriorityBlockingQueue` 取任务，中间没有二次排队。优先级值越小越优先，同优先级按提交顺序（FIFO）。
+- **优先级队列即工作队列**：`ThreadPoolExecutor` 直接从 `PriorityBlockingQueue` 取任务，中间没有二次排队。**值越大越优先**（`CRITICAL(20)` 先于 `LOW(0)`），同优先级按提交顺序（FIFO）。
+- **队列有界**：默认容量 16384。队列满且线程池已到上限时 `submit` 抛 `SchedulerError`，而不是把任务塞进无底洞。
 - **周期任务共用一个计时器线程**：不是每个 `submitRepeating` 一条线程。周期任务在计时器上直接执行，不占用工作线程（旧实现让工作线程 sleep 等下一周期，corePoolSize 个周期任务就能把池占满）。
 - **任务表只装未终结任务**：完成/失败/取消时立即摘除。`activeTaskCount()` 就是表大小，不需要拿提交数减完成数（那个减法在有任务被拒、被跳过时必然算错）。
 - **取消不被完成覆盖**：终结状态一律走 CAS，先到先得。

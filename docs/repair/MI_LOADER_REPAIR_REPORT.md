@@ -4,7 +4,11 @@
 > 执行日期：2026-10-24
 > 依据：`MI_LOADER_REPAIR_PLAN.md`（仓库外文件，见任务附件；本报告按 P0 → P1 → P2 全量执行）
 > 基线 HEAD：`03105e020ee74636633c82a76f392e54d5daa753`（`26.2`）
-> 修复分支：`fix/mi-loader-hardening-20261024`（本地，**未提交、未推送**）
+> 修复分支：`fix/mi-loader-hardening-20261024`（现已合并入 `26.2`）
+> 状态说明（2026-10-28）：本报告的修复已随 `26.2` 合并；
+> 合并后与另一条修复线（ABI 2 / 平台总线）产生 4 处语义冲突，已在合并提交后
+> 逐一和解（`Scheduler` 队列容量与 active 计数、`TaskHandle` 重复 `state()`、
+> 周期任务 future 终态）。当前状态以 `docs/architecture/CURRENT.md` 为准。
 
 ---
 

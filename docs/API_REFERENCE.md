@@ -327,7 +327,7 @@ public enum TaskPriority {
 }
 ```
 
-值越小越优先。同优先级按提交顺序执行。
+**值越大越优先**（`CRITICAL(20)` 先于 `LOW(0)`）。同优先级按提交顺序执行（FIFO）。
 
 ---
 

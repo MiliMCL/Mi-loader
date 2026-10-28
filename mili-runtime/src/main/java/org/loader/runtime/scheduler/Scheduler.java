@@ -280,7 +280,19 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
                 }
             }
 
-            /** 周期结束（取消 / Scope 停止 / 调度器关闭）——只执行一次。 */
+            /**
+             * 周期结束（取消 / Scope 停止 / 调度器关闭）——只执行一次。
+             *
+             * <p><b>future 的终态取决于「谁终止了它」</b>：
+             * <ul>
+             *   <li>调用方显式 {@code cancel()} → {@code CancellationException}
+             *       （「我取消了它」这个语义必须能从 future 上读出来）；</li>
+             *   <li>Scope 停止 / 调度器关闭 → <b>正常完成</b>。
+             *       调用方没有取消任何东西，它只是失去了宿主环境；
+             *       让 {@code future.get()} 抛取消异常会把「环境退出」
+             *       伪装成「调用方主动取消」，等待方无法区分两者。</li>
+             * </ul>
+             */
             private void finish() {
                 if (!scheduledOnce.compareAndSet(false, true)) {
                     return;
@@ -288,7 +300,11 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
                 state.set(TaskState.CANCELLED);
                 cancelledTasks.incrementAndGet();
                 taskMap.remove(taskId);
-                future.cancel(false);
+                if (cancelled.get()) {
+                    future.cancel(false);
+                } else {
+                    future.complete(null);
+                }
             }
         };
 
@@ -370,6 +386,9 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
                 t.state().compareAndSet(TaskState.QUEUED, TaskState.CANCELLED);
                 t.state().compareAndSet(TaskState.RUNNING, TaskState.CANCELLED);
                 taskQueue.remove(t);
+                // 只改状态不摘表会让这批任务永久占据活跃计数。
+                // Scope 停止是批量发生的，一次就是全量泄漏。
+                taskMap.remove(t.taskId());
                 t.future().cancel(true);
             }
         }
@@ -400,7 +419,11 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
                 completedTasks.get(),
                 failedTasks.get(),
                 cancelledTasks.get(),
-                taskMap.size(),
+                rejectedTasks.get(),
+                activeTasks.get(),
+                taskQueue.size(),
+                taskQueue.capacity(),
+                taskQueue.remainingCapacity(),
                 totalExecutionTime.get(),
                 waitTimeSamples.percentileMs(50),
                 waitTimeSamples.percentileMs(95),
@@ -526,6 +549,18 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
 
         private final java.util.concurrent.PriorityBlockingQueue<ScheduledTask> delegate;
 
+        /**
+         * 队列容量上限。
+         *
+         * <p>{@code PriorityBlockingQueue} 本身是<b>无界</b>的（构造参数只是初始
+         * 容量），因此容量必须由本类自己维护：{@link #offer} 在超限时返回
+         * {@code false}，让 {@code ThreadPoolExecutor} 走到「扩容线程 → 拒绝」
+         * 这条路径。没有这个字段，{@link #remainingCapacity()} 与
+         * {@link #offer} 的上限判断都无从实现 —— 队列会静默变成无底洞，
+         * 任务延迟无上限增长直到 OOM。
+         */
+        private final int capacity;
+
         PriorityWorkQueue(Comparator<ScheduledTask> comparator, int capacity) {
             this.delegate = new java.util.concurrent.PriorityBlockingQueue<>(256, comparator);
             this.capacity = capacity;
@@ -562,6 +597,11 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
         public boolean offer(Runnable r) {
             if (r == null) {
                 throw new NullPointerException("runnable must not be null");
+            }
+            // 容量判断必须在入队之前：PriorityBlockingQueue 无界，
+            // 让它自己收下就等于放弃了上限。
+            if (delegate.size() >= capacity) {
+                return false;
             }
             ScheduledTask st = unwrap(r);
             if (st == null) {
@@ -756,54 +796,60 @@ public class Scheduler implements org.loader.runtime.kernel.Resource {
             scheduler.activeTasks.incrementAndGet();
             long startTime = System.nanoTime();
             scheduler.waitTimeSamples.add(startTime - createdAtNanos);
+
+            Throwable failure = null;
+            boolean cancelledOutcome = false;
             try {
                 // 取消与开始之间是竞态：用 CAS 抢 RUNNING，抢不到说明
                 // 在排队期间已经被取消 —— 绝不能把它改回 RUNNING。
                 if (!state.compareAndSet(TaskState.QUEUED, TaskState.RUNNING)) {
-                    scheduler.cancelledTasks.incrementAndGet();
-                    scheduler.taskMap.remove(taskId);
-                    future.cancel(true);
-                    return;
-                }
-                if (ownerScope.isStopped() || scheduler.closed.get()) {
+                    cancelledOutcome = true;
+                } else if (ownerScope.isStopped() || scheduler.closed.get()) {
                     state.set(TaskState.CANCELLED);
-                    scheduler.cancelledTasks.incrementAndGet();
-                    scheduler.taskMap.remove(taskId);
-                    future.cancel(true);
-                    return;
-                }
-
-                work.run();
-
-                // 执行期间被取消（协作式取消），不得把 CANCELLED 覆盖成 COMPLETED
-                if (state.compareAndSet(TaskState.RUNNING, TaskState.COMPLETED)) {
-                    scheduler.completedTasks.incrementAndGet();
-                    // 先摘表再完成 future：否则调用方 future().join() 返回时
-                    // 任务还挂在活跃表里，activeTaskCount() 会短暂给出错误值 ——
-                    // 测试里是偶发失败，生产里是监控面板的假峰值。
-                    scheduler.taskMap.remove(taskId);
-                    future.complete(null);
+                    cancelledOutcome = true;
                 } else {
-                    scheduler.cancelledTasks.incrementAndGet();
-                    scheduler.taskMap.remove(taskId);
-                    future.cancel(true);
-                }
-            } catch (Throwable e) {
-                if (state.compareAndSet(TaskState.RUNNING, TaskState.FAILED)) {
-                    scheduler.failedTasks.incrementAndGet();
-                    scheduler.taskMap.remove(taskId);
-                    future.completeExceptionally(e);
-                } else {
-                    scheduler.cancelledTasks.incrementAndGet();
-                    scheduler.taskMap.remove(taskId);
-                    future.cancel(true);
+                    try {
+                        work.run();
+                    } catch (Throwable e) {
+                        failure = e;
+                    }
+                    // 执行期间被取消（协作式取消），不得把 CANCELLED 覆盖成 COMPLETED
+                    if (failure != null) {
+                        if (!state.compareAndSet(TaskState.RUNNING, TaskState.FAILED)) {
+                            cancelledOutcome = true;
+                        }
+                    } else if (!state.compareAndSet(TaskState.RUNNING, TaskState.COMPLETED)) {
+                        cancelledOutcome = true;
+                    }
                 }
             } finally {
                 long execNanos = System.nanoTime() - startTime;
                 scheduler.totalExecutionTime.addAndGet(execNanos);
                 scheduler.executionTimeSamples.add(execNanos);
+                // 与开头的 incrementAndGet 成对。漏掉这一句会让
+                // metrics().active 单调增长 —— 面板上表现为「线程池永远在忙」，
+                // 而实际上早就空闲，是最容易被误读成线程泄漏的那种假象。
+                scheduler.activeTasks.decrementAndGet();
                 // 兜底：任何未覆盖的路径都不能让任务永久留在活跃表里
                 scheduler.taskMap.remove(taskId);
+            }
+
+            // ── 统一收尾 ────────────────────────────────────────────────
+            //
+            // 顺序是硬约束：**先摘表与递减，再完成 future**。
+            // 反过来的话，调用方 await() 返回时任务仍挂在活跃表里，
+            // metrics().active 会短暂非零 —— 测试里是偶发失败，
+            // 生产里是监控面板上的假峰值，而且「任务完成」与「指标归零」
+            // 之间出现了一个可观测的中间态，调用方只能 sleep 一轮再读。
+            if (failure != null && !cancelledOutcome) {
+                scheduler.failedTasks.incrementAndGet();
+                future.completeExceptionally(failure);
+            } else if (cancelledOutcome) {
+                scheduler.cancelledTasks.incrementAndGet();
+                future.cancel(true);
+            } else {
+                scheduler.completedTasks.incrementAndGet();
+                future.complete(null);
             }
         }
     }

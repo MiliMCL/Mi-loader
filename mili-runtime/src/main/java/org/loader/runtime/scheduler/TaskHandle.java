@@ -92,11 +92,6 @@ record TaskHandleImpl(
     }
 
     @Override
-    public TaskState state() {
-        return stateRef.get();
-    }
-
-    @Override
     public boolean cancel() {
         // 只允许从「未开始」或「运行中」取消；已终结的任务返回 false，
         // 与 {@link TaskState#canTransitionTo} 的语义一致。
