@@ -1,10 +1,12 @@
 package org.loader.loader.discovery;
 
+import org.loader.loader.PlatformLog;
 import org.loader.loader.config.LoaderConfig;
 import org.loader.loader.util.MiliJson;
 import org.loader.runtime.error.ModLoadError;
 import org.loader.runtime.mod.ModManifest;
 import org.loader.runtime.mod.ModManifest.VersionBinding;
+import org.loader.runtime.util.DependencySorter;
 
 import java.io.IOException;
 import java.nio.file.*;
@@ -195,24 +197,73 @@ public class ModDiscovery {
         return Collections.unmodifiableList(discovered);
     }
 
+    /**
+     * 按依赖拓扑顺序排列 Mod。
+     *
+     * <p><b>循环依赖必须在这里被拦住</b>：Mod 加载顺序是不归路 ——
+     * 一旦以错误顺序初始化，Mod 之间的相互引用就已经发生，事后无法补救。
+     * 历史实现用 {@code visited} 去重，{@code A → B → A} 会被当成
+     * 「已访问」而静默通过，两个 Mod 以任意顺序进入加载流程。
+     *
+     * <p>缺失依赖仍然保持宽松（只告警不阻断）：可选依赖很常见，
+     * 而且「声明了但没装」在开发期经常是有意的。
+     *
+     * @throws org.loader.runtime.error.ModLoadError 依赖成环（MOD_DEPENDENCY_CYCLE）
+     */
     public List<ModManifest> resolveDependencies(List<ModManifest> mods) {
         Map<String, ModManifest> index = new LinkedHashMap<>();
-        for (ModManifest m : mods) index.put(m.id(), m);
-        List<ModManifest> result = new ArrayList<>();
-        Set<String> visited = new HashSet<>();
-        for (ModManifest mod : mods) resolveRecursive(mod, index, result, visited);
+        for (ModManifest m : mods) {
+            index.putIfAbsent(m.id(), m);
+        }
+
+        List<DependencySorter.Node> nodes = new ArrayList<>(index.size());
+        for (ModManifest mod : index.values()) {
+            List<String> required = new ArrayList<>();
+            for (ModManifest.DependencyEntry dep : mod.dependencies()) {
+                if (dep.required()) {
+                    required.add(dep.modId());
+                }
+            }
+            nodes.add(new DependencySorter.Node(mod.id(), required));
+        }
+
+        DependencySorter.Result sorted =
+                DependencySorter.sort(nodes, new ArrayList<>(index.keySet()));
+
+        if (sorted.hasCycles()) {
+            String chain = sorted.describeCycles();
+            throw new ModLoadError(
+                    "依赖循环，拒绝启动: " + chain + "\n  ErrorCode: MOD_DEPENDENCY_CYCLE",
+                    "MOD_DEPENDENCY_CYCLE");
+        }
+
+        if (sorted.hasMissing()) {
+            missingDependencies = List.copyOf(sorted.missing());
+            PlatformLog.warn("以下依赖在 mods 目录中不存在（按可选依赖处理）: "
+                    + String.join(", ", missingDependencies));
+        } else {
+            missingDependencies = List.of();
+        }
+
+        List<ModManifest> result = new ArrayList<>(sorted.order().size());
+        for (String id : sorted.order()) {
+            ModManifest manifest = index.get(id);
+            if (manifest != null) {
+                result.add(manifest);
+            }
+        }
         return result;
     }
 
-    private void resolveRecursive(ModManifest mod, Map<String, ModManifest> index,
-                                  List<ModManifest> result, Set<String> visited) {
-        if (visited.contains(mod.id())) return;
-        visited.add(mod.id());
-        for (ModManifest.DependencyEntry dep : mod.dependencies()) {
-            if (dep.required() && index.containsKey(dep.modId())) {
-                resolveRecursive(index.get(dep.modId()), index, result, visited);
-            }
-        }
-        result.add(mod);
+    /**
+     * 上一次 {@link #resolveDependencies} 中未能解析的依赖 id。
+     *
+     * <p>Loader 用它把「装了 A 但没装 A 依赖的 B」写进启动报告，
+     * 而不是让 Mod 在运行期抛 {@code NoClassDefFoundError} 时才发现。
+     */
+    public List<String> missingDependencies() {
+        return missingDependencies;
     }
+
+    private volatile List<String> missingDependencies = List.of();
 }

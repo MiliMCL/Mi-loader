@@ -296,4 +296,195 @@ public final class Json {
         }
         return null;
     }
+
+    // ── 写出 ────────────────────────────────────────────────────────────────
+
+    /**
+     * 序列化为紧凑 JSON 文本。
+     *
+     * <p><b>为什么必须用序列化器而不是手拼字符串</b>：安装报告里含文件路径。
+     * Windows 路径的 {@code \} 在 JSON 中是转义引导符，手工拼接会把
+     * {@code C:\Users\x} 写成 {@code "C:\Users\x"} —— 其中 {@code \U} 是非法
+     * 转义，输出不是合法 JSON，下游解析直接失败。同理，路径中的 {@code "}、
+     * 换行、控制字符都会破坏文档结构。这些都必须由转义逻辑统一处理。
+     *
+     * <p>接受的值：{@code String}、{@code Boolean}、整数类型（{@code Integer}/
+     * {@code Long}/{@code Short}/{@code Byte}）、{@code Double}/{@code Float}
+     * （必须有限）、{@code Map<String,?>}、{@code Iterable<?>}、{@code Object[]}
+     * 与 {@code null}。其它类型一律拒绝 —— 对任意对象调用 {@code toString()}
+     * 会产出「看起来像数据但其实不可解析」的输出，比直接报错危险得多。
+     */
+    public static String write(Object value) {
+        StringBuilder sb = new StringBuilder();
+        writeValue(sb, value, -1, 0);
+        return sb.toString();
+    }
+
+    /** 序列化为 2 空格缩进的 JSON（安装报告需要人眼可读）。 */
+    public static String writePretty(Object value) {
+        StringBuilder sb = new StringBuilder();
+        writeValue(sb, value, 2, 0);
+        return sb.toString();
+    }
+
+    /** 嵌套深度上限。防的是自引用/环形结构导致的 StackOverflow。 */
+    private static final int MAX_DEPTH = 64;
+
+    private static void writeValue(StringBuilder sb, Object value, int indent, int depth) {
+        if (depth > MAX_DEPTH) {
+            throw new JsonException("JSON 嵌套过深（>" + MAX_DEPTH + "）或存在自引用结构");
+        }
+        if (value == null) {
+            sb.append("null");
+            return;
+        }
+        if (value instanceof String s) {
+            writeString(sb, s);
+            return;
+        }
+        if (value instanceof Boolean b) {
+            sb.append(b ? "true" : "false");
+            return;
+        }
+        if (value instanceof Integer || value instanceof Long
+                || value instanceof Short || value instanceof Byte) {
+            sb.append(value);
+            return;
+        }
+        if (value instanceof java.math.BigInteger bi) {
+            sb.append(bi);
+            return;
+        }
+        if (value instanceof Double d) {
+            writeNumber(sb, d);
+            return;
+        }
+        if (value instanceof Float f) {
+            writeNumber(sb, f.doubleValue());
+            return;
+        }
+        // Path 实现了 Iterable<Path>，落到下面的 Iterable 分支会无限递归
+        // （元素还是 Path）。这是最容易踩的一处：调用方往往直接把路径丢进来。
+        if (value instanceof java.nio.file.Path p) {
+            throw new JsonException("Path 不能直接序列化，请先 toString(): " + p);
+        }
+        if (value instanceof Map<?, ?> m) {
+            writeObject(sb, m, indent, depth);
+            return;
+        }
+        if (value instanceof Iterable<?> it) {
+            writeArray(sb, it, indent, depth);
+            return;
+        }
+        if (value instanceof Object[] arr) {
+            writeArray(sb, java.util.Arrays.asList(arr), indent, depth);
+            return;
+        }
+        throw new JsonException("无法序列化的 JSON 值类型: " + value.getClass().getName()
+                + "（请显式转换成 String/Number/Boolean/Map/List）");
+    }
+
+    private static void writeNumber(StringBuilder sb, double d) {
+        // JSON（RFC 8259）没有 NaN / Infinity 字面量；放过去会产出非法文档。
+        if (!Double.isFinite(d)) {
+            throw new JsonException("JSON 不支持非有限数值: " + d);
+        }
+        if (d == Math.rint(d) && Math.abs(d) < 1e15) {
+            sb.append((long) d);
+        } else {
+            sb.append(d);
+        }
+    }
+
+    private static void writeObject(StringBuilder sb, Map<?, ?> map, int indent, int depth) {
+        if (map.isEmpty()) {
+            sb.append("{}");
+            return;
+        }
+        sb.append('{');
+        boolean first = true;
+        for (Map.Entry<?, ?> e : map.entrySet()) {
+            if (!first) {
+                sb.append(',');
+            }
+            first = false;
+            newline(sb, indent, depth + 1);
+            if (!(e.getKey() instanceof String key)) {
+                throw new JsonException("JSON 对象的 key 必须是 String，实际为 "
+                        + (e.getKey() == null ? "null" : e.getKey().getClass().getName()));
+            }
+            writeString(sb, key);
+            sb.append(':');
+            if (indent >= 0) {
+                sb.append(' ');
+            }
+            writeValue(sb, e.getValue(), indent, depth + 1);
+        }
+        newline(sb, indent, depth);
+        sb.append('}');
+    }
+
+    private static void writeArray(StringBuilder sb, Iterable<?> items, int indent, int depth) {
+        java.util.Iterator<?> it = items.iterator();
+        if (!it.hasNext()) {
+            sb.append("[]");
+            return;
+        }
+        sb.append('[');
+        boolean first = true;
+        while (it.hasNext()) {
+            if (!first) {
+                sb.append(',');
+            }
+            first = false;
+            newline(sb, indent, depth + 1);
+            writeValue(sb, it.next(), indent, depth + 1);
+        }
+        newline(sb, indent, depth);
+        sb.append(']');
+    }
+
+    private static void newline(StringBuilder sb, int indent, int depth) {
+        if (indent < 0) {
+            return;
+        }
+        sb.append('\n');
+        sb.append(" ".repeat(indent * depth));
+    }
+
+    private static void writeString(StringBuilder sb, String s) {
+        sb.append('"');
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"' -> sb.append("\\\"");
+                case '\\' -> sb.append("\\\\");
+                case '\b' -> sb.append("\\b");
+                case '\f' -> sb.append("\\f");
+                case '\n' -> sb.append("\\n");
+                case '\r' -> sb.append("\\r");
+                case '\t' -> sb.append("\\t");
+                default -> {
+                    if (c < 0x20) {
+                        sb.append(unicodeEscape(c));
+                    } else if (Character.isHighSurrogate(c)
+                            && i + 1 < s.length()
+                            && Character.isLowSurrogate(s.charAt(i + 1))) {
+                        // 合法的代理对：按原样成对写出
+                        sb.append(c).append(s.charAt(++i));
+                    } else if (Character.isSurrogate(c)) {
+                        // 未配对的代理项无法编码为 UTF-8，转义后保证输出可逆
+                        sb.append(unicodeEscape(c));
+                    } else {
+                        sb.append(c);
+                    }
+                }
+            }
+        }
+        sb.append('"');
+    }
+
+    private static String unicodeEscape(char c) {
+        return String.format("\\u%04x", (int) c);
+    }
 }

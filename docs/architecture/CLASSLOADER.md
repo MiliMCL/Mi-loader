@@ -21,6 +21,40 @@ Mod 之间是**兄弟**，不是父子。
 
 ---
 
+## 两条加载路径：只有一条是生产路径
+
+| 路径 | 入口 | 是否创建隔离 ClassLoader | 用途 |
+|---|---|---|---|
+| **生产** | `LoaderMain` → `ModDiscovery` → `ModClassLoaderManager.create(manifest, source)` | 是（parent = `MinecraftClassLoader`） | 真正启动游戏 |
+| **进程内 API** | `org.loader.runtime.mod.ModLoader#load(manifest, parent)` | **否** —— 直接使用调用方给的 ClassLoader | 测试 / Mod 代码已在当前 classpath 上的宿主场景 |
+
+第二条路径曾被误认为"也是加载器"：它的 `createClassLoader` 只有一行
+`return parent != null ? parent : getClass().getClassLoader()`，
+注释写着 "In a real implementation, this would create a URLClassLoader from mod jars"。
+后果是**一个根本没被打进 classpath 的 Mod 也能"加载成功"**，直到某处引用它的类时
+才抛 `ClassNotFoundException` —— 报错点离根因很远。
+
+现在的处理：
+
+- `ModLoader.createsIsolatedClassLoaders()` 恒返回 `false`，把这个事实变成可断言的代码；
+- `load()` 在清单声明了 `entrypoint` 时，用 `Class.forName(entrypoint, false, loader)`
+  做一次可见性检查，不可见就立刻抛 `ModLoadException`，消息直接指向 `ModClassLoader`。
+
+**`ModManager` 属于第二条路径**：`LoaderMain` 不引用它，它也不参与生产启动。
+它的 `resolve()` 与生产路径共用同一个
+`org.loader.runtime.util.DependencySorter`，因此"依赖环会不会被拦住"不存在两套答案。
+
+### 卸载边界
+
+`ModClassLoader.close()` 关闭 `URLClassLoader`，`ModClassLoaderManager.close()` 逆序关闭，
+这让 Mod JAR 的文件句柄被释放（Windows 上才删得掉/换得掉）。
+
+**这不等于类被卸载。** JVM 只在 ClassLoader 与其所有类都不可达时才回收它们；
+静态字段、线程栈、缓存里任何一处强引用都会让整棵类树继续存活。
+因此文档不声称"彻底卸载"，热替换的正确实现方式仍是重启进程。
+
+---
+
 ## 三条硬约束
 
 ### 1. Minecraft 类全局唯一

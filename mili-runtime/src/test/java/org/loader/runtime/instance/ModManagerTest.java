@@ -139,8 +139,101 @@ class ModManagerTest {
 
         assertFalse(result.success());
         assertFalse(result.missingDependencies().isEmpty());
+        // 缺失 ≠ 冲突：三类失败必须可区分，否则诊断无从下手
+        assertTrue(result.conflicts().isEmpty(),
+                () -> "缺失依赖不应被记成冲突: " + result.conflicts());
 
         runtime.close();
+    }
+
+    @Test
+    void modManager_resolve_dependencyCycleIsRejected() {
+        org.loader.runtime.kernel.Runtime runtime = org.loader.runtime.kernel.Runtime.create("cycle-test");
+        runtime.start();
+
+        // modA -> modB -> modA。旧实现只用 visited 去重，会把它当成
+        // 「已访问」并成功返回 [modB, modA] —— 循环依赖直接进加载流程。
+        ModManifest modA = dependentOn("modA", "modB");
+        ModManifest modB = dependentOn("modB", "modA");
+
+        ModManager manager = new ModManager("cycle-mgr", runtime.rootScope());
+        runtime.rootScope().registerResource(manager);
+        manager.addSource(ModSources.listOf(List.of(modA, modB)));
+
+        ModResolutionResult result = manager.resolve(
+                Instance.builder("inst").addMod("modA").build());
+
+        assertFalse(result.success(), "循环依赖必须解析失败");
+        assertTrue(result.resolvedMods().isEmpty(), "环不得产出可加载集合");
+        assertTrue(result.missingDependencies().isEmpty(), "环不是缺失");
+        assertTrue(result.conflicts().stream().anyMatch(c -> c.contains("依赖循环")),
+                () -> "必须明确指出是循环: " + result.conflicts());
+        assertTrue(result.conflicts().stream().anyMatch(c -> c.contains("modA -> modB -> modA")),
+                () -> "必须给出完整环链: " + result.conflicts());
+
+        runtime.close();
+    }
+
+    @Test
+    void modManager_resolve_selfCycleIsRejected() {
+        org.loader.runtime.kernel.Runtime runtime = org.loader.runtime.kernel.Runtime.create("self-cycle");
+        runtime.start();
+
+        ModManager manager = new ModManager("self-mgr", runtime.rootScope());
+        runtime.rootScope().registerResource(manager);
+        manager.addSource(ModSources.listOf(List.of(dependentOn("solo", "solo"))));
+
+        ModResolutionResult result = manager.resolve(
+                Instance.builder("inst").addMod("solo").build());
+
+        assertFalse(result.success());
+        assertTrue(result.conflicts().stream().anyMatch(c -> c.contains("solo -> solo")),
+                () -> result.conflicts().toString());
+
+        runtime.close();
+    }
+
+    @Test
+    void modManager_resolve_versionMismatchIsDistinctFromMissing() {
+        org.loader.runtime.kernel.Runtime runtime = org.loader.runtime.kernel.Runtime.create("version-test");
+        runtime.start();
+
+        ModManifest core = ModManifest.of("core", "Core", "1.0");
+        ModManifest lib = new ModManifest("lib", "Lib", "1.0", "", "",
+                List.of(new ModManifest.DependencyEntry("core", "2.0", true)),
+                List.of(), "", List.of(), VersionBinding.unbound());
+
+        ModManager manager = new ModManager("version-mgr", runtime.rootScope());
+        runtime.rootScope().registerResource(manager);
+        manager.addSource(ModSources.listOf(List.of(core, lib)));
+
+        ModResolutionResult result = manager.resolve(
+                Instance.builder("inst").addMod("lib").build());
+
+        assertFalse(result.success());
+        assertTrue(result.missingDependencies().isEmpty(), "依赖存在，只是版本不符");
+        assertTrue(result.conflicts().stream().anyMatch(c -> c.contains("版本不匹配")),
+                () -> "必须是版本冲突而不是缺失: " + result.conflicts());
+
+        runtime.close();
+    }
+
+    @Test
+    void versionSatisfies_supportsWildcardAndExactOnly() {
+        assertTrue(ModManager.versionSatisfies(null, "1.0"));
+        assertTrue(ModManager.versionSatisfies("*", "1.0"));
+        assertTrue(ModManager.versionSatisfies("1.0", "1.0"));
+        assertFalse(ModManager.versionSatisfies("1.0", "1.1"));
+        // 未实现的范围语法按「不校验」处理：宁可漏报，也不要误报阻断
+        assertTrue(ModManager.versionSatisfies("^1.0", "9.9"));
+        assertTrue(ModManager.versionSatisfies(">=1.0,<2.0", "0.1"));
+    }
+
+    /** 构造一个只依赖 {@code dep} 的清单。 */
+    private static ModManifest dependentOn(String id, String dep) {
+        return new ModManifest(id, id, "1.0", "", "",
+                List.of(new ModManifest.DependencyEntry(dep, "*", true)),
+                List.of(), "", List.of(), VersionBinding.unbound());
     }
 
     @Test

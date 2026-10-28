@@ -86,6 +86,11 @@ class ApiBoundaryTest {
             // 边界真正要防的是「loader 自行实现转换逻辑」，
             // 而不是「loader 调用平台提供的转换入口」。
             "import org.loader.runtime.transform.engine.TransformerPipeline;",
+            // 依赖拓扑排序是「唯一实现」：ModManager（runtime）与 ModDiscovery
+            // （loader）必须用同一套三态 DFS，否则「环会不会被拦住」取决于
+            // Mod 从哪个入口进来。它住在 util（无依赖的叶子包），
+            // 因此这里仍然只白名单这一个类，不放宽 util 整包。
+            "import org.loader.runtime.util.DependencySorter;",
             // MinecraftGameProvider 需要 TransformerRegistry 构建注册表并登记
             // 平台自身的转换器（TransformerPipeline 由它构建后持有）。与上一条
             // 同类：白名单是具体类 —— loader 仍不能碰 ASM / verifier 等内部件。

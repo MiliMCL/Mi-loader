@@ -61,4 +61,36 @@ class DependencyResolverTest {
         assertThrows(IllegalArgumentException.class,
                 () -> resolver.addDependency("known", "unknown"));
     }
+
+    @Test
+    void cycleRejectionNamesBothSides() {
+        DependencyResolver resolver = new DependencyResolver();
+        resolver.registerNode("a");
+        resolver.registerNode("b");
+        resolver.addDependency("a", "b");
+
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> resolver.addDependency("b", "a"));
+        assertTrue(e.getMessage().contains("b") && e.getMessage().contains("a"));
+    }
+
+    @Test
+    void multipleRootsStillTopologicallyOrdered() {
+        DependencyResolver resolver = new DependencyResolver();
+        resolver.registerNode("base");
+        resolver.registerNode("x");
+        resolver.registerNode("y");
+        resolver.registerNode("app");
+
+        resolver.addDependency("x", "base");
+        resolver.addDependency("y", "base");
+        resolver.addDependency("app", "x");
+
+        List<String> order = resolver.resolveInitializationOrder();
+        assertEquals(4, order.size());
+        assertTrue(order.indexOf("base") < order.indexOf("x"));
+        assertTrue(order.indexOf("x") < order.indexOf("app"));
+        // 确定性：同一图重复求解结果一致
+        assertEquals(order, resolver.resolveInitializationOrder());
+    }
 }
