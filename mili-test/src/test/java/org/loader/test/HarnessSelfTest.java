@@ -126,7 +126,28 @@ class HarnessSelfTest extends MiliTest {
         CountDownLatch gate = new CountDownLatch(1);
         AtomicInteger ran = new AtomicInteger();
 
-        TaskHandle blocker = mod.scheduler().submit(mod.scope(), () -> awaitQuietly(gate));
+        // 前提必须做实：两个 blocker（= fixture 调度器的 corePoolSize，
+        // 见 TestModFixture）各自报告「已开跑」，确认全部常驻工作线程
+        // 都被占住后，victim 提交时才必然留在队列里。
+        //
+        // 为什么不能提交完 blocker 就立刻提交 victim：ThreadPoolExecutor
+        // 为前两次 submit 各拉起一个工作线程，两个线程谁先从队列抢到
+        // 任务是未定义的 —— Linux CI 上 victim 被第二个线程抢走并瞬间
+        // 跑完，等主线程调 cancel() 时任务已 COMPLETED，cancel() 返回
+        // false，「排队任务可取消」的前提根本没建立（Windows 本地恰好
+        // 总是 blocker 先被抢到，所以从未暴露）。
+        CountDownLatch blockersStarted = new CountDownLatch(2);
+        TaskHandle blocker1 = mod.scheduler().submit(mod.scope(), () -> {
+            blockersStarted.countDown();
+            awaitQuietly(gate);
+        });
+        TaskHandle blocker2 = mod.scheduler().submit(mod.scope(), () -> {
+            blockersStarted.countDown();
+            awaitQuietly(gate);
+        });
+        assertTrue(blockersStarted.await(2, TimeUnit.SECONDS),
+                "两个 blocker 应占住调度器的全部常驻工作线程");
+
         TaskHandle victim = mod.scheduler().submit(mod.scope(), ran::incrementAndGet);
 
         assertTrue(victim.cancel(), "排队任务应可取消");
@@ -135,7 +156,8 @@ class HarnessSelfTest extends MiliTest {
         Thread.sleep(100); // 宽限：若取消无效，任务已可能执行
         assertEquals(0, ran.get(), "被取消的任务不应执行");
 
-        assertCompleted(blocker);
+        assertCompleted(blocker1);
+        assertCompleted(blocker2);
     }
 
     @Test
