@@ -1,191 +1,302 @@
-# Mili Platform
+Mi-loader
 
-Mili 是一个从零编写的 Minecraft 客户端 Mod 加载器，基于 Java 25，不克隆也不兼容 Fabric。它自带独立的 Runtime 内核（Scope / Scheduler / EventBus / Capability / TickEngine），为 Mod 提供纯 Mili 原生 API，不依赖 Fabric，不使用 Mixin，也不依赖 LaunchWrapper。
+一个面向 Minecraft 的原生模组平台
 
-整个平台以**运行时契约（ABI）**为核心：Mod 只编译 `mili-abi`，Loader 负责注入真实实现。ABI 与实现之间是单向依赖，实现可以任意重构，只要契约不变，已编译的 Mod 二进制无需重新编译。
+Mi-loader 是一个独立开发的 Minecraft 模组平台，旨在为 Minecraft 提供结构清晰、易于维护、可扩展的模组运行环境。
 
-## 核心特性
+与依赖现有模组加载器兼容层的方案不同，Mi-loader 拥有自己的模组 ABI、运行时契约、生命周期管理、类加载边界以及 Minecraft 集成机制。
 
-**契约优先，实现可替换。** `mili-abi` 是 Mod 的唯一编译目标，零运行时依赖。Loader 侧任何重构都不会传导到 Mod。
+Mi-loader 希望通过明确的接口契约、可预测的生命周期规则与受管理的运行时服务，构建一个更易于开发、维护和扩展的模组生态。
 
-**单一平台事件总线。** 全平台只有一条事件总线，Mod 的 `ctx.events()` 是它的带归属视图。Tick 事件、Mod 生命周期事件、平台阶段事件、Mod 之间的自定义事件全部走同一条总线，并按**类型继承链**派发——订阅 `Object.class` 能收到一切事件，订阅某个基类型能收到所有子类型。这条约束是硬性的：多总线会让「订阅了但永远收不到」变成无法排查的静默失效。
+Mi-loader 不是 Fabric、Forge 或 NeoForge 的兼容层。 现有的 Fabric、Forge、NeoForge 模组默认无法直接运行，除非经过明确的移植或适配。
 
-**结构化并发。** 每个任务归属于一个 Scope，Scope 关闭时未完成任务自动取消。任务按优先级出队（同优先级 FIFO），周期任务共用一个计时器线程而不是每任务一条线程。`TaskHandle.state()` 读的是实时状态，不是提交时的快照。
+⸻
 
-**跨 Mod 服务代理。** `ctx.services()` 提供 `provide` / `discover` / `require`。同一接口只允许一个提供方——冲突在**发布时**失败并指出双方 modId，而不是后注册者静默覆盖。提供方 Scope 停止后服务自动失效。
+项目简介
 
-**按 tick 计数调度。** `ctx.tick()` 提供 `runNextTick` / `runAfterTicks` / `runEveryTick`。与按墙钟计时的 `Scheduler` 分开：游戏卡顿时两者会分叉，需要与游戏节奏对齐的逻辑必须用 tick 服务。
+项目	信息
+项目名称	Mi-loader
+开发组织	MiliMCL
+目标 Minecraft 版本	26.2
+Java 版本	Java 25
+构建系统	Gradle
+开源协议	Apache License 2.0
+项目类型	独立原生模组平台
 
-**拒绝即默认的权限模型。** 读写自己的资源默认允许；网络、原生库、四项字节码转换权、方法覆盖默认拒绝，必须由用户配置显式放行。权限在 API 门面层校验，Mod 无法绕过。
+Mi-loader 仍处于持续开发阶段。随着平台完善，接口、实现与使用方式可能发生变化。
 
-**版本三元组严格锁定。** 平台版本、ABI 版本、Minecraft 版本三者必须完全一致才允许加载。没有模糊的兼容区间——升级的显式性本身就是安全保证的一部分。
+设计理念
 
-**无字节码重写的反射桥接。** 与 Minecraft 的交互通过反射完成，不需要 Agent、不需要 premain、不需要改启动参数。桥接坐标集中在 `MiliSymbol`，构建期用**真实 Minecraft JAR** 逐条比对 owner + name + descriptor——符号表过期会让转换器静默不注入，因此这道关卡不可省略。
+1. 契约优先的架构
 
-## 模块构成
+Mi-loader 优先考虑明确的接口边界与稳定的模块职责，减少平台组件之间不必要的耦合。
 
-| 模块 | 职责 | 依赖 |
-|---|---|---|
-| `mili-abi` | 稳定契约接口，零运行时依赖，Mod 编译的唯一目标 | — |
-| `mili-runtime` | Runtime 内核：Scope、Scheduler、EventBus、ServiceBroker、Capability、Permission、TickEngine | `abi` |
-| `mili-loader` | 启动发现、依赖解析、类加载、生命周期调度、CLI | `abi`、`runtime`、`minecraft-integration`、`installer` |
-| `mili-minecraft-integration` | 反射桥接与字节码转换：tick 注入、注册表绑定、客户端服务 | `abi`、`runtime` |
-| `mili-installer` | 首次运行的 Minecraft 客户端/库/资源安装器 | — |
-| `mili-test` | 纯 JVM Mod 测试框架（测试依赖，不属于运行时） | `abi`、`runtime` |
+平台主要围绕以下部分构建：
 
-依赖方向严格单向、无环：`abi ← runtime ← loader`，`abi ← runtime ← minecraft-integration`。Minecraft 集成模块独立而非嵌入 Loader，是因为它的替换频率远高于 Loader 本体——Minecraft 补丁发布时只需重打集成模块。
+* 模组 ABI：定义模组与平台交互的基础契约。
+* 运行时（Runtime）：提供公共服务、执行设施与生命周期基础设施。
+* 加载器（Loader）：负责模组发现、依赖解析与加载。
+* Minecraft 集成层：负责平台与 Minecraft 实际运行环境之间的连接。
+* 安装器（Installer）：负责安装与准备受支持的游戏环境。
 
-## 版本
+通过明确职责边界，降低平台维护成本，并使系统行为更容易检查、测试与验证。
 
-| 维度 | 值 | 含义 |
-|---|---|---|
-| `CURRENT_VERSION` | `0.1.0` | Loader 实现版本（语义化） |
-| `ABI_VERSION` | `2` | Mod 契约版本（整数，从 1 递增） |
-| `TARGET_JAVA` | `25` | 运行时最低 Java 版本 |
-| `TARGET_MINECRAFT` | `26.2` | 唯一支持的 Minecraft 版本 |
+2. 受控的类加载机制
 
-`gradle.properties` 是唯一权威来源。`./gradlew check` 会校验 `VersionInfo`、`MiliSymbol.MINECRAFT_VERSION` 与它完全一致——版本漂移会让已编译的 Mod 无法加载，必须在构建期拦住。
+Mi-loader 实现了独立的模组类加载基础设施。
 
-ABI 2 相对 ABI 1 的变化见 [ABI.md](docs/ABI.md#abi-2-相对-abi-1-的变更)。
+目前涉及：
 
-## 快速开始
+* 每个模组独立的类加载器。
+* 显式的依赖解析机制。
+* 模组类与 Minecraft 类之间的加载边界。
+* 对平台 API 的受控访问。
+* 与模组生命周期相关的资源清理机制。
 
-编译需要 JDK 25：
+类加载隔离属于架构层面的边界，不等于完整的安全沙箱。模组仍应被视为可信代码。
 
-```
-./gradlew clean build test
-```
+3. 受管理的运行时
 
-产物位于各模块的 `build/libs/`：
+Mi-loader 提供一系列运行时设施，尽可能减少模组重复实现基础功能的成本。
 
-- `mili-abi/build/libs/mili-abi-<version>.jar` — Mod 编译依赖
-- `mili-runtime/build/libs/mili-runtime-<version>.jar` — Runtime 内核
-- `mili-loader/build/libs/mili-loader-<version>.jar` — Loader 本体
-- `mili-minecraft-integration/build/libs/mili-minecraft-integration-<version>.jar` — 反射桥接
+运行时组件包括：
 
-分发包布局：
+* 模组生命周期管理
+* 事件基础设施
+* Scheduler（调度器）
+* TickEngine
+* ServiceBroker（服务代理）
+* Capability / Permission（能力与权限相关设施）
+* 配置与存储
+* 诊断设施
 
-```
-<dist>/
-├── bin/         启动脚本（mili-loader / mili-loader.ps1）
-├── core/        Loader + Runtime + Integration + Installer
-├── game/        Minecraft 客户端（首次运行由 Installer 自动拉取）
-├── mods/        Mod JAR
-└── config/mili/ 平台配置、Mod 配置、Mod 数据
-```
+不同 API 的实现程度与成熟度可能存在差异。使用前请以对应版本的实际实现和文档为准。
 
-启动脚本需传 `--mili-mods <dist>/mods`——分发包里 `game/` 与 `mods/` 不是同一目录，不显式指定就会去扫一个不存在的 `game/mods/`，结果是零个 Mod 且无任何报错（Loader 会在日志里显式警告）。
+4. 明确的 Minecraft 集成机制
 
-开发模式下：
+Mi-loader 通过自身的集成机制连接 Minecraft。
 
-| 命令 | 作用 |
-|---|---|
-| `./gradlew :mili-loader:runClient` | 直接启动（gameDir 默认 `test_client/`，`-Pmili.gameDir=` 覆盖） |
-| `./gradlew :mili-loader:miliDoctor` | 对 Mod 目录做只读体检 |
-| `java -cp ... org.loader.loader.cli.MiliCli doctor <gameDir>` | 独立 CLI 体检 |
-| `java -cp ... org.loader.loader.cli.MiliCli explain <CODE>` | 解释错误码并给出修复建议 |
-| `java -cp ... org.loader.loader.cli.MiliCli new <dir> <id>` | 生成 Mod 脚手架 |
+对于无法仅通过普通外部 API 完成的集成需求，平台维护了自有的 ASM 字节码转换流水线与 Minecraft 字节码 Hook。
 
-## 一个最小 Mod
+该设计旨在集中管理底层集成逻辑，使其更容易维护、验证与排查问题。
 
-```java
-package com.example;
+⸻
 
-import org.loader.api.Mod;
-import org.loader.api.ModContext;
-import org.loader.api.event.TickEvent;
+架构概览
 
-public final class ExampleMod implements Mod {
+Minecraft
+    |
+    v
+Minecraft 集成层
+    |
+    v
+Mi-loader Runtime
+    |
+    +-- 模组生命周期
+    +-- 事件基础设施
+    +-- Scheduler
+    +-- TickEngine
+    +-- ServiceBroker
+    +-- Capability / Permission
+    +-- 配置与存储
+    +-- 诊断设施
+    |
+    v
+Mod ABI
+    |
+    v
+各个模组
 
-    @Override
-    public void initialize(ModContext ctx) {
-        ctx.logger().info("hello from " + ctx.modId());
+以上为概念性架构示意，不代表所有内部依赖关系或实际执行路径。
 
-        // 每 tick 一次（只在 END 阶段计数，避免 2 倍速率）
-        ctx.events().subscribe(TickEvent.class, e -> {
-            if (e.isEnd() && e.tick() % 20 == 0) {
-                ctx.logger().info("1 second passed: t=" + e.tick()
-                        + " tickCost=" + e.durationMs() + "ms");
-            }
-        });
+模组生命周期
 
-        // 20 tick 之后做一次
-        ctx.tick().runAfterTicks(20, () -> ctx.logger().info("ready"));
+加载器负责模组发现、依赖解析、类加载及生命周期管理。
 
-        // 跨 Mod 服务
-        ctx.services().provide(MyApi.class, new MyApiImpl());
+明确的生命周期规则，有助于模组协调初始化过程、管理自身资源，并减少重复建设加载框架的工作。
 
-        // 配置（玩家可手改 config/mili/<modId>.properties）
-        int volume = ctx.config().getInt("volume", 80);
-    }
-}
-```
+运行时服务
 
-`META-INF/mod.json`：
+运行时服务为模组提供通用基础能力。
 
-```json
-{
-  "schema": 1,
-  "id": "example",
-  "name": "Example Mod",
-  "version": "1.0.0",
-  "environment": "client",
-  "entrypoint": "com.example.ExampleMod",
-  "mili": { "platform": "0.1.0", "abi": 2, "minecraft": "26.2" }
-}
-```
+平台希望通过明确的服务接口与访问契约，使模组与运行时之间的交互更加清晰、可维护。
 
-入口点是唯一且严格的：`public class <entrypoint> implements org.loader.api.Mod`，public 无参构造器，`public void initialize(org.loader.api.ModContext)`。不接受 `onInitialize` / `main` / `init` 等 fallback——找不到入口即加载失败。
+TickEngine
 
-## 启动流程
+Mi-loader 已实现与 Minecraft 实际游戏 Tick 相连接的 TickEngine。
 
-```
-1. parseArgs              --mili-mods 摘出，其余参数转发给 Minecraft
-2. ensureMinecraftPresent 缺失时调用 Installer 现场拉取
-3. locateGame             发现 Minecraft JAR + 库
-4. createGameClassLoader  建立唯一的 MinecraftClassLoader（含转换管线装配）
-5. ModDiscovery           发现 Mod、解析依赖（拓扑排序 + 循环检测）
-6. runtime.start()        启动 Mili Runtime
-7. validateVersionBindings 三元组严格校验
-8. createModClassLoaders  每个 Mod 挂在 gameCL 之下，注册 Scope 与归因
-9. installRuntimeServices 存储 / 配置 / 客户端服务 / 指标 / 事件错误接收器
-10. invokeModEntrypoints  调用 initialize(ModContext)，成功后 Scope 推进到 RUNNING
-11. installMiliFacade     接通 Mili.mod(...) / Mili.events() / Mili.modIds()
-12. launch Minecraft      交给 EntryPointHook，阻塞到游戏退出
-13. shutdown              逆序释放 Mod / ClassLoader / Scope
-```
+当前限制：TickEngine 仍由单一驱动线程驱动。
 
-关键顺序约束：MinecraftClassLoader 必须先于所有 ModClassLoader 创建；存储与配置服务必须先于 Mod 的 `initialize()` 装配（Mod 在初始化阶段就会调用 `ctx.storage()` / `ctx.config()`）。
+目前尚未实现 Region 化世界 Tick 与并行世界 Tick。
 
-## 设计哲学
+因此，Mi-loader 目前不能被描述为已经具备并行 Tick 能力的平台。
 
-**显式优于隐式，编译错误优于运行时错误，拒绝优于静默妥协。**
+⸻
 
-这条哲学在代码里有一致的体现：
+安装
 
-- 能力冲突在发布时抛异常并指出双方 modId，而不是后注册者覆盖。
-- 符号名写错在加载期抛异常并列出可用符号，而不是注入不到任何东西。
-- 未注册的权限一律拒绝，而不是「没有策略就当允许」。
-- 服务缺失时 `require()` 抛异常并列出已注册类型，而不是返回 null。
-- 事件订阅超类型能收到子类型，而不是「订阅成功但永远收不到」。
+Mi-loader 提供安装器，用于准备受支持的 Minecraft 运行环境。
 
-平台反复记录过同一类问题：**代码路径存在、编译通过、运行无异常，但功能静默缺失**（注册链死代码、TickBridge 零调用者、事件零发布者、Mod Scope 永不进入 RUNNING）。这类失效比崩溃难查得多，因此每个新接口都必须回答一个问题：**如果它断了，谁会看到？** 答不上来的接口不应该存在。
+安装器通过 Mojang 官方版本元数据获取游戏文件，并执行相应校验。
 
-## 详细文档
+一般安装流程：
 
-| 文档 | 内容 |
-|---|---|
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | 运行时内核、组件装配、启动时序 |
-| [ABI.md](docs/ABI.md) | 契约清单、ABI 2 变更、兼容性承诺 |
-| [API_REFERENCE.md](docs/API_REFERENCE.md) | 全部公开接口与方法签名 |
-| [MOD_DEVELOPMENT.md](docs/MOD_DEVELOPMENT.md) | Mod 开发指南：入口、元数据、注册、事件、调度、服务 |
-| [PLATFORM_VERSIONING.md](docs/PLATFORM_VERSIONING.md) | 版本三元组与兼容策略 |
-| [ERROR_MODEL.md](docs/ERROR_MODEL.md) | 错误码目录、错误模型、`mili explain` |
-| [architecture/](docs/architecture/) | 专题：类加载、Tick 引擎、创造栏 |
-| [design/](docs/design/) | 专题：转换引擎、安全模型、液态玻璃转场 |
-| [performance/](docs/performance/) | 性能预算与稳定性 |
-| [decisions/](docs/decisions/) | 架构决策记录（ADR） |
+1. 获取对应版本的 Mi-loader 发行包。
+2. 根据发行版本的说明运行安装器。
+3. 选择或准备受支持的 Minecraft 安装环境。
+4. 由安装器获取所需的官方游戏文件。
+5. 校验安装结果。
+6. 启动配置完成的游戏实例。
 
-## 许可证
+具体安装方式、启动环境要求以及版本限制，请以对应发行版本附带的说明为准。
 
-见仓库根目录的 [LICENSE.txt](LICENSE.txt)。
+Minecraft 游戏文件
+
+Mi-loader 设计为通过相应的官方分发元数据获取 Minecraft 游戏文件。
+
+Mi-loader 发行包不应捆绑 Minecraft 客户端 JAR。
+
+用户需要具备访问和游玩 Minecraft 所需的相应权限与账号条件。
+
+⸻
+
+模组开发
+
+Mi-loader 拥有自己的模组 ABI 与面向模组的运行时 API。
+
+面向 Mi-loader 的模组应根据目标版本支持的 API 与开发约定进行开发。
+
+在开发新模组或移植现有模组时，请重点关注：
+
+* 目标 Minecraft 版本
+* Mi-loader ABI 兼容性
+* 模组依赖声明
+* 生命周期要求
+* 类加载行为
+* 运行时服务可用性
+* Minecraft 集成需求
+
+兼容性说明
+
+Mi-loader 是独立的模组平台。
+
+请勿默认认为其支持：
+
+* Fabric 模组
+* Forge 模组
+* NeoForge 模组
+* 任意版本之间的二进制兼容
+* 依赖未公开或不受支持的 Minecraft 内部行为的模组
+
+具体兼容性必须经过明确的支持或测试确认。
+
+⸻
+
+开发环境
+
+环境要求
+
+* Java 25
+* Gradle（使用项目自带的 Gradle Wrapper）
+* Git
+
+请优先遵循仓库构建配置中指定的 Java 版本与环境要求。
+
+克隆仓库
+
+git clone https://github.com/MiliMCL/Mi-loader.git
+cd Mi-loader
+git checkout 26.2
+
+构建项目
+
+Linux / macOS：
+
+./gradlew build
+
+Windows：
+
+.\gradlew.bat build
+
+其他构建任务、验证步骤与开发流程，请参考仓库当前配置。
+
+验证与测试
+
+提交代码前，请验证相关组件与测试。
+
+涉及 Minecraft 集成机制的修改尤其需要谨慎，因为错误的集成行为可能影响整个游戏运行环境。
+
+⸻
+
+项目状态
+
+Mi-loader 正在持续开发中。
+
+当前项目已经建立了独立 ABI、运行时基础设施、模组类加载机制、生命周期管理、Minecraft 集成机制以及安装器等基础部分。
+
+但是，基础设施已经存在，并不意味着所有子系统均已达到生产环境成熟度。
+
+当前限制
+
+* 不提供 Fabric、Forge、NeoForge 兼容层。
+* 尚未实现并行世界 Tick。
+* TickEngine 仍采用单驱动线程模式。
+* 不保证完整的通用热重载能力。
+* 不提供通用的运行时安全沙箱。
+* 不保证不同发行版本之间的二进制兼容。
+
+只有经过实现、验证并形成明确说明的功能，才应视为对应版本正式支持的能力。
+
+⸻
+
+后续发展方向
+
+Mi-loader 的发展重点是先完善平台基础，再逐步扩展生态。
+
+可能的后续方向包括：
+
+* ABI 稳定性与版本兼容策略
+* 运行时服务契约完善
+* 模组依赖管理
+* 生命周期正确性与资源清理
+* Minecraft 集成可靠性
+* 诊断与调试工具
+* 安装器健壮性
+* 模组开发工具链
+* 性能测试与优化
+* 后续调度与执行架构演进
+
+以上为发展方向，不代表所有项目均已实现或已经确定具体发布时间。
+
+⸻
+
+参与贡献
+
+欢迎提交代码、问题反馈与技术讨论。
+
+提交修改时，建议遵循以下原则：
+
+1. 保持平台契约明确。
+2. 避免不必要的模块耦合。
+3. 在条件允许时提供测试或可复现的验证方式。
+4. 对行为变化进行必要说明。
+5. 明确区分已实现功能与规划功能。
+
+涉及 ABI 或运行时契约的修改，应充分考虑对现有模组与下游集成项目的影响。
+
+⸻
+
+开源协议
+
+Mi-loader 使用 Apache License 2.0 开源协议。
+
+详情请参阅 LICENSE。
+
+项目链接
+
+* Mi-loader GitHub 仓库
+* MiliMCL 开发组织
+
+⸻
+
+Mi-loader —— 以明确的契约、受控的运行时行为与可验证的集成机制，构建属于自己的模组平台。
